@@ -56,6 +56,18 @@ def build_client(config: Any) -> Any:
     return backend_rpc_client(config, agent_runtime_providers=providers)
 
 
+def _positive_seconds(value: str) -> float:
+    """Argparse type for durations that must be greater than zero."""
+
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from None
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return seconds
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pi-aa-connector",
@@ -84,8 +96,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_common_args(pair)
     pair.add_argument("server", nargs="?", help="backend server URL")
-    pair.add_argument("--poll-interval", type=float, default=2.0)
-    pair.add_argument("--timeout", type=float, default=DEFAULT_PAIR_TIMEOUT)
+    pair.add_argument("--poll-interval", type=_positive_seconds, default=2.0)
+    pair.add_argument("--timeout", type=_positive_seconds, default=DEFAULT_PAIR_TIMEOUT)
     pair.add_argument(
         "--no-start",
         action="store_true",

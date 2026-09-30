@@ -183,3 +183,21 @@ def test_configure_saves_config(
     )
 
     assert "Saved connector config" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--poll-interval", "0"],
+        ["--poll-interval", "-1"],
+        ["--timeout", "0"],
+    ],
+)
+def test_pair_rejects_non_positive_seconds(
+    args: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Zero or negative seconds would turn the pairing poll into a busy loop.
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["pair", "https://example.test", *args])
+    assert excinfo.value.code == 2
+    assert "must be greater than zero" in capsys.readouterr().err
