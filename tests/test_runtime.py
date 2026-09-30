@@ -63,6 +63,39 @@ async def test_create_and_start_session(
     assert session_file.is_file()
 
 
+async def test_state_change_publishes_session_capabilities(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """Capability facts must be published, not only answered on request.
+
+    The platform caches capability facts only from runtime notifications, and
+    snapshot and websocket projections fall back to that cache when a live
+    read fails; without a publish the cached set stays empty and clients see
+    every session action as unavailable.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session(
+            "sess-caps",
+            "hello",
+            cwd=str(tmp_path),
+        )
+        await wait_for(lambda: len(fake_host.capability_sets) >= 1)
+    finally:
+        await runtime.stop()
+
+    published = fake_host.capability_sets[-1]
+    assert published.session_id == "sess-caps"
+    by_id = {capability.capability_id: capability for capability in published.capabilities}
+    assert "session.send_message" in by_id
+    send = by_id["session.send_message"]
+    assert send.supported and send.available and send.allowed
+
+
 async def test_list_sessions_and_snapshot(
     fake_pi: Path,
     tmp_path: Path,

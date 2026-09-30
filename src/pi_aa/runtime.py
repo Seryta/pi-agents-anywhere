@@ -596,6 +596,11 @@ class PiRuntime(AgentRuntime):
         external_session_id: str | None = None,
     ) -> RuntimeCapabilitySet:
         _ = external_session_id
+        return self._session_capability_set(session_id)
+
+    def _session_capability_set(self, session_id: str) -> RuntimeCapabilitySet:
+        """Capability facts the pi runtime exposes for one platform session."""
+
         capabilities = tuple(
             RuntimeCapability(
                 capability_id=capability_id,
@@ -622,6 +627,20 @@ class PiRuntime(AgentRuntime):
             runtime_id=self.config.runtime_id,
             metadata={"source": "pi.runtime"},
         )
+
+    async def _publish_session_capabilities(self, session_id: str) -> None:
+        """Push capability facts so the platform's cached set stays current.
+
+        The platform falls back to persisted capability facts when a live read
+        fails, and only runtime capability notifications feed that store. The
+        built-in runtimes publish on every state change; pi must do the same
+        or snapshot and websocket projections keep an empty capability set.
+        """
+
+        try:
+            await self.host.session_capabilities_update(self._session_capability_set(session_id))
+        except Exception:
+            logger.exception("failed to publish pi session capabilities for %s", session_id)
 
     # -- catalogs -----------------------------------------------------------
 
@@ -1151,6 +1170,8 @@ class PiRuntime(AgentRuntime):
             live.last_state_key = key
         except Exception:
             logger.exception("failed to push pi session state for %s", live.platform_id)
+            return
+        await self._publish_session_capabilities(live.platform_id)
 
     async def _push_meta(self, live: PiLiveSession) -> None:
         path = live.session_file or live.session_path

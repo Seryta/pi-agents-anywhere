@@ -31,6 +31,7 @@ class FakeHost(RuntimeHostClient):
         self.states: list[dict[str, Any]] = []
         self.metas: list[dict[str, Any]] = []
         self.turn_ends: list[dict[str, Any]] = []
+        self.capability_sets: list[Any] = []
 
     @property
     def connector_id(self) -> str:
@@ -69,6 +70,9 @@ class FakeHost(RuntimeHostClient):
 
     async def session_turn_ended(self, session_id: str, runtime: str, **kwargs: Any) -> None:
         self.turn_ends.append({"session_id": session_id, "runtime": runtime, **kwargs})
+
+    async def session_capabilities_update(self, capabilities: Any) -> None:
+        self.capability_sets.append(capabilities)
 
     async def publish_runtime_notifications(
         self, runtime: str, notifications: list[dict[str, Any]], runtime_id: str | None = None
