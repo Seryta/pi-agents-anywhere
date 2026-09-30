@@ -3,6 +3,19 @@ name = "pi-agents-anywhere"
 version = "0.1.0"
 description = "Pi coding agent as an Agents Anywhere runtime (connector adapter)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Seryta" },
+]
+keywords = ["pi", "agents-anywhere", "connector", "coding-agent", "runtime"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
 requires-python = ">=3.12"
 dependencies = [
     "anywhere-cli>=2.0.0",
