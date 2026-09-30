@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 from pathlib import Path
 
 import pytest
-from connector.runtime_protocol import RuntimeConfig
+from connector.runtime_protocol import RuntimeAttachment, RuntimeConfig
 
 from pi_aa.runtime import PiRuntime, platform_session_id
-from tests.conftest import FakeHost, wait_for
+from tests.conftest import FAKE_PNG_BYTES, FakeHost, wait_for
 
 
 def make_runtime(fake_pi: Path, tmp_path: Path, host: FakeHost) -> PiRuntime:
@@ -382,3 +383,52 @@ def test_catalog_revision_is_monotonic_across_restarts(tmp_path: Path) -> None:
     time.sleep(0.005)
     restarted = make()
     assert restarted._next_catalog_revision() > revisions[-1]
+
+
+async def test_start_turn_forwards_image_attachments(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        attachment = RuntimeAttachment(
+            file_id="file-1",
+            name="shot.png",
+            media_type="image/png",
+            size=len(FAKE_PNG_BYTES),
+            sha256="0" * 64,
+        )
+        result = await runtime.start_turn(
+            "sess-img",
+            None,
+            "看看这张图",
+            attachments=(attachment,),
+        )
+        assert result.ok is True
+        await wait_for(
+            lambda: session_file.is_file()
+            and "看看这张图" in session_file.read_text(encoding="utf-8")
+        )
+    finally:
+        await runtime.stop()
+
+    assert fake_host.attachment_downloads == [{"session_id": "sess-img", "file_id": "file-1"}]
+    records = [
+        json.loads(line)
+        for line in session_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    user_message = next(
+        record["message"]
+        for record in records
+        if record.get("type") == "message"
+        and (record.get("message") or {}).get("role") == "user"
+    )
+    blocks = user_message["content"]
+    assert isinstance(blocks, list)
+    image = next(block for block in blocks if block.get("type") == "image")
+    assert image["mimeType"] == "image/png"
+    assert image["data"] == base64.b64encode(FAKE_PNG_BYTES).decode("ascii")

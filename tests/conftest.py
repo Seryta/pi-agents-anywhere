@@ -18,7 +18,10 @@ AA_SOURCE = Path(
 if AA_SOURCE.is_dir() and str(AA_SOURCE) not in sys.path:
     sys.path.insert(0, str(AA_SOURCE))
 
+from connector.runtime_protocol import RuntimeAttachmentContent
 from connector.runtime_protocol.host import RuntimeHostClient
+
+FAKE_PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-image-bytes"
 
 
 class FakeHost(RuntimeHostClient):
@@ -32,6 +35,7 @@ class FakeHost(RuntimeHostClient):
         self.metas: list[dict[str, Any]] = []
         self.turn_ends: list[dict[str, Any]] = []
         self.capability_sets: list[Any] = []
+        self.attachment_downloads: list[dict[str, str]] = []
 
     @property
     def connector_id(self) -> str:
@@ -73,6 +77,15 @@ class FakeHost(RuntimeHostClient):
 
     async def session_capabilities_update(self, capabilities: Any) -> None:
         self.capability_sets.append(capabilities)
+
+    async def attachment_download(self, session_id: str, file_id: str) -> RuntimeAttachmentContent:
+        self.attachment_downloads.append({"session_id": session_id, "file_id": file_id})
+        return RuntimeAttachmentContent(
+            file_id=file_id,
+            name="test.png",
+            media_type="image/png",
+            content=FAKE_PNG_BYTES,
+        )
 
     async def publish_runtime_notifications(
         self, runtime: str, notifications: list[dict[str, Any]], runtime_id: str | None = None

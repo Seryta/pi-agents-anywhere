@@ -9,6 +9,7 @@ so the workbench does not have to wait for the next polling pass.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -22,6 +23,7 @@ from typing import Any
 from connector.runtime_protocol import (
     CAPABILITY_CATALOG_EFFORT,
     CAPABILITY_CATALOG_MODEL,
+    CAPABILITY_RUNTIME_ATTACHMENT,
     CAPABILITY_SESSION_COMMANDS,
     CAPABILITY_SESSION_INTERACTION_APPROVAL,
     CAPABILITY_SESSION_INTERRUPT,
@@ -42,7 +44,6 @@ from connector.runtime_protocol import (
     RuntimePermissionCatalog,
     RuntimeTimelineSnapshot,
     RuntimeUnavailableError,
-    RuntimeUnsupportedError,
     SessionMeta,
     SessionNotice,
     SessionSourceState,
@@ -68,6 +69,15 @@ logger = logging.getLogger(__name__)
 
 RUNTIME = "pi"
 PLATFORM_SESSION_PREFIX = "sess_pi_"
+
+# Pi consumes images as base64 ``ImageContent``; these are the formats the
+# model providers behind Pi accept in practice.
+PI_IMAGE_MIME_TYPES: tuple[str, ...] = (
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+)
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
 
 
@@ -346,11 +356,17 @@ class PiLiveSession:
         content: str,
         *,
         streaming_behavior: str | None = None,
+        images: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         if streaming_behavior == "steer":
-            await self.command({"type": "steer", "message": content})
+            payload: dict[str, Any] = {"type": "steer", "message": content}
+            if images:
+                payload["images"] = list(images)
+            await self.command(payload)
             return
-        payload: dict[str, Any] = {"type": "prompt", "message": content}
+        payload = {"type": "prompt", "message": content}
+        if images:
+            payload["images"] = list(images)
         if streaming_behavior:
             payload["streamingBehavior"] = streaming_behavior
         await self.command(payload)
@@ -608,6 +624,11 @@ class PiRuntime(AgentRuntime):
                 runtime=RUNTIME,
                 runtime_id=self.config.runtime_id,
                 session_id=session_id if scope == "session" else None,
+                metadata=(
+                    {"allowedMimeTypes": list(PI_IMAGE_MIME_TYPES)}
+                    if capability_id == CAPABILITY_RUNTIME_ATTACHMENT
+                    else {}
+                ),
             )
             for capability_id, scope in (
                 (CAPABILITY_SESSION_SEND_MESSAGE, "session"),
@@ -615,6 +636,7 @@ class PiRuntime(AgentRuntime):
                 (CAPABILITY_SESSION_STEER, "session"),
                 (CAPABILITY_SESSION_INTERACTION_APPROVAL, "session"),
                 (CAPABILITY_SESSION_COMMANDS, "session"),
+                (CAPABILITY_RUNTIME_ATTACHMENT, "session"),
                 (CAPABILITY_CATALOG_MODEL, "runtime"),
                 (CAPABILITY_CATALOG_EFFORT, "session"),
             )
@@ -793,7 +815,7 @@ class PiRuntime(AgentRuntime):
         runtime_options: Mapping[str, Any] | None = None,
     ) -> RuntimeOperationResult:
         _ = client_message_id, runtime_options
-        self._reject_attachments(attachments)
+        images = await self._attachment_images(session_id, attachments)
         workdir = self._resolve_cwd(cwd)
         live = PiLiveSession(self, session_id, cwd=workdir)
         self._live[session_id] = live
@@ -802,7 +824,7 @@ class PiRuntime(AgentRuntime):
             await live.command({"type": "set_session_name", "name": title})
         if selections:
             await self._apply_selections(live, selections)
-        await live.send_prompt(content)
+        await live.send_prompt(content, images=images)
         await self._push_meta(live)
         await self._push_state(live, force=True)
         return RuntimeOperationResult(
@@ -820,12 +842,12 @@ class PiRuntime(AgentRuntime):
         cwd: str | None = None,
     ) -> RuntimeOperationResult:
         _ = client_message_id
-        self._reject_attachments(attachments)
+        images = await self._attachment_images(session_id, attachments)
         live = await self._ensure_live(session_id, external_session_id, cwd)
         if selections:
             await self._apply_selections(live, selections)
         behavior = "followUp" if (live.is_streaming or live.is_compacting) else None
-        await live.send_prompt(content, streaming_behavior=behavior)
+        await live.send_prompt(content, streaming_behavior=behavior, images=images)
         return RuntimeOperationResult(
             result={"sessionId": session_id, "queued": behavior is not None}
         )
@@ -839,12 +861,12 @@ class PiRuntime(AgentRuntime):
         client_message_id: str | None = None,
     ) -> RuntimeOperationResult:
         _ = client_message_id
-        self._reject_attachments(attachments)
+        images = await self._attachment_images(session_id, attachments)
         live = await self._ensure_live(session_id, external_session_id, None)
         if live.is_streaming:
-            await live.send_prompt(content, streaming_behavior="steer")
+            await live.send_prompt(content, streaming_behavior="steer", images=images)
             return RuntimeOperationResult(result={"sessionId": session_id, "steered": True})
-        await live.send_prompt(content)
+        await live.send_prompt(content, images=images)
         return RuntimeOperationResult(result={"sessionId": session_id, "steered": False})
 
     async def interrupt_session(
@@ -1122,10 +1144,47 @@ class PiRuntime(AgentRuntime):
             return False
         return True
 
-    @staticmethod
-    def _reject_attachments(attachments: tuple[RuntimeAttachment, ...]) -> None:
-        if attachments:
-            raise RuntimeUnsupportedError("pi runtime does not support platform attachments yet")
+    async def _attachment_images(
+        self,
+        session_id: str,
+        attachments: tuple[RuntimeAttachment, ...],
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Download image attachments and reshape them into Pi RPC image content.
+
+        Pi accepts images as base64 ``ImageContent`` entries on ``prompt`` and
+        ``steer`` commands. Non-image attachments are skipped so a mixed
+        selection still delivers the images Pi can consume.
+        """
+
+        if not attachments:
+            return ()
+        images: list[Mapping[str, Any]] = []
+        for attachment in attachments:
+            media_type = (attachment.media_type or "").strip().lower()
+            if not media_type.startswith("image/"):
+                logger.warning(
+                    "pi runtime skipped non-image attachment file_id=%s media_type=%s",
+                    attachment.file_id,
+                    attachment.media_type,
+                )
+                continue
+            try:
+                downloaded = await self.host.attachment_download(session_id, attachment.file_id)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "pi attachment download failed file_id=%s",
+                    attachment.file_id,
+                )
+                continue
+            resolved_media_type = (downloaded.media_type or media_type).strip().lower()
+            images.append(
+                {
+                    "type": "image",
+                    "data": base64.b64encode(downloaded.content).decode("ascii"),
+                    "mimeType": resolved_media_type,
+                }
+            )
+        return tuple(images)
 
     async def _apply_selections(
         self,

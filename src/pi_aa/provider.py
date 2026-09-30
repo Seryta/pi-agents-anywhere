@@ -168,6 +168,6 @@ def pi_capabilities() -> dict[str, bool]:
         "interruptTurn": True,
         "commands": True,
         "interactions": True,
-        "attachments": False,
+        "attachments": True,
         "ipc": True,
     }

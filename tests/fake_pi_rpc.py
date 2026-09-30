@@ -136,6 +136,9 @@ def issue_ui_if_needed() -> bool:
 
 def handle_prompt(command: dict) -> None:
     text = command.get("message", "")
+    images = command.get("images") or []
+    # Pi renders image inputs as block content on the persisted user message.
+    content = text if not images else [{"type": "text", "text": text}, *images]
     ensure_header()
     STATE["isStreaming"] = True
     user_id = uuid.uuid4().hex[:8]
@@ -145,14 +148,14 @@ def handle_prompt(command: dict) -> None:
             "id": user_id,
             "parentId": last_entry_id(),
             "timestamp": "2026-01-01T00:00:01.000Z",
-            "message": {"role": "user", "content": text, "timestamp": 1},
+            "message": {"role": "user", "content": content, "timestamp": 1},
         }
     )
     reply = "reply to " + str(text)
     emit({"type": "agent_start"})
     emit({"type": "turn_start"})
-    emit({"type": "message_start", "message": {"role": "user", "content": text}})
-    emit({"type": "message_end", "message": {"role": "user", "content": text}})
+    emit({"type": "message_start", "message": {"role": "user", "content": content}})
+    emit({"type": "message_end", "message": {"role": "user", "content": content}})
     emit(
         {
             "type": "message_start",

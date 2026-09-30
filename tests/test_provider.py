@@ -43,7 +43,7 @@ async def test_discover_available(fake_pi: Path) -> None:
     assert descriptor.runtime_type == "pi"
     assert descriptor.available is True
     assert descriptor.capabilities["startTurn"] is True
-    assert descriptor.capabilities["attachments"] is False
+    assert descriptor.capabilities["attachments"] is True
     assert descriptor.metadata["version"] == "9.9.9-fake"
 
 
