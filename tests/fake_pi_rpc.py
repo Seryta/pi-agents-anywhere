@@ -304,10 +304,11 @@ def handle_command(command: dict) -> None:
                             "provider": "test",
                         },
                         # Same model name under another provider: pi allows
-                        # it, so the catalog must keep ids unique.
+                        # it, so the catalog must keep ids unique and label
+                        # the titles.
                         {
                             "id": "test-model",
-                            "name": "Duplicate Model",
+                            "name": "Test Model",
                             "provider": "alt",
                         },
                     ]

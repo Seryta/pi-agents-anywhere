@@ -154,8 +154,14 @@ async def test_model_catalog_and_selections(
         assert ids == ["test:test-model", "test:other-model", "alt:test-model"]
         assert len(ids) == len(set(ids))
         assert catalog.models[0].selection_id == "test:test-model"
+        # Ambiguous names carry the provider so the workbench can tell them
+        # apart; unambiguous names stay untouched.
+        titles = [model.title for model in catalog.models]
+        assert titles == ["Test Model（test）", "Other Model", "Test Model（alt）"]
         filtered = await runtime.list_model_catalog(query="alt")
         assert [model.id for model in filtered.models] == ["alt:test-model"]
+        # Labels are computed over the full directory, so filtering keeps them.
+        assert filtered.models[0].title == "Test Model（alt）"
 
         await runtime.create_and_start_session("sess-model", "hi", cwd=str(tmp_path))
         result = await runtime.update_session_selections(
@@ -286,3 +292,28 @@ async def test_snapshot_rejects_paths_outside_sessions_dir(
         assert snapshot.items == ()
     finally:
         await runtime.stop()
+
+
+def test_model_display_title_rules() -> None:
+    from pi_aa.runtime import _model_display_title
+
+    directory = [
+        ("DeepSeek V4.1 Flash", "deepseek", "deepseek-flash"),
+        ("DeepSeek V4.1 Flash", "opencode-go", "deepseek-v4.1-flash"),
+        ("DeepSeek V4 Pro", "deepseek", "deepseek-v4-pro"),
+        ("Routed", "test", "a"),
+        ("Routed", "test", "b"),
+    ]
+    # Same name under several providers: provider suffix.
+    assert (
+        _model_display_title("DeepSeek V4.1 Flash", "deepseek", "deepseek-flash", directory)
+        == "DeepSeek V4.1 Flash（deepseek）"
+    )
+    # Unique name: untouched.
+    assert (
+        _model_display_title("DeepSeek V4 Pro", "deepseek", "deepseek-v4-pro", directory)
+        == "DeepSeek V4 Pro"
+    )
+    # Same provider, several ids under one name: append the model id.
+    assert _model_display_title("Routed", "test", "a", directory) == "Routed [a]"
+    assert _model_display_title("Solo", "test", "s", directory) == "Solo"

@@ -12,7 +12,7 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -96,6 +96,34 @@ def _split_model_selection(value: str) -> tuple[str | None, str]:
     if separator and provider and model_id:
         return provider, model_id
     return None, value
+
+
+def _model_display_title(
+    name: str,
+    provider: str | None,
+    model_id: str,
+    directory: Sequence[tuple[str, str | None, str]],
+) -> str:
+    """Label a model so identical names from different routes stay distinct.
+
+    Mirrors the platform's own labeling (dsh-bridge-next ``labelModels``):
+    when the same display name exists under several providers, append the
+    provider; when one provider exposes several ids under the same name,
+    append the model id as well. Labels are computed over the full directory
+    so search and pagination cannot change them.
+    """
+
+    same_name = [entry for entry in directory if entry[0] == name]
+    multiple_providers = any(entry[1] != provider for entry in same_name)
+    duplicate_model = any(
+        entry[1] == provider and entry[2] != model_id for entry in same_name
+    )
+    title = name
+    if multiple_providers and provider:
+        title += f"（{provider}）"
+    if duplicate_model:
+        title += f" [{model_id}]"
+    return title
 
 
 class PendingInteraction:
@@ -604,20 +632,27 @@ class PiRuntime(AgentRuntime):
         limit: int = 100,
     ) -> RuntimeModelCatalog:
         data = response_data(await self._utility_command({"type": "get_available_models"}))
-        models: list[RuntimeModelItem] = []
+        # Pi allows the same model name under several providers; the platform
+        # rejects catalogs with duplicate ids, so ids are provider-qualified
+        # and titles carry the provider when a name is ambiguous.
+        entries: list[tuple[Mapping[str, Any], str, str, str | None, str]] = []
         for raw in _as_list(data.get("models")):
             if not isinstance(raw, Mapping):
                 continue
             model_id = raw.get("id")
             if not isinstance(model_id, str) or not model_id:
                 continue
-            # Pi allows the same model name under several providers; the
-            # platform rejects catalogs with duplicate ids, so qualify the id
-            # with the provider exactly like the selection id already does.
             catalog_id = _model_selection_id(raw) or model_id
-            title = raw.get("name")
-            title = title if isinstance(title, str) and title else model_id
-            haystack = f"{catalog_id} {title}".lower()
+            name = raw.get("name")
+            name = name if isinstance(name, str) and name else model_id
+            provider = raw.get("provider")
+            provider = provider if isinstance(provider, str) and provider else None
+            entries.append((raw, catalog_id, name, provider, model_id))
+        directory = [(name, provider, model_id) for _, _, name, provider, model_id in entries]
+        models: list[RuntimeModelItem] = []
+        for raw, catalog_id, name, provider, model_id in entries:
+            title = _model_display_title(name, provider, model_id, directory)
+            haystack = f"{catalog_id} {name} {title}".lower()
             if query and query.lower() not in haystack:
                 continue
             models.append(
@@ -625,9 +660,7 @@ class PiRuntime(AgentRuntime):
                     id=catalog_id,
                     title=title,
                     selection_id=catalog_id,
-                    description=raw.get("provider")
-                    if isinstance(raw.get("provider"), str)
-                    else None,
+                    description=provider,
                     metadata={
                         "provider": raw.get("provider"),
                         "contextWindow": raw.get("contextWindow"),
