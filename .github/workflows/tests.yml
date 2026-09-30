@@ -7,6 +7,8 @@ on:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    env:
+      PI_AA_CONNECTOR_SOURCE: /tmp/Agents-Anywhere/connector
     steps:
       - uses: actions/checkout@v4
 
@@ -20,4 +22,4 @@ jobs:
         run: docker/run-tests.sh bash -c "python -m ruff check src tests && python -m ruff format --check src tests"
 
       - name: Tests (unit + real pi)
-        run: PI_AA_TRUE_PI=1 PI_AA_CONNECTOR_SOURCE=/tmp/Agents-Anywhere/connector docker/run-tests.sh
+        run: PI_AA_TRUE_PI=1 docker/run-tests.sh
