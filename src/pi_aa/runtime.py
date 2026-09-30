@@ -1005,6 +1005,11 @@ class PiRuntime(AgentRuntime):
     ) -> RuntimeOperationResult:
         images = await self._attachment_images(session_id, attachments)
         live = await self._ensure_live(session_id, external_session_id, cwd)
+        logger.info(
+            "pi turn start session_id=%s client_message_id=%s",
+            session_id,
+            client_message_id,
+        )
         if client_message_id:
             live.client_messages.append((content, client_message_id))
         if selections:

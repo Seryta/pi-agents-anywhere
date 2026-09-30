@@ -116,6 +116,35 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--debug", action="store_true", help="show debug-level logs")
 
 
+def _bridge_stdlib_logging() -> None:
+    """Route standard-library loggers into loguru.
+
+    The connector configures loguru only, but pi_aa modules log through
+    ``logging``; without interception their INFO records never reach the
+    connector log (only WARNING and above leak through the root handler).
+    """
+
+    import logging
+
+    from loguru import logger as loguru_logger
+
+    class _InterceptHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            try:
+                level: str | int = loguru_logger.level(record.levelname).name
+            except ValueError:
+                level = record.levelno
+            frame, depth = logging.currentframe(), 2
+            while frame is not None and frame.f_code.co_filename == logging.__file__:
+                frame = frame.f_back
+                depth += 1
+            loguru_logger.opt(depth=depth, exception=record.exc_info).log(
+                level, record.getMessage()
+            )
+
+    logging.basicConfig(handlers=[_InterceptHandler()], level=0, force=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else sys.argv[1:])
@@ -129,6 +158,7 @@ def main(argv: list[str] | None = None) -> None:
         from connector.logging import configure_connector_logging
 
         configure_connector_logging(debug=bool(getattr(args, "debug", False)))
+        _bridge_stdlib_logging()
     except Exception as exc:  # noqa: BLE001 - logging must never block startup
         print(f"warning: connector logging setup failed: {exc}", file=sys.stderr)
 
