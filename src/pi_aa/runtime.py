@@ -429,6 +429,24 @@ class PiRuntime(AgentRuntime):
             raise RuntimeUnavailableError(f"pi executable is unavailable: {self.executable!r}")
         self._identity = replace(self._identity, runtime_version=version)
         logger.info("pi runtime started version=%s", version)
+        await self._publish_runtime_capabilities()
+
+    async def _publish_runtime_capabilities(self) -> None:
+        """Push runtime-scoped facts so the platform persists them.
+
+        The connector's discovery publication drops runtime types outside its
+        hard-coded allowlist, so pi's runtime-scoped entries would never reach
+        the platform's persisted capability facts. Without them, sessions that
+        never published their own facts project as unsupported. Publishing
+        through the runtime capability channel merges them into that store.
+        """
+
+        try:
+            await self.host.session_capabilities_update(
+                await self.get_runtime_capabilities()
+            )
+        except Exception:  # noqa: BLE001 - publishing must not block startup
+            logger.exception("failed to publish pi runtime capabilities")
 
     async def stop(self) -> None:
         self._stopping = True
@@ -605,6 +623,46 @@ class PiRuntime(AgentRuntime):
         if live is None:
             return ()
         return tuple(pending.as_notice(session_id) for pending in live.pending_ui.values())
+
+    async def get_runtime_capabilities(self) -> RuntimeCapabilitySet:
+        """Runtime-scoped capability facts advertised to the platform.
+
+        The device-runtime capability endpoint (and the new-session composer
+        that reads it) uses this set, so attachments must be advertised here as
+        well as on individual sessions. It also gives the platform's session
+        projection a runtime-scoped fallback for sessions that never published
+        their own facts.
+        """
+
+        return RuntimeCapabilitySet(
+            runtime=RUNTIME,
+            revision=1,
+            runtime_id=self.config.runtime_id,
+            capabilities=tuple(
+                RuntimeCapability(
+                    capability_id=capability_id,
+                    scope="runtime",
+                    runtime=RUNTIME,
+                    runtime_id=self.config.runtime_id,
+                    metadata=(
+                        {"allowedMimeTypes": list(PI_IMAGE_MIME_TYPES)}
+                        if capability_id == CAPABILITY_RUNTIME_ATTACHMENT
+                        else {}
+                    ),
+                )
+                for capability_id in (
+                    CAPABILITY_SESSION_SEND_MESSAGE,
+                    CAPABILITY_SESSION_INTERRUPT,
+                    CAPABILITY_SESSION_STEER,
+                    CAPABILITY_SESSION_INTERACTION_APPROVAL,
+                    CAPABILITY_SESSION_COMMANDS,
+                    CAPABILITY_RUNTIME_ATTACHMENT,
+                    CAPABILITY_CATALOG_MODEL,
+                    CAPABILITY_CATALOG_EFFORT,
+                )
+            ),
+            metadata={"source": "pi.runtime"},
+        )
 
     async def get_session_capabilities(
         self,

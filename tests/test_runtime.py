@@ -7,7 +7,12 @@ import time
 from pathlib import Path
 
 import pytest
-from connector.runtime_protocol import RuntimeAttachment, RuntimeConfig
+from connector.runtime_protocol import (
+    CAPABILITY_RUNTIME_ATTACHMENT,
+    CAPABILITY_SESSION_SEND_MESSAGE,
+    RuntimeAttachment,
+    RuntimeConfig,
+)
 
 from pi_aa.runtime import PiRuntime, platform_session_id
 from tests.conftest import FAKE_PNG_BYTES, FakeHost, wait_for
@@ -432,3 +437,49 @@ async def test_start_turn_forwards_image_attachments(
     image = next(block for block in blocks if block.get("type") == "image")
     assert image["mimeType"] == "image/png"
     assert image["data"] == base64.b64encode(FAKE_PNG_BYTES).decode("ascii")
+
+
+async def test_runtime_start_publishes_runtime_capabilities(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """start() pushes runtime-scoped facts so the platform persists them."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        published = [item for item in fake_host.capability_sets if item.session_id is None]
+    finally:
+        await runtime.stop()
+
+    assert published, "start() should publish runtime-scoped capability facts"
+    by_id = {capability.capability_id: capability for capability in published[-1].capabilities}
+    assert by_id[CAPABILITY_RUNTIME_ATTACHMENT].scope == "runtime"
+    assert by_id[CAPABILITY_SESSION_SEND_MESSAGE].scope == "runtime"
+
+
+async def test_runtime_capabilities_advertise_attachments(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """The device-runtime endpoint (new-session composer) reads this set."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        capability_set = await runtime.get_runtime_capabilities()
+    finally:
+        await runtime.stop()
+
+    by_id = {capability.capability_id: capability for capability in capability_set.capabilities}
+    attachment = by_id[CAPABILITY_RUNTIME_ATTACHMENT]
+    assert attachment.scope == "runtime"
+    assert attachment.supported is True
+    assert attachment.available is True
+    assert attachment.allowed is True
+    assert attachment.metadata["allowedMimeTypes"]
+    # Session actions are advertised at runtime scope too so the platform's
+    # per-session projection has a fallback for sessions without own facts.
+    assert by_id[CAPABILITY_SESSION_SEND_MESSAGE].scope == "runtime"
