@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Run the test suite in the container. Never build or test on the host.
+# Run tests in the container. Never build or test on the host.
 #
 # Usage:
-#   docker/run-tests.sh                     # unit tests, fake pi
-#   PI_AA_TRUE_PI=1 docker/run-tests.sh     # also run real-pi integration tests
-#   PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh  # opt-in: one real model turn
+#   docker/run-tests.sh                          # unit tests, fake pi
+#   docker/run-tests.sh python -m pytest tests/test_cli.py
+#   docker/run-tests.sh bash -c "python -m ruff check src tests && python -m pytest -q"
+#   PI_AA_TRUE_PI=1 docker/run-tests.sh          # also run real-pi integration tests
+#   PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh    # opt-in: one real model turn
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,5 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-COMMAND="${*:-python -m pytest -q}"
-docker run "${ARGS[@]}" "${IMAGE}" bash -lc "${COMMAND}"
+if [[ $# -eq 0 ]]; then
+    set -- python -m pytest -q
+fi
+docker run "${ARGS[@]}" "${IMAGE}" "$@"
