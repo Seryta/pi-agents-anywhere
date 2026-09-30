@@ -143,8 +143,13 @@ async def test_model_catalog_and_selections(
     try:
         catalog = await runtime.list_model_catalog()
         ids = [model.id for model in catalog.models]
-        assert ids == ["test-model", "other-model"]
+        # Pi can expose the same model name under several providers; ids must
+        # stay unique or the platform rejects the whole catalog.
+        assert ids == ["test:test-model", "test:other-model", "alt:test-model"]
+        assert len(ids) == len(set(ids))
         assert catalog.models[0].selection_id == "test:test-model"
+        filtered = await runtime.list_model_catalog(query="alt")
+        assert [model.id for model in filtered.models] == ["alt:test-model"]
 
         await runtime.create_and_start_session("sess-model", "hi", cwd=str(tmp_path))
         result = await runtime.update_session_selections(

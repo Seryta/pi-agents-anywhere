@@ -606,16 +606,20 @@ class PiRuntime(AgentRuntime):
             model_id = raw.get("id")
             if not isinstance(model_id, str) or not model_id:
                 continue
+            # Pi allows the same model name under several providers; the
+            # platform rejects catalogs with duplicate ids, so qualify the id
+            # with the provider exactly like the selection id already does.
+            catalog_id = _model_selection_id(raw) or model_id
             title = raw.get("name")
             title = title if isinstance(title, str) and title else model_id
-            haystack = f"{model_id} {title}".lower()
+            haystack = f"{catalog_id} {title}".lower()
             if query and query.lower() not in haystack:
                 continue
             models.append(
                 RuntimeModelItem(
-                    id=model_id,
+                    id=catalog_id,
                     title=title,
-                    selection_id=_model_selection_id(raw),
+                    selection_id=catalog_id,
                     description=raw.get("provider")
                     if isinstance(raw.get("provider"), str)
                     else None,
