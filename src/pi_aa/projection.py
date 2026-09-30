@@ -186,7 +186,7 @@ class TranscriptProjector:
                     key=f"{entry_id or 'user'}:user",
                     role="user",
                     text=text,
-                    client_message_id=self._take_client_message_id(text),
+                    client_message_id=self._client_message_id_for(text),
                 )
         elif role == "assistant":
             self._apply_assistant(message, entry_id=entry_id)
@@ -404,17 +404,21 @@ class TranscriptProjector:
 
     # -- item construction --------------------------------------------------
 
-    def _take_client_message_id(self, text: str) -> str | None:
+    def _client_message_id_for(self, text: str) -> str | None:
         """Pair one projected user message with its platform client message id.
 
         The platform deduplicates optimistic local sends by this id; without
-        it the echo renders next to the local copy.
+        it the echo renders next to the local copy. The lookup must be
+        idempotent: the same transcript is projected repeatedly (live push
+        plus the polling sync), so consuming a pair would drop the id from
+        later projections and the echo would duplicate again. Identical
+        texts take the most recent id, which is the one an in-flight
+        optimistic send is waiting for.
         """
 
         target = text.strip()
-        for index, (candidate_text, client_message_id) in enumerate(self._client_messages):
+        for candidate_text, client_message_id in reversed(self._client_messages):
             if candidate_text.strip() == target:
-                self._client_messages.pop(index)
                 return client_message_id
         return None
 

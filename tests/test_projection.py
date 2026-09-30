@@ -103,8 +103,8 @@ def test_client_message_id_attaches_to_user_message() -> None:
     assert user_item.source["clientMessageId"] == "cm-1"
 
 
-def test_client_message_ids_pair_in_order() -> None:
-    """Repeated identical texts pair FIFO so each send keeps its own id."""
+def test_client_message_id_lookup_is_idempotent() -> None:
+    """Repeated projections must still find the id; the sync re-projects."""
 
     records = [
         {
@@ -122,14 +122,25 @@ def test_client_message_ids_pair_in_order() -> None:
             "message": {"role": "user", "content": "继续", "timestamp": 2},
         },
     ]
-    items = project_session(
+    client_messages = [("继续", "cm-1"), ("继续", "cm-2")]
+    first = project_session(
         records,
         session_id="s",
         external_session_id="/tmp/s.jsonl",
-        client_messages=[("继续", "cm-1"), ("继续", "cm-2")],
+        client_messages=client_messages,
     )
-    user_items = [item for item in items if item.role == "user"]
-    assert [item.source["clientMessageId"] for item in user_items] == ["cm-1", "cm-2"]
+    second = project_session(
+        records,
+        session_id="s",
+        external_session_id="/tmp/s.jsonl",
+        client_messages=client_messages,
+    )
+    pick = lambda items: [
+        item.source.get("clientMessageId") for item in items if item.role == "user"
+    ]
+    assert pick(first) == pick(second), "a second projection must not lose ids"
+    # Identical texts take the most recent id (the in-flight optimistic send).
+    assert pick(first) == ["cm-2", "cm-2"]
 
 
 def test_compaction_marker() -> None:

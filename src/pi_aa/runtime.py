@@ -641,11 +641,18 @@ class PiRuntime(AgentRuntime):
                 metadata={"reason": "session file unreadable"},
             )
         live = self._live.get(session_id)
+        client_messages = tuple(live.client_messages) if live is not None else ()
+        logger.info(
+            "pi project session_id=%s live=%s client_message_pairs=%d",
+            session_id,
+            live is not None,
+            len(client_messages),
+        )
         items = projection.project_session(
             doc.entries,
             session_id=session_id,
             external_session_id=doc.summary.path,
-            client_messages=tuple(live.client_messages) if live is not None else (),
+            client_messages=client_messages,
         )
         truncated = limit is not None and limit > 0
         if truncated:
@@ -1385,6 +1392,12 @@ class PiRuntime(AgentRuntime):
         if not force and key == live.last_state_key:
             return
         state = self._live_state(live)
+        logger.info(
+            "pi state push session_id=%s status=%s force=%s",
+            state.session_id,
+            state.status,
+            force,
+        )
         try:
             await self.host.session_state_update(
                 session_id=state.session_id,
