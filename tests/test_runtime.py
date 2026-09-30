@@ -71,6 +71,9 @@ async def test_list_sessions_and_snapshot(
         result = await runtime.create_and_start_session("sess-abc", "你好", cwd=str(tmp_path))
         assert result.ok is True
         await wait_for(lambda: session_file.is_file())
+        # The settle push records the file as synced before notifying the host;
+        # wait for it so the scanner check below cannot race the async push.
+        await wait_for(lambda: len(fake_host.timeline_syncs) >= 1)
 
         sessions = await runtime.list_sessions()
         assert len(sessions) == 1
