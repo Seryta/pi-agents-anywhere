@@ -31,8 +31,7 @@ pi --mode rpc （每个活跃会话一个子进程）
 ```bash
 cd /path/to/pi-agents-anywhere
 uv venv .venv --python 3.12
-uv pip install --index-url https://pypi.org/simple/ \
-    -e /path/to/Agents-Anywhere/connector
+uv pip install -e /path/to/Agents-Anywhere/connector
 uv pip install -e . --no-deps     # 依赖已由 connector 提供
 ```
 
@@ -58,9 +57,9 @@ Description=Agents Anywhere Connector (with Pi runtime)
 After=network-online.target
 
 [Service]
-# 按实际 checkout 路径替换 %h/Git/github/pi-agents-anywhere；
+# 把 %h/pi-agents-anywhere 换成实际 checkout 路径；
 # 裸跑 `pi-aa-connector`（不带子命令）等价于 `start`。
-ExecStart=%h/Git/github/pi-agents-anywhere/.venv/bin/pi-aa-connector start
+ExecStart=%h/pi-agents-anywhere/.venv/bin/pi-aa-connector start
 Restart=on-failure
 RestartSec=5
 
@@ -120,10 +119,13 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 
 ```bash
 docker/build-test-env.sh                        # 构建测试镜像（Python 3.12 + Node + 真 pi + pytest）
-docker/run-tests.sh                             # 单元测试（fake pi，22 项）
+docker/run-tests.sh                             # 单元测试（fake pi）
 PI_AA_TRUE_PI=1 docker/run-tests.sh             # 追加真 pi 集成测试
 PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 ```
+
+镜像构建默认走官方源；受限网络可通过 `PI_AA_NODE_DIST` / `PI_AA_NPM_REGISTRY` /
+`PI_AA_PIP_INDEX_URL` 环境变量（或 `--build-arg`）指向镜像源。
 
 `docker/run-tests.sh` 默认从 `../Agents-Anywhere/connector` 读取官方 Connector 源码，可用
 `PI_AA_CONNECTOR_SOURCE` 覆盖。测试镜像把真 pi（`@earendil-works/pi-coding-agent`）装进容器，
@@ -132,13 +134,13 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`27 passed`，含真 pi 与真实模型一轮）：
+已验证（`34 passed, 1 skipped`；真 pi 集成在列，真实模型轮次为可选项）：
 
-- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程。
-- 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、一轮真实模型的完整投影。
+- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程、CLI 参数解析与错误映射。
+- 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
+- 端到端：与自托管 AA Server 2.0.0 的连接、既有会话批量同步与时间线投影、模型目录上报。
 
 未验证（需要环境）：
 
-- 与真实 AA Server 的端到端（配对自己的自托管实例）。
-- AA 各客户端（Web / Desktop / Android / iOS）上的渲染效果。
+- AA 各客户端（Web / Desktop / Android / iOS）上的完整渲染验收。
 - Windows 平台；多会话并发压力。

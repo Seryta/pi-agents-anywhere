@@ -19,8 +19,7 @@ from typing import Any
 INSTALL_HINT = (
     "anywhere-cli (the Agents Anywhere connector) is not importable.\n"
     "Install it from the Agents Anywhere repository:\n"
-    "    uv pip install --index-url https://pypi.org/simple/ \\\n"
-    "        -e /path/to/Agents-Anywhere/connector\n"
+    "    uv pip install -e /path/to/Agents-Anywhere/connector\n"
     "    uv pip install -e . --no-deps"
 )
 

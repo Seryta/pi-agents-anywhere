@@ -9,18 +9,23 @@ FROM python:3.12-slim
 
 ARG NODE_VERSION=v22.14.0
 ARG PI_VERSION=0.87.1
+# Registry endpoints default to the upstream projects; override them for
+# restricted networks, e.g. --build-arg PIP_INDEX_URL=<mirror>/pypi/simple.
+ARG NODE_DIST=https://nodejs.org/dist
+ARG NPM_REGISTRY=https://registry.npmjs.org
+ARG PIP_INDEX_URL=https://pypi.org/simple
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
-    && curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
+    && curl -fsSL -o /tmp/node.tar.xz "${NODE_DIST}/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
     && tar -xf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm /tmp/node.tar.xz \
-    && npm config set registry https://registry.npmjs.org \
+    && npm config set registry "${NPM_REGISTRY}" \
     && npm install -g "@earendil-works/pi-coding-agent@${PI_VERSION}" \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -i https://pypi.org/simple/ \
+RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" \
         pytest \
         pytest-asyncio \
         pydantic \
