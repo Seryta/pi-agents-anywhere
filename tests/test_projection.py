@@ -100,7 +100,7 @@ def test_client_message_id_attaches_to_user_message() -> None:
         client_messages=[("你好", "cm-1")],
     )
     user_item = next(item for item in items if item.role == "user")
-    assert user_item.metadata["clientMessageId"] == "cm-1"
+    assert user_item.source["clientMessageId"] == "cm-1"
 
 
 def test_client_message_ids_pair_in_order() -> None:
@@ -129,7 +129,7 @@ def test_client_message_ids_pair_in_order() -> None:
         client_messages=[("继续", "cm-1"), ("继续", "cm-2")],
     )
     user_items = [item for item in items if item.role == "user"]
-    assert [item.metadata["clientMessageId"] for item in user_items] == ["cm-1", "cm-2"]
+    assert [item.source["clientMessageId"] for item in user_items] == ["cm-1", "cm-2"]
 
 
 def test_compaction_marker() -> None:

@@ -452,7 +452,7 @@ async def test_start_turn_attaches_client_message_id(
         await runtime.start_turn("sess-cm", None, "你好", client_message_id="cm-42")
         await wait_for(
             lambda: any(
-                item.metadata.get("clientMessageId") == "cm-42"
+                item.source.get("clientMessageId") == "cm-42"
                 for sync in fake_host.timeline_syncs
                 for item in sync["items"]
             )

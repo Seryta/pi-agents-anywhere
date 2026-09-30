@@ -186,7 +186,7 @@ class TranscriptProjector:
                     key=f"{entry_id or 'user'}:user",
                     role="user",
                     text=text,
-                    metadata=self._take_client_message_metadata(text),
+                    client_message_id=self._take_client_message_id(text),
                 )
         elif role == "assistant":
             self._apply_assistant(message, entry_id=entry_id)
@@ -404,7 +404,7 @@ class TranscriptProjector:
 
     # -- item construction --------------------------------------------------
 
-    def _take_client_message_metadata(self, text: str) -> dict[str, Any] | None:
+    def _take_client_message_id(self, text: str) -> str | None:
         """Pair one projected user message with its platform client message id.
 
         The platform deduplicates optimistic local sends by this id; without
@@ -415,7 +415,7 @@ class TranscriptProjector:
         for index, (candidate_text, client_message_id) in enumerate(self._client_messages):
             if candidate_text.strip() == target:
                 self._client_messages.pop(index)
-                return {"clientMessageId": client_message_id}
+                return client_message_id
         return None
 
     def _add_message(
@@ -426,6 +426,7 @@ class TranscriptProjector:
         text: str,
         status: str = "done",
         metadata: Mapping[str, Any] | None = None,
+        client_message_id: str | None = None,
     ) -> RuntimeTimelineItem:
         return self._append(
             key=key,
@@ -435,6 +436,7 @@ class TranscriptProjector:
             content={"kind": "markdown", "format": "markdown", "text": text},
             native_type="message",
             metadata=metadata,
+            client_message_id=client_message_id,
         )
 
     def _add_system_text(
@@ -500,6 +502,7 @@ class TranscriptProjector:
         native_type: str,
         turn_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        client_message_id: str | None = None,
     ) -> RuntimeTimelineItem:
         self._order += 1
         item = self._build(
@@ -512,6 +515,7 @@ class TranscriptProjector:
             native_type=native_type,
             turn_id=turn_id if turn_id is not None else self._current_turn_id,
             metadata=metadata,
+            client_message_id=client_message_id,
         )
         self._items.append(item)
         return item
@@ -550,6 +554,7 @@ class TranscriptProjector:
         native_type: str,
         turn_id: str | None,
         metadata: Mapping[str, Any] | None,
+        client_message_id: str | None = None,
     ) -> RuntimeTimelineItem:
         source = TimelineSource(
             runtime=RUNTIME,
@@ -557,6 +562,7 @@ class TranscriptProjector:
             turn_id=turn_id,
             native_item_id=key,
             native_item_type=native_type,
+            client_message_id=client_message_id,
         ).to_mapping()
         return RuntimeTimelineItem(
             id=item_id(self.external_session_id, item_type, key),
