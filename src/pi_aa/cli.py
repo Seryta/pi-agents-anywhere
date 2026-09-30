@@ -18,9 +18,9 @@ from typing import Any
 
 INSTALL_HINT = (
     "anywhere-cli (the Agents Anywhere connector) is not importable.\n"
-    "Install it from the Agents Anywhere repository:\n"
-    "    uv pip install -e /path/to/Agents-Anywhere/connector\n"
-    "    uv pip install -e . --no-deps"
+    "Install the package, or a source checkout:\n"
+    "    uv pip install anywhere-cli\n"
+    "    # or: uv pip install -e /path/to/Agents-Anywhere/connector"
 )
 
 SHELL_LIFETIME_WARNING = (

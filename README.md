@@ -1,5 +1,7 @@
 # pi-agents-anywhere
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-222222?style=flat)](LICENSE)
+
 把 [pi coding agent](https://github.com/earendil-works/pi) 接入 [Agents Anywhere](https://github.com/anywhere-labs/Agents-Anywhere) 工作台的连接器适配器。
 
 Agents Anywhere（下称 AA）官方 Connector 只内置 Codex / Claude / DSH 三个 Runtime。本项目提供一个 **pi** Runtime：通过官方注入点把 `PiProvider` / `PiRuntime` 挂进 Connector，用 `pi --mode rpc` 驱动本机 pi，并把 pi 会话投影为平台 Timeline。**不修改官方 Connector 源码。**
@@ -26,11 +28,17 @@ pi --mode rpc （每个活跃会话一个子进程）
 
 ## 安装
 
-官方 Connector v2 尚未发布到 PyPI，需要从源码安装（依赖较重，建议用独立虚拟环境）：
+官方 Connector 自 `anywhere-cli` 2.0.0 起可从 PyPI 安装（依赖较重，建议用独立虚拟环境）：
 
 ```bash
 cd /path/to/pi-agents-anywhere
 uv venv .venv --python 3.12
+uv pip install -e .               # 依赖会从 PyPI 解析（含官方 anywhere-cli）
+```
+
+如需跟随官方仓库的最新源码：
+
+```bash
 uv pip install -e /path/to/Agents-Anywhere/connector
 uv pip install -e . --no-deps     # 依赖已由 connector 提供
 ```
@@ -127,6 +135,8 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 镜像构建默认走官方源；受限网络可通过 `PI_AA_NODE_DIST` / `PI_AA_NPM_REGISTRY` /
 `PI_AA_PIP_INDEX_URL` 环境变量（或 `--build-arg`）指向镜像源。
 
+自定义命令以参数形式传递，例如 `docker/run-tests.sh python -m pytest tests/test_cli.py`。
+
 `docker/run-tests.sh` 默认从 `../Agents-Anywhere/connector` 读取官方 Connector 源码，可用
 `PI_AA_CONNECTOR_SOURCE` 覆盖。测试镜像把真 pi（`@earendil-works/pi-coding-agent`）装进容器，
 `tests/test_true_pi.py` 直接驱动它——不依赖模型账号的部分随时可跑；`test_real_model_turn`
@@ -134,7 +144,7 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`34 passed, 1 skipped`；真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`37 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
 
 - 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
