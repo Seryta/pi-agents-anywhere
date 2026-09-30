@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
@@ -668,10 +669,9 @@ class PiRuntime(AgentRuntime):
             )
             if len(models) >= limit:
                 break
-        self._catalog_revision += 1
         return RuntimeModelCatalog(
             runtime=RUNTIME,
-            revision=self._catalog_revision,
+            revision=self._next_catalog_revision(),
             models=tuple(models),
             runtime_id=self.config.runtime_id,
         )
@@ -682,12 +682,25 @@ class PiRuntime(AgentRuntime):
         limit: int = 100,
     ) -> RuntimePermissionCatalog:
         _ = query, limit
+        # Pi permission presets are not modeled; the catalog stays empty and
+        # keeps revision 0 so the platform stores it once as idempotent.
         return RuntimePermissionCatalog(
             runtime=RUNTIME,
             revision=0,
             permissions=(),
             runtime_id=self.config.runtime_id,
         )
+
+    def _next_catalog_revision(self) -> int:
+        """Monotonic revision for runtime catalogs.
+
+        The platform ignores a catalog whose revision does not exceed the
+        stored one, so a per-process counter stalls every update after a
+        connector restart; a millisecond clock stays monotonic across them.
+        """
+
+        self._catalog_revision = max(int(time.time() * 1000), self._catalog_revision + 1)
+        return self._catalog_revision
 
     # -- commands -----------------------------------------------------------
 

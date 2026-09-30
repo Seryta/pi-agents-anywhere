@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -317,3 +318,34 @@ def test_model_display_title_rules() -> None:
     # Same provider, several ids under one name: append the model id.
     assert _model_display_title("Routed", "test", "a", directory) == "Routed [a]"
     assert _model_display_title("Solo", "test", "s", directory) == "Solo"
+
+
+def test_catalog_revision_is_monotonic_across_restarts(tmp_path: Path) -> None:
+    """The platform drops catalogs whose revision does not exceed the stored
+    one, so a restarted connector must still produce larger revisions."""
+
+    def make() -> PiRuntime:
+        return PiRuntime(
+            config=RuntimeConfig(
+                runtime="pi",
+                revision=1,
+                values={
+                    "executablePath": "pi",
+                    "sessionsDir": str(tmp_path / "sessions"),
+                    "defaultCwd": str(tmp_path),
+                    "requestTimeoutMs": 5000,
+                },
+            ),
+            host=FakeHost(),
+        )
+
+    first = make()
+    revisions = [first._next_catalog_revision() for _ in range(3)]
+    assert revisions == sorted(revisions)
+    assert len(set(revisions)) == 3
+    # A real connector restart takes at least milliseconds; the clock-based
+    # revision then exceeds the previous process even though it restarted from
+    # an empty in-memory counter.
+    time.sleep(0.005)
+    restarted = make()
+    assert restarted._next_catalog_revision() > revisions[-1]
