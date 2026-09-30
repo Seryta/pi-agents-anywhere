@@ -98,6 +98,16 @@ def test_title_falls_back_to_first_user_message(tmp_path: Path) -> None:
     assert summaries[0].title == "请帮我改一下这个 bug"
 
 
+def test_placeholder_session_name_falls_back_to_first_message(tmp_path: Path) -> None:
+    """AA's default composer title must not shadow the first-message title."""
+
+    session = tmp_path / "sessions" / "a" / "s.jsonl"
+    write_session(session, name="新建会话")
+    directory = SessionDirectory(tmp_path / "sessions")
+    summaries = directory.list_sessions()
+    assert summaries[0].title == "请帮我改一下这个 bug"
+
+
 def test_load_active_branch(tmp_path: Path) -> None:
     session = tmp_path / "sessions" / "a" / "s.jsonl"
     write_session(session)

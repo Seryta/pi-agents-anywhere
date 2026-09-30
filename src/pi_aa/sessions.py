@@ -62,6 +62,21 @@ def _extract_text(content: Any) -> str:
     return "".join(parts)
 
 
+# AA's new-session composer sends its default title ("新建会话") with the
+# create request. It is not a user-chosen name, and persisting it in the pi
+# session file would permanently shadow the first-message title fallback.
+PLACEHOLDER_TITLES = frozenset({"新建会话", "New session"})
+
+
+def is_meaningful_title(value: str | None) -> bool:
+    """Whether a session name is worth persisting as the title."""
+
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return bool(text) and text not in PLACEHOLDER_TITLES
+
+
 def _truncate_title(text: str) -> str | None:
     cleaned = " ".join(text.split())
     if not cleaned:
@@ -112,7 +127,7 @@ def summarize_session(path: Path) -> PiSessionSummary | None:
             continue
         if record.get("type") == "session_info":
             name = record.get("name")
-            if isinstance(name, str) and name.strip():
+            if is_meaningful_title(name):
                 title = name.strip()
         elif first_user_text is None and record.get("type") == "message":
             message = record.get("message")

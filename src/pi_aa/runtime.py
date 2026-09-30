@@ -62,6 +62,7 @@ from pi_aa.rpc import (
 from pi_aa.sessions import (
     PiSessionSummary,
     SessionDirectory,
+    is_meaningful_title,
     load_session_doc,
 )
 
@@ -876,7 +877,7 @@ class PiRuntime(AgentRuntime):
         live = PiLiveSession(self, session_id, cwd=workdir)
         self._live[session_id] = live
         await live.ensure_started()
-        if title:
+        if is_meaningful_title(title):
             await live.command({"type": "set_session_name", "name": title})
         if selections:
             await self._apply_selections(live, selections)

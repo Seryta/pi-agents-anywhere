@@ -439,6 +439,28 @@ async def test_start_turn_forwards_image_attachments(
     assert image["data"] == base64.b64encode(FAKE_PNG_BYTES).decode("ascii")
 
 
+async def test_create_session_skips_placeholder_title(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """AA's default title must not be written into the pi session file."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session(
+            "sess-placeholder",
+            "你好",
+            title="新建会话",
+            cwd=str(tmp_path),
+        )
+        live = runtime._live["sess-placeholder"]
+        assert live.session_name is None
+    finally:
+        await runtime.stop()
+
+
 async def test_runtime_start_publishes_runtime_capabilities(
     fake_pi: Path,
     tmp_path: Path,
