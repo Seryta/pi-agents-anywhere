@@ -439,6 +439,50 @@ async def test_start_turn_forwards_image_attachments(
     assert image["data"] == base64.b64encode(FAKE_PNG_BYTES).decode("ascii")
 
 
+async def test_start_resets_stale_running_states(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """A restart re-announces idle for sessions the platform may see as running."""
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session = sessions_dir / "restart.jsonl"
+    session.write_text(
+        json.dumps(
+            {
+                "type": "session",
+                "version": 3,
+                "id": "sess-restart",
+                "cwd": str(tmp_path),
+                "timestamp": "t",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "message",
+                "id": "u1",
+                "parentId": None,
+                "timestamp": "t",
+                "message": {"role": "user", "content": "你好", "timestamp": 1},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await wait_for(lambda: any(state.get("status") == "idle" for state in fake_host.states))
+        state = next(item for item in fake_host.states if item.get("status") == "idle")
+        assert state["runtime"] == "pi"
+        assert state["session_id"].startswith("sess_pi_")
+    finally:
+        await runtime.stop()
+
+
 async def test_start_turn_attaches_client_message_id(
     fake_pi: Path,
     tmp_path: Path,

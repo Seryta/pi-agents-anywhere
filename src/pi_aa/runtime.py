@@ -425,6 +425,7 @@ class PiRuntime(AgentRuntime):
         self._catalog_revision = 0
         self._stopping = False
         self._reclaim_task: asyncio.Task[None] | None = None
+        self._stale_reset_task: asyncio.Task[None] | None = None
         self._identity = RuntimeIdentity(
             runtime=RUNTIME,
             runtime_version="unknown",
@@ -445,6 +446,7 @@ class PiRuntime(AgentRuntime):
         self._identity = replace(self._identity, runtime_version=version)
         logger.info("pi runtime started version=%s", version)
         await self._publish_runtime_capabilities()
+        self._stale_reset_task = asyncio.create_task(self._reset_stale_running_states())
         if self._idle_timeout > 0:
             self._reclaim_task = asyncio.create_task(self._reclaim_loop())
 
@@ -465,13 +467,16 @@ class PiRuntime(AgentRuntime):
 
     async def stop(self) -> None:
         self._stopping = True
-        if self._reclaim_task is not None:
-            self._reclaim_task.cancel()
+        for task in (self._reclaim_task, self._stale_reset_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._reclaim_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._reclaim_task = None
+        self._reclaim_task = None
+        self._stale_reset_task = None
         for live in list(self._live.values()):
             await live.stop()
         self._live.clear()
@@ -479,6 +484,39 @@ class PiRuntime(AgentRuntime):
         if self._utility is not None:
             await self._utility.close()
             self._utility = None
+
+    async def _reset_stale_running_states(self) -> None:
+        """Re-announce idle for sessions left running by a previous process.
+
+        A connector restart kills live pi processes before their exit state
+        can be published, so the platform keeps showing "running" until the
+        next turn. Right after start() this runtime owns no live process, so
+        idle is accurate; the platform skips states that did not change.
+        """
+
+        try:
+            summaries = await self.list_complete_session_inventory()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # a failed scan must not break startup
+            logger.exception("failed to list sessions for stale state reset")
+            return
+        reset = 0
+        for summary in summaries:
+            try:
+                await self.host.session_state_update(
+                    session_id=summary.session_id,
+                    runtime=RUNTIME,
+                    external_session_id=summary.external_session_id,
+                    status="idle",
+                    metadata={"sessionFile": summary.external_session_id},
+                )
+                reset += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("failed to reset idle state for %s", summary.session_id)
+        logger.info("reset idle state for %d sessions after restart", reset)
 
     async def _reclaim_loop(self) -> None:
         while True:
