@@ -115,9 +115,7 @@ def _model_display_title(
 
     same_name = [entry for entry in directory if entry[0] == name]
     multiple_providers = any(entry[1] != provider for entry in same_name)
-    duplicate_model = any(
-        entry[1] == provider and entry[2] != model_id for entry in same_name
-    )
+    duplicate_model = any(entry[1] == provider and entry[2] != model_id for entry in same_name)
     title = name
     if multiple_providers and provider:
         title += f"（{provider}）"
