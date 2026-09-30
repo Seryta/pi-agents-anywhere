@@ -439,6 +439,51 @@ async def test_start_turn_forwards_image_attachments(
     assert image["data"] == base64.b64encode(FAKE_PNG_BYTES).decode("ascii")
 
 
+async def test_reclaims_idle_sessions(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """Idle pi processes are closed; the session file remains for revival."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session("sess-idle", "你好", cwd=str(tmp_path))
+        live = runtime._live["sess-idle"]
+        assert live.alive
+        runtime._idle_timeout = 0.05
+        live.last_activity -= 1.0
+        await runtime._reclaim_idle_sessions()
+        assert "sess-idle" not in runtime._live
+        await wait_for(lambda: not live.alive)
+    finally:
+        await runtime.stop()
+
+
+async def test_keeps_active_sessions_during_reclaim(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """A streaming session must survive an idle reclaim pass."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session("sess-busy", "你好", cwd=str(tmp_path))
+        live = runtime._live["sess-busy"]
+        runtime._idle_timeout = 0.05
+        live.is_streaming = True
+        live.last_activity -= 1.0
+        await runtime._reclaim_idle_sessions()
+        assert runtime._live.get("sess-busy") is live
+        assert live.alive
+    finally:
+        runtime._live["sess-busy"].is_streaming = False
+        await runtime.stop()
+
+
 async def test_create_session_skips_placeholder_title(
     fake_pi: Path,
     tmp_path: Path,

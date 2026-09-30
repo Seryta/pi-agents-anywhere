@@ -71,6 +71,9 @@ logger = logging.getLogger(__name__)
 RUNTIME = "pi"
 PLATFORM_SESSION_PREFIX = "sess_pi_"
 
+# How often the idle reclaim loop inspects live sessions.
+RECLAIM_INTERVAL_SECONDS = 15.0
+
 # Pi consumes images as base64 ``ImageContent``; these are the formats the
 # model providers behind Pi accept in practice.
 PI_IMAGE_MIME_TYPES: tuple[str, ...] = (
@@ -258,6 +261,7 @@ class PiLiveSession:
         self.message_count = 0
         self.status_reason: str | None = None
         self.pending_ui: dict[str, PendingInteraction] = {}
+        self.last_activity = time.monotonic()
         self._start_lock = asyncio.Lock()
         self.last_state_key: tuple[Any, ...] | None = None
 
@@ -319,6 +323,11 @@ class PiLiveSession:
         self.apply_state(data)
         return data
 
+    def touch(self) -> None:
+        """Record activity so the idle reclaim loop leaves this session alone."""
+
+        self.last_activity = time.monotonic()
+
     def apply_state(self, data: Mapping[str, Any]) -> None:
         model = data.get("model")
         if isinstance(model, Mapping):
@@ -347,6 +356,7 @@ class PiLiveSession:
         timeout: float | None = None,
     ) -> Mapping[str, Any]:
         await self.ensure_started()
+        self.touch()
         process = self.process
         if process is None:
             raise PiRpcProcessExited("Pi RPC process is not running")
@@ -401,6 +411,7 @@ class PiRuntime(AgentRuntime):
         values = normalized_config_values(dict(config.values))
         self.executable = str(values["executablePath"])
         self.request_timeout = int(values["requestTimeoutMs"]) / 1000
+        self._idle_timeout = float(values["idleTimeoutSeconds"])
         self.default_cwd = str(values["defaultCwd"])
         self.sessions_dir = Path(str(values["sessionsDir"]))
         self.directory = SessionDirectory(self.sessions_dir)
@@ -411,6 +422,7 @@ class PiRuntime(AgentRuntime):
         self._utility: PiRpcProcess | None = None
         self._catalog_revision = 0
         self._stopping = False
+        self._reclaim_task: asyncio.Task[None] | None = None
         self._identity = RuntimeIdentity(
             runtime=RUNTIME,
             runtime_version="unknown",
@@ -431,6 +443,8 @@ class PiRuntime(AgentRuntime):
         self._identity = replace(self._identity, runtime_version=version)
         logger.info("pi runtime started version=%s", version)
         await self._publish_runtime_capabilities()
+        if self._idle_timeout > 0:
+            self._reclaim_task = asyncio.create_task(self._reclaim_loop())
 
     async def _publish_runtime_capabilities(self) -> None:
         """Push runtime-scoped facts so the platform persists them.
@@ -449,6 +463,13 @@ class PiRuntime(AgentRuntime):
 
     async def stop(self) -> None:
         self._stopping = True
+        if self._reclaim_task is not None:
+            self._reclaim_task.cancel()
+            try:
+                await self._reclaim_task
+            except asyncio.CancelledError:
+                pass
+            self._reclaim_task = None
         for live in list(self._live.values()):
             await live.stop()
         self._live.clear()
@@ -456,6 +477,46 @@ class PiRuntime(AgentRuntime):
         if self._utility is not None:
             await self._utility.close()
             self._utility = None
+
+    async def _reclaim_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(RECLAIM_INTERVAL_SECONDS)
+                await self._reclaim_idle_sessions()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a failed pass must not kill the loop
+                logger.exception("pi idle reclaim pass failed")
+
+    async def _reclaim_idle_sessions(self) -> None:
+        """Close pi processes whose sessions stayed idle past the timeout."""
+
+        if self._idle_timeout <= 0:
+            return
+        now = time.monotonic()
+        for session_id in list(self._live):
+            live = self._live.get(session_id)
+            if live is None:
+                continue
+            if now - live.last_activity < self._idle_timeout:
+                continue
+            if live.is_streaming or live.is_compacting or live.pending_ui:
+                continue
+            # Serialize with _ensure_live so a reviving turn cannot race the close.
+            async with self._live_lock(session_id):
+                if self._live.get(session_id) is not live:
+                    continue
+                if now - live.last_activity < self._idle_timeout:
+                    continue
+                if live.is_streaming or live.is_compacting or live.pending_ui:
+                    continue
+                self._live.pop(session_id, None)
+            logger.info(
+                "reclaimed idle pi session session_id=%s idle_seconds=%.0f",
+                session_id,
+                now - live.last_activity,
+            )
+            await live.stop()
 
     # -- discovery / inventory ---------------------------------------------
 
@@ -986,6 +1047,7 @@ class PiRuntime(AgentRuntime):
     # -- live event handling ------------------------------------------------
 
     async def handle_live_event(self, live: PiLiveSession, record: Mapping[str, Any]) -> None:
+        live.touch()
         event_type = record.get("type")
         if event_type == "extension_ui_request":
             await self._handle_ui_request(live, record)

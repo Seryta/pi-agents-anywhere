@@ -112,6 +112,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `sessionsDir` | `~/.pi/agent/sessions` | 会话目录；会作为 `--session-dir` 传给子进程 |
 | `defaultCwd` | `~` | 未指定工作目录时使用的目录 |
 | `requestTimeoutMs` | `60000` | 单条 RPC 命令超时 |
+| `idleTimeoutSeconds` | `600` | 空闲回收：会话进程空闲超过该时长后被关闭（0 禁用），会话文件保留，下一条消息自动恢复 |
 
 ## 已知限制
 
@@ -119,7 +120,6 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 - **无权限目录**：pi 没有运行时工具审批概念（工具权限由启动配置决定），因此没有 permission catalog。
 - **非逐 token 流式**：Timeline 在轮次结束（`agent_settled`）时推送，不推送 delta 级文本。
 - **`notify` 通知不会被自动清除**：映射为 `open` 状态的 notification notice。
-- **空闲进程不回收**：活跃过的会话进程保留到 Runtime 停止；多会话长时间运行会累积进程。
 - **时间线跟随 pi 的活跃分支**：在 pi 中切换分支（`/tree`）后，旧分支的远端时间线项会被移除；切回该分支后会重新投影恢复。pi 的会话文件始终保留全部分支，此行为可逆。
 - 仅覆盖 `select/confirm/input/editor` 四种对话框交互；`setStatus`/`setWidget` 等无副作用调用被忽略。
 

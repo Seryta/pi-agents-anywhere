@@ -17,6 +17,7 @@ def test_schema_shape() -> None:
         "sessionsDir",
         "defaultCwd",
         "requestTimeoutMs",
+        "idleTimeoutSeconds",
     }
     assert schema["additionalProperties"] is False
 
@@ -26,6 +27,7 @@ def test_normalized_defaults(tmp_path: Path) -> None:
     assert values["executablePath"] == "pi"
     assert values["sessionsDir"].startswith(str(tmp_path))
     assert values["requestTimeoutMs"] == default_config_values()["requestTimeoutMs"]
+    assert values["idleTimeoutSeconds"] == default_config_values()["idleTimeoutSeconds"]
 
 
 def test_normalized_rejects_bad_timeout() -> None:

@@ -19,6 +19,7 @@ DEFAULT_EXECUTABLE = "pi"
 DEFAULT_SESSIONS_DIR = "~/.pi/agent/sessions"
 DEFAULT_CWD = "~"
 DEFAULT_REQUEST_TIMEOUT_MS = 60_000
+DEFAULT_IDLE_TIMEOUT_SECONDS = 600
 PROBE_TIMEOUT_SECONDS = 20.0
 
 
@@ -96,6 +97,17 @@ def pi_config_schema() -> dict[str, Any]:
                 "description": "单条 RPC 命令等待响应的最长时间。",
                 "default": DEFAULT_REQUEST_TIMEOUT_MS,
             },
+            "idleTimeoutSeconds": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 86400,
+                "title": "空闲回收（秒）",
+                "description": (
+                    "空闲超过该时长的会话进程会被关闭（0 表示不回收）；"
+                    "会话文件保留，下一条消息会自动恢复。"
+                ),
+                "default": DEFAULT_IDLE_TIMEOUT_SECONDS,
+            },
         },
         "additionalProperties": False,
     }
@@ -107,6 +119,7 @@ def default_config_values() -> dict[str, Any]:
         "sessionsDir": DEFAULT_SESSIONS_DIR,
         "defaultCwd": DEFAULT_CWD,
         "requestTimeoutMs": DEFAULT_REQUEST_TIMEOUT_MS,
+        "idleTimeoutSeconds": DEFAULT_IDLE_TIMEOUT_SECONDS,
     }
 
 
@@ -131,5 +144,15 @@ def normalized_config_values(raw: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1_000 <= timeout <= 600_000:
         raise RuntimeInvalidRequestError(
             "requestTimeoutMs must be an integer between 1000 and 600000"
+        )
+
+    idle_timeout = values.get("idleTimeoutSeconds")
+    if (
+        not isinstance(idle_timeout, int)
+        or isinstance(idle_timeout, bool)
+        or not 0 <= idle_timeout <= 86_400
+    ):
+        raise RuntimeInvalidRequestError(
+            "idleTimeoutSeconds must be an integer between 0 and 86400"
         )
     return values
