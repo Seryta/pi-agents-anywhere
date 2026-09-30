@@ -26,22 +26,56 @@ pi --mode rpc （每个活跃会话一个子进程）
 
 ## 安装
 
-官方 Connector v2 尚未发布到 PyPI，需要从源码安装：
+官方 Connector v2 尚未发布到 PyPI，需要从源码安装（依赖较重，建议用独立虚拟环境）：
 
 ```bash
-uv pip install /path/to/Agents-Anywhere/connector
-uv pip install /path/to/pi-agents-anywhere     # 本项目
+cd /path/to/pi-agents-anywhere
+uv venv .venv --python 3.12
+uv pip install --index-url https://pypi.org/simple/ \
+    -e /path/to/Agents-Anywhere/connector
+uv pip install -e . --no-deps     # 依赖已由 connector 提供
 ```
 
 ## 使用
 
-在工作设备（装了 pi 的机器）上运行：
+### 1. 配对（只需一次）
 
 ```bash
-pi-aa-connector
+.venv/bin/pi-aa-connector pair https://your-server --no-start
 ```
 
-连接参数、配对方式、状态目录与官方 `anywhere-cli` 完全一致（`~/.agents-anywhere`、`AGENT_*` 环境变量）。随后在 AA 工作台里配置 pi Runtime（可执行文件、会话目录等）并创建会话。
+命令会打印配对码，在 AA 工作台的「添加设备」里输入该码；凭据保存到
+`~/.agents-anywhere/connector.json`（与官方 CLI 同一配置）。
+
+### 2. 常驻运行
+
+测试/构建在容器里，运行在工作设备上。推荐 systemd user service：
+
+```ini
+# ~/.config/systemd/user/pi-aa-connector.service
+[Unit]
+Description=Agents Anywhere Connector (with Pi runtime)
+After=network-online.target
+
+[Service]
+# 按实际 checkout 路径替换 %h/Git/github/pi-agents-anywhere；
+# 裸跑 `pi-aa-connector`（不带子命令）等价于 `start`。
+ExecStart=%h/Git/github/pi-agents-anywhere/.venv/bin/pi-aa-connector start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now pi-aa-connector
+loginctl enable-linger "$USER"   # 无登录会话时也保持运行
+```
+
+连接参数、配对方式、状态目录与官方 `anywhere-cli` 完全一致（`~/.agents-anywhere`、`AGENT_*` 环境变量）。
+随后在 AA 工作台里配置 pi Runtime（可执行文件、会话目录等）并创建会话。
 
 ## 能力映射
 
