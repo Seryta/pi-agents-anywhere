@@ -69,9 +69,7 @@ async def test_real_catalogs(tmp_path: Path, fake_host: FakeHost) -> None:
         await runtime.stop()
 
 
-async def test_real_open_existing_session_file(
-    tmp_path: Path, fake_host: FakeHost
-) -> None:
+async def test_real_open_existing_session_file(tmp_path: Path, fake_host: FakeHost) -> None:
     project = tmp_path / "project"
     project.mkdir()
     session_file = tmp_path / "sessions" / "--tmp-project--" / "2026_sess.jsonl"
