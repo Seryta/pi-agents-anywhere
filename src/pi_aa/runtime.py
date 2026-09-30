@@ -361,6 +361,7 @@ class PiRuntime(AgentRuntime):
         self.sessions_dir = Path(str(values["sessionsDir"]))
         self.directory = SessionDirectory(self.sessions_dir)
         self._live: dict[str, PiLiveSession] = {}
+        self._live_locks: dict[str, asyncio.Lock] = {}
         self._known_paths: dict[str, str] = {}
         self._synced: dict[str, tuple[float, int]] = {}
         self._utility: PiRpcProcess | None = None
@@ -391,6 +392,7 @@ class PiRuntime(AgentRuntime):
         for live in list(self._live.values()):
             await live.stop()
         self._live.clear()
+        self._live_locks.clear()
         if self._utility is not None:
             await self._utility.close()
             self._utility = None
@@ -482,7 +484,8 @@ class PiRuntime(AgentRuntime):
             session_id=session_id,
             external_session_id=doc.summary.path,
         )
-        if limit is not None and limit > 0:
+        truncated = limit is not None and limit > 0
+        if truncated:
             items = items[-limit:]
         self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
         self._known_paths[session_id] = doc.summary.path
@@ -492,7 +495,9 @@ class PiRuntime(AgentRuntime):
             runtime=RUNTIME,
             runtime_id=self.config.runtime_id,
             items=items,
-            complete=True,
+            # Only a full read is a Runtime-owned snapshot; a truncated tail must
+            # not let the platform replace (and delete) the stored history.
+            complete=not truncated,
             metadata={
                 "itemCount": len(items),
                 "piSessionId": doc.summary.session_id,
@@ -964,28 +969,39 @@ class PiRuntime(AgentRuntime):
         cwd: str | None,
     ) -> PiLiveSession:
         live = self._live.get(session_id)
-        if live is not None:
-            await live.ensure_started()
-            return live
-        session_path: str | None = None
-        workdir = self._resolve_cwd(cwd)
-        resolved = self._resolve_session_path(session_id, external_session_id)
-        if resolved is not None:
-            session_path = str(resolved)
-            doc_cwd = await asyncio.to_thread(self._session_cwd, resolved)
-            if doc_cwd:
-                workdir = doc_cwd
-        elif external_session_id:
-            session_path = external_session_id
-        live = PiLiveSession(
-            self,
-            session_id,
-            cwd=workdir,
-            session_path=session_path,
-        )
-        self._live[session_id] = live
+        if live is None:
+            # Resolve the target first; installation below is synchronous, so two
+            # concurrent RPCs for the same session share one live session (and one
+            # pi process) instead of overwriting each other.
+            session_path: str | None = None
+            workdir = self._resolve_cwd(cwd)
+            resolved = self._resolve_session_path(session_id, external_session_id)
+            if resolved is not None:
+                session_path = str(resolved)
+                doc_cwd = await asyncio.to_thread(self._session_cwd, resolved)
+                if doc_cwd:
+                    workdir = doc_cwd
+            elif external_session_id:
+                session_path = external_session_id
+            async with self._live_lock(session_id):
+                live = self._live.get(session_id)
+                if live is None:
+                    live = PiLiveSession(
+                        self,
+                        session_id,
+                        cwd=workdir,
+                        session_path=session_path,
+                    )
+                    self._live[session_id] = live
         await live.ensure_started()
         return live
+
+    def _live_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self._live_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._live_locks[session_id] = lock
+        return lock
 
     @staticmethod
     def _session_cwd(path: Path) -> str | None:
@@ -1012,7 +1028,11 @@ class PiRuntime(AgentRuntime):
     ) -> Path | None:
         candidates: list[str] = []
         if external_session_id:
-            candidates.append(external_session_id)
+            external_path = Path(external_session_id)
+            if self._within_sessions_root(external_path):
+                candidates.append(external_session_id)
+            else:
+                logger.warning("ignoring session path outside sessionsDir: %s", external_session_id)
         live = self._live.get(session_id)
         if live is not None and live.session_file:
             candidates.append(live.session_file)
@@ -1029,6 +1049,15 @@ class PiRuntime(AgentRuntime):
                 self._known_paths[session_id] = summary.path
                 return Path(summary.path)
         return None
+
+    def _within_sessions_root(self, path: Path) -> bool:
+        """Whether a platform-supplied path stays inside the sessions directory."""
+
+        try:
+            path.resolve().relative_to(self.directory.root.resolve())
+        except (OSError, ValueError):
+            return False
+        return True
 
     @staticmethod
     def _reject_attachments(attachments: tuple[RuntimeAttachment, ...]) -> None:

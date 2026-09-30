@@ -62,7 +62,6 @@ class PiRpcProcess:
         on_event: EventListener | None = None,
         on_exit: ExitListener | None = None,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
-        stderr_path: str | None = None,
     ) -> None:
         self._argv = argv
         self._cwd = cwd
@@ -70,13 +69,11 @@ class PiRpcProcess:
         self._on_event = on_event
         self._on_exit = on_exit
         self._request_timeout = request_timeout
-        self._stderr_path = stderr_path
 
         self._process: asyncio.subprocess.Process | None = None
         self._pending: dict[str, asyncio.Future[Mapping[str, Any]]] = {}
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
-        self._stderr_file: Any = None
         self._exit_code: int | None = None
         self._exited = asyncio.Event()
         self._closing = False
@@ -106,22 +103,16 @@ class PiRpcProcess:
         if self._env is not None:
             env.update(self._env)
         logger.debug("starting pi rpc: %s (cwd=%s)", " ".join(self._argv), self._cwd)
-        stderr_target: Any = asyncio.subprocess.PIPE
-        if self._stderr_path:
-            stderr_target = open(self._stderr_path, "ab")  # noqa: ASYNC230, SIM115 - owned until close
         self._process = await asyncio.create_subprocess_exec(
             *self._argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=stderr_target,
+            stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
             env=env,
         )
         self._reader_task = asyncio.create_task(self._read_stdout(), name="pi-rpc-reader")
-        if stderr_target is asyncio.subprocess.PIPE:
-            self._stderr_task = asyncio.create_task(self._read_stderr(), name="pi-rpc-stderr")
-        else:
-            self._stderr_file = stderr_target
+        self._stderr_task = asyncio.create_task(self._read_stderr(), name="pi-rpc-stderr")
 
     async def request(
         self,
@@ -221,9 +212,6 @@ class PiRpcProcess:
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-        if self._stderr_file is not None:
-            with contextlib.suppress(Exception):
-                self._stderr_file.close()
 
     def _fail_pending(self, error: Exception) -> None:
         pending = list(self._pending.values())
