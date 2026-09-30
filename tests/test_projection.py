@@ -90,6 +90,48 @@ def test_projection_ids_and_order_are_stable() -> None:
         assert item.content_hash.startswith("sha256:")
 
 
+def test_client_message_id_attaches_to_user_message() -> None:
+    """The platform dedupes optimistic sends by this metadata id."""
+
+    items = project_session(
+        entries(),
+        session_id="s",
+        external_session_id="/tmp/s.jsonl",
+        client_messages=[("你好", "cm-1")],
+    )
+    user_item = next(item for item in items if item.role == "user")
+    assert user_item.metadata["clientMessageId"] == "cm-1"
+
+
+def test_client_message_ids_pair_in_order() -> None:
+    """Repeated identical texts pair FIFO so each send keeps its own id."""
+
+    records = [
+        {
+            "type": "message",
+            "id": "u1",
+            "parentId": None,
+            "timestamp": "t",
+            "message": {"role": "user", "content": "继续", "timestamp": 1},
+        },
+        {
+            "type": "message",
+            "id": "u2",
+            "parentId": "u1",
+            "timestamp": "t",
+            "message": {"role": "user", "content": "继续", "timestamp": 2},
+        },
+    ]
+    items = project_session(
+        records,
+        session_id="s",
+        external_session_id="/tmp/s.jsonl",
+        client_messages=[("继续", "cm-1"), ("继续", "cm-2")],
+    )
+    user_items = [item for item in items if item.role == "user"]
+    assert [item.metadata["clientMessageId"] for item in user_items] == ["cm-1", "cm-2"]
+
+
 def test_compaction_marker() -> None:
     records = [
         {

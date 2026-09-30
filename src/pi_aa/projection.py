@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -113,7 +113,13 @@ def _tool_exit_code(details: Any) -> int | None:
 class TranscriptProjector:
     """Builds an ordered timeline for one Pi session."""
 
-    def __init__(self, session_id: str, external_session_id: str) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        external_session_id: str,
+        *,
+        client_messages: Sequence[tuple[str, str]] = (),
+    ) -> None:
         self.session_id = session_id
         self.external_session_id = external_session_id
         self._items: list[RuntimeTimelineItem] = []
@@ -121,6 +127,7 @@ class TranscriptProjector:
         self._order = 0
         self._turn_counter = 0
         self._current_turn_id: str | None = None
+        self._client_messages: list[tuple[str, str]] = list(client_messages)
 
     # -- public API ---------------------------------------------------------
 
@@ -179,6 +186,7 @@ class TranscriptProjector:
                     key=f"{entry_id or 'user'}:user",
                     role="user",
                     text=text,
+                    metadata=self._take_client_message_metadata(text),
                 )
         elif role == "assistant":
             self._apply_assistant(message, entry_id=entry_id)
@@ -396,6 +404,20 @@ class TranscriptProjector:
 
     # -- item construction --------------------------------------------------
 
+    def _take_client_message_metadata(self, text: str) -> dict[str, Any] | None:
+        """Pair one projected user message with its platform client message id.
+
+        The platform deduplicates optimistic local sends by this id; without
+        it the echo renders next to the local copy.
+        """
+
+        target = text.strip()
+        for index, (candidate_text, client_message_id) in enumerate(self._client_messages):
+            if candidate_text.strip() == target:
+                self._client_messages.pop(index)
+                return {"clientMessageId": client_message_id}
+        return None
+
     def _add_message(
         self,
         *,
@@ -562,10 +584,13 @@ def project_session(
     *,
     session_id: str,
     external_session_id: str,
+    client_messages: Sequence[tuple[str, str]] = (),
 ) -> tuple[RuntimeTimelineItem, ...]:
     """Project the active branch of a parsed Pi session document."""
 
-    projector = TranscriptProjector(session_id, external_session_id)
+    projector = TranscriptProjector(
+        session_id, external_session_id, client_messages=client_messages
+    )
     projector.project_entries(doc_entries)
     return projector.items()
 

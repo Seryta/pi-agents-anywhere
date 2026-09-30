@@ -261,6 +261,8 @@ class PiLiveSession:
         self.message_count = 0
         self.status_reason: str | None = None
         self.pending_ui: dict[str, PendingInteraction] = {}
+        # (text, clientMessageId) pairs waiting for their projected user message.
+        self.client_messages: list[tuple[str, str]] = []
         self.last_activity = time.monotonic()
         self._start_lock = asyncio.Lock()
         self.last_state_key: tuple[Any, ...] | None = None
@@ -600,10 +602,12 @@ class PiRuntime(AgentRuntime):
                 complete=False,
                 metadata={"reason": "session file unreadable"},
             )
+        live = self._live.get(session_id)
         items = projection.project_session(
             doc.entries,
             session_id=session_id,
             external_session_id=doc.summary.path,
+            client_messages=tuple(live.client_messages) if live is not None else (),
         )
         truncated = limit is not None and limit > 0
         if truncated:
@@ -932,10 +936,12 @@ class PiRuntime(AgentRuntime):
         client_message_id: str | None = None,
         runtime_options: Mapping[str, Any] | None = None,
     ) -> RuntimeOperationResult:
-        _ = client_message_id, runtime_options
+        _ = runtime_options
         images = await self._attachment_images(session_id, attachments)
         workdir = self._resolve_cwd(cwd)
         live = PiLiveSession(self, session_id, cwd=workdir)
+        if client_message_id:
+            live.client_messages.append((content, client_message_id))
         self._live[session_id] = live
         await live.ensure_started()
         if is_meaningful_title(title):
@@ -959,9 +965,10 @@ class PiRuntime(AgentRuntime):
         client_message_id: str | None = None,
         cwd: str | None = None,
     ) -> RuntimeOperationResult:
-        _ = client_message_id
         images = await self._attachment_images(session_id, attachments)
         live = await self._ensure_live(session_id, external_session_id, cwd)
+        if client_message_id:
+            live.client_messages.append((content, client_message_id))
         if selections:
             await self._apply_selections(live, selections)
         behavior = "followUp" if (live.is_streaming or live.is_compacting) else None
@@ -978,9 +985,10 @@ class PiRuntime(AgentRuntime):
         attachments: tuple[RuntimeAttachment, ...] = (),
         client_message_id: str | None = None,
     ) -> RuntimeOperationResult:
-        _ = client_message_id
         images = await self._attachment_images(session_id, attachments)
         live = await self._ensure_live(session_id, external_session_id, None)
+        if client_message_id:
+            live.client_messages.append((content, client_message_id))
         if live.is_streaming:
             await live.send_prompt(content, streaming_behavior="steer", images=images)
             return RuntimeOperationResult(result={"sessionId": session_id, "steered": True})
