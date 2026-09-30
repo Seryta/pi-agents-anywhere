@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the Agents Anywhere connector
+        run: git clone --depth 1 https://github.com/anywhere-labs/Agents-Anywhere.git /tmp/Agents-Anywhere
+
+      - name: Build the test image
+        run: docker/build-test-env.sh
+
+      - name: Lint
+        run: docker/run-tests.sh bash -c "python -m ruff check src tests && python -m ruff format --check src tests"
+
+      - name: Tests (unit + real pi)
+        run: PI_AA_TRUE_PI=1 PI_AA_CONNECTOR_SOURCE=/tmp/Agents-Anywhere/connector docker/run-tests.sh
