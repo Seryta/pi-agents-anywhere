@@ -3,4 +3,4 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-docker build -f "${DIR}/pi-test-env.Dockerfile" -t pi-aa-test-env "$@"
+docker build -f "${DIR}/pi-test-env.Dockerfile" -t pi-aa-test-env "$@" "${DIR}"

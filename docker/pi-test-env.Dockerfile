@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir -i https://pypi.org/simple/ \
         pydantic \
         loguru \
         jsonschema \
+        httpx \
         ruff
 
 WORKDIR /work
