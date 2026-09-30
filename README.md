@@ -21,7 +21,7 @@ pi --mode rpc （每个活跃会话一个子进程）
 ```
 
 - **PiProvider**：发现本机 pi（`pi --version`）、配置校验、按配置创建 Runtime 实例。
-- **PiRuntime**：会话清单（扫描 `~/.pi/agent/sessions`）、会话快照、状态、发送/打断/转向、模型目录、命令、扩展 UI 交互。
+- **PiRuntime**：会话清单（扫描 `~/.pi/agent/sessions`）、会话快照、状态、发送/打断/转向、图片附件、模型目录、命令、扩展 UI 交互。
 - **Timeline 投影**：把 pi 会话文件里的消息、工具调用、轮次翻译成 AA 的 `RuntimeTimelineItem`（同样的投影同时用于历史会话与实时推送）。
 
 注入点来自官方代码：`BackendRpcClient(config, agent_runtime_providers=(...))`（`connector/server/client.py`）。
@@ -95,6 +95,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `interrupt_session` | `abort` |
 | `update_session_selections` | `set_model` / `set_thinking_level` |
 | `get_session_state` | `get_state` + 进程内存态（运行/空闲/等待交互） |
+| `runtime.attachment` | 从平台下载附件，把图片按 base64 `ImageContent` 附加到 `prompt`/`steer`（非图片跳过） |
 | `get_session_snapshot` | 读会话文件 → 时间线投影 |
 | `list_model_catalog` | `get_available_models`（独立工具进程） |
 | `list_commands` / `execute_command` | `get_commands`；执行 = 发送 `/命令` |
@@ -114,7 +115,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 
 ## 已知限制
 
-- **附件（图片）不支持**：pi RPC 支持 base64 图片输入，本项目尚未接线。
+- **附件仅支持图片**：pi RPC 的输入是文本 + `ImageContent`，非图片附件（PDF 等）会被跳过。
 - **无权限目录**：pi 没有运行时工具审批概念（工具权限由启动配置决定），因此没有 permission catalog。
 - **非逐 token 流式**：Timeline 在轮次结束（`agent_settled`）时推送，不推送 delta 级文本。
 - **`notify` 通知不会被自动清除**：映射为 `open` 状态的 notification notice。
@@ -145,9 +146,9 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`37 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`43 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
 
-- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程、CLI 参数解析与错误映射。
+- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程、图片附件转发（下载、base64 编码与命令载荷）、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
 - 端到端：与自托管 AA Server 2.0.0 的连接、既有会话批量同步与时间线投影、模型目录上报。
 
