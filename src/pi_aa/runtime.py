@@ -442,10 +442,8 @@ class PiRuntime(AgentRuntime):
         """
 
         try:
-            await self.host.session_capabilities_update(
-                await self.get_runtime_capabilities()
-            )
-        except Exception:  # noqa: BLE001 - publishing must not block startup
+            await self.host.session_capabilities_update(await self.get_runtime_capabilities())
+        except Exception:  # publishing must not block startup
             logger.exception("failed to publish pi runtime capabilities")
 
     async def stop(self) -> None:
@@ -1228,7 +1226,7 @@ class PiRuntime(AgentRuntime):
                 continue
             try:
                 downloaded = await self.host.attachment_download(session_id, attachment.file_id)
-            except Exception:  # noqa: BLE001
+            except Exception:  # skipped attachments must not block the turn
                 logger.exception(
                     "pi attachment download failed file_id=%s",
                     attachment.file_id,

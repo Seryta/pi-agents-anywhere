@@ -414,8 +414,9 @@ async def test_start_turn_forwards_image_attachments(
         )
         assert result.ok is True
         await wait_for(
-            lambda: session_file.is_file()
-            and "看看这张图" in session_file.read_text(encoding="utf-8")
+            lambda: (
+                session_file.is_file() and "看看这张图" in session_file.read_text(encoding="utf-8")
+            )
         )
     finally:
         await runtime.stop()
@@ -429,8 +430,7 @@ async def test_start_turn_forwards_image_attachments(
     user_message = next(
         record["message"]
         for record in records
-        if record.get("type") == "message"
-        and (record.get("message") or {}).get("role") == "user"
+        if record.get("type") == "message" and (record.get("message") or {}).get("role") == "user"
     )
     blocks = user_message["content"]
     assert isinstance(blocks, list)
