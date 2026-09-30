@@ -119,6 +119,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 - **非逐 token 流式**：Timeline 在轮次结束（`agent_settled`）时推送，不推送 delta 级文本。
 - **`notify` 通知不会被自动清除**：映射为 `open` 状态的 notification notice。
 - **空闲进程不回收**：活跃过的会话进程保留到 Runtime 停止；多会话长时间运行会累积进程。
+- **时间线跟随 pi 的活跃分支**：在 pi 中切换分支（`/tree`）后，旧分支的远端时间线项会被移除；切回该分支后会重新投影恢复。pi 的会话文件始终保留全部分支，此行为可逆。
 - 仅覆盖 `select/confirm/input/editor` 四种对话框交互；`setStatus`/`setWidget` 等无副作用调用被忽略。
 
 ## 开发与测试

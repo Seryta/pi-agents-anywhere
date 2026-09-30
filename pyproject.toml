@@ -21,6 +21,10 @@ dependencies = [
     "anywhere-cli>=2.0.0",
 ]
 
+[project.urls]
+Repository = "https://github.com/Seryta/pi-agents-anywhere"
+Issues = "https://github.com/Seryta/pi-agents-anywhere/issues"
+
 [project.scripts]
 pi-aa-connector = "pi_aa.cli:main"
 
