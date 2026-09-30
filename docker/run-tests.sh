@@ -36,7 +36,10 @@ if [[ "${PI_AA_TRUE_PI_MODEL:-0}" == "1" && -d "${HOME}/.pi/agent" ]]; then
     ARGS+=(-v "${TMP_AGENT}:/root/.pi/agent")
 fi
 cleanup() {
-    [[ -n "${TMP_AGENT}" ]] && rm -rf "${TMP_AGENT}"
+    [[ -z "${TMP_AGENT}" ]] || rm -rf "${TMP_AGENT}"
+    # Keep the script's own exit status: a trailing test would otherwise
+    # replace it with 1 when no temporary agent directory was created.
+    return 0
 }
 trap cleanup EXIT
 
