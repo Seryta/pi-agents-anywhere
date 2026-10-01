@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 INSTALL_HINT = (
     "anywhere-cli (the Agents Anywhere connector) is not importable.\n"
@@ -52,7 +55,50 @@ def build_client(config: Any) -> Any:
     from pi_aa.provider import PiProvider
 
     providers = (*default_runtime_providers(), PiProvider())
-    return backend_rpc_client(config, agent_runtime_providers=providers)
+    client = backend_rpc_client(config, agent_runtime_providers=providers)
+    install_reconnect_reannounce(client)
+    return client
+
+
+def install_reconnect_reannounce(client: Any) -> None:
+    """Re-announce Pi session states on every backend reconnect.
+
+    The platform's runtime-state caches are emptied or staled by a backend
+    restart (for example the server host rebooting) while this connector
+    keeps running; clients then keep refusing input until someone restarts
+    the connector, which would kill live sessions. The official client
+    invokes ``reconnect_event_runtimes`` after every websocket connection,
+    so extending that hook lets the platform converge by itself.
+    """
+
+    runtime_sync = getattr(client, "_runtime_sync", None)
+    original = getattr(runtime_sync, "reconnect_event_runtimes", None)
+    if runtime_sync is None or not callable(original):
+        logger.warning(
+            "connector client has no reconnect_event_runtimes hook; "
+            "session-state re-announce on reconnect is disabled"
+        )
+        return
+
+    async def reconnect_with_reannounce() -> None:
+        await original()
+        await _reannounce_pi_session_states(runtime_sync)
+
+    runtime_sync.reconnect_event_runtimes = reconnect_with_reannounce
+
+
+async def _reannounce_pi_session_states(runtime_sync: Any) -> None:
+    from pi_aa.runtime import PiRuntime
+
+    supervisor = getattr(runtime_sync, "supervisor", None)
+    for runtime_id in list(getattr(supervisor, "runtimes", None) or ()):
+        try:
+            runtime = supervisor.resolve_runtime(runtime_id)
+            native = getattr(runtime, "native_runtime", runtime)
+            if isinstance(native, PiRuntime):
+                await native.reannounce_session_states(reason="backend-reconnect")
+        except Exception:  # one bad runtime must not block the others
+            logger.exception("failed to re-announce session states runtime_id=%s", runtime_id)
 
 
 def _positive_seconds(value: str) -> float:

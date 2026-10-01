@@ -483,6 +483,103 @@ async def test_start_resets_stale_running_states(
         await runtime.stop()
 
 
+def write_pi_session_file(path: Path, *, session_id: str, cwd: str) -> None:
+    """A minimal pi session file: header line plus one user message."""
+
+    path.write_text(
+        json.dumps(
+            {
+                "type": "session",
+                "version": 3,
+                "id": session_id,
+                "cwd": cwd,
+                "timestamp": "t",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "message",
+                "id": "u1",
+                "parentId": None,
+                "timestamp": "t",
+                "message": {"role": "user", "content": "你好", "timestamp": 1},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+async def test_reannounce_session_states_after_reconnect(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Backend state caches converge after a reconnect without killing live sessions."""
+
+    import pi_aa.runtime as runtime_module
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    imported = sessions_dir / "imported.jsonl"
+    write_pi_session_file(imported, session_id="sess-imported", cwd=str(tmp_path))
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        imported_session_id = platform_session_id(fake_host.session_namespace, str(imported))
+        await wait_for(
+            lambda: any(
+                state.get("session_id") == imported_session_id for state in fake_host.states
+            )
+        )
+        # A platform-created session keeps its platform id as the live key,
+        # while the inventory knows the same session under a path-derived id.
+        await runtime.create_and_start_session("sess-live", "你好", cwd=str(tmp_path))
+        await wait_for(lambda: "sess-live" in runtime._live)
+        await wait_for(lambda: runtime._live["sess-live"].status == "idle")
+        live = runtime._live["sess-live"]
+
+        monkeypatch.setattr(runtime_module, "REANNOUNCE_MIN_INTERVAL_SECONDS", 0.0)
+        fake_host.states.clear()
+        await runtime.reannounce_session_states(reason="reconnect")
+
+        announced = {state["session_id"]: state for state in fake_host.states}
+        assert set(announced) == {imported_session_id, "sess-live"}
+        assert announced[imported_session_id]["status"] == "idle"
+        assert announced["sess-live"]["status"] == live.status
+        assert announced["sess-live"]["metadata"]["sessionFile"] == live.session_file
+    finally:
+        await runtime.stop()
+
+
+async def test_reannounce_session_states_skips_repeats_within_interval(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """A reconnect storm must not trigger repeated full inventory scans."""
+
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    write_pi_session_file(
+        sessions_dir / "imported.jsonl", session_id="sess-imported", cwd=str(tmp_path)
+    )
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await wait_for(lambda: any(state.get("status") == "idle" for state in fake_host.states))
+        fake_host.states.clear()
+        await runtime.reannounce_session_states(reason="reconnect")
+        assert fake_host.states == []
+    finally:
+        await runtime.stop()
+
+
 async def test_start_turn_attaches_client_message_id(
     fake_pi: Path,
     tmp_path: Path,

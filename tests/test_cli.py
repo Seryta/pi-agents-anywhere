@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import types
 from pathlib import Path
 from typing import Any
 
@@ -201,3 +203,77 @@ def test_pair_rejects_non_positive_seconds(
         cli.main(["pair", "https://example.test", *args])
     assert excinfo.value.code == 2
     assert "must be greater than zero" in capsys.readouterr().err
+
+
+async def test_install_reconnect_reannounce_calls_pi_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reconnect hook must reach the Pi runtime, not just the original hook."""
+
+    import pi_aa.runtime as runtime_module
+
+    announced: list[str] = []
+
+    class FakePiRuntime:
+        async def reannounce_session_states(self, *, reason: str) -> None:
+            announced.append(reason)
+
+    monkeypatch.setattr(runtime_module, "PiRuntime", FakePiRuntime)
+    pi_runtime = FakePiRuntime()
+
+    class FakeRuntimeSync:
+        def __init__(self) -> None:
+            self.supervisor = types.SimpleNamespace(
+                runtimes={"rti_pi": None},
+                resolve_runtime=lambda runtime_id: pi_runtime,
+            )
+
+        async def reconnect_event_runtimes(self) -> None:
+            return None
+
+    client = types.SimpleNamespace(_runtime_sync=FakeRuntimeSync())
+    cli.install_reconnect_reannounce(client)
+    await client._runtime_sync.reconnect_event_runtimes()
+
+    assert announced == ["backend-reconnect"]
+
+
+async def test_reannounce_skips_runtimes_that_fail_to_resolve() -> None:
+    """One broken runtime must not stop the others from re-announcing."""
+
+    resolved: list[str] = []
+
+    def resolve_runtime(runtime_id: str) -> Any:
+        if runtime_id == "rti_bad":
+            raise RuntimeError("boom")
+        resolved.append(runtime_id)
+        return types.SimpleNamespace()
+
+    class FakeRuntimeSync:
+        def __init__(self) -> None:
+            self.supervisor = types.SimpleNamespace(
+                runtimes={"rti_bad": None, "rti_ok": None},
+                resolve_runtime=resolve_runtime,
+            )
+
+        async def reconnect_event_runtimes(self) -> None:
+            return None
+
+    client = types.SimpleNamespace(_runtime_sync=FakeRuntimeSync())
+    cli.install_reconnect_reannounce(client)
+    await client._runtime_sync.reconnect_event_runtimes()
+
+    assert resolved == ["rti_ok"]
+
+
+def test_install_reconnect_reannounce_warns_without_hook(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A changed official client surface degrades to a warning, not a crash."""
+
+    client = types.SimpleNamespace()
+
+    with caplog.at_level(logging.WARNING, logger="pi_aa.cli"):
+        cli.install_reconnect_reannounce(client)
+
+    assert any("reconnect_event_runtimes" in record.getMessage() for record in caplog.records)

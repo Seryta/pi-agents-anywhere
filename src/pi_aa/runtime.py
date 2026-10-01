@@ -68,6 +68,12 @@ from pi_aa.sessions import (
 
 logger = logging.getLogger(__name__)
 
+# The platform may empty or stale its runtime-state caches when the backend
+# restarts (for example the server host rebooting) while this connector keeps
+# running. Re-announcing every session's state converges them again; repeated
+# reconnects within this window skip the full inventory scan.
+REANNOUNCE_MIN_INTERVAL_SECONDS = 60.0
+
 RUNTIME = "pi"
 PLATFORM_SESSION_PREFIX = "sess_pi_"
 
@@ -426,6 +432,8 @@ class PiRuntime(AgentRuntime):
         self._stopping = False
         self._reclaim_task: asyncio.Task[None] | None = None
         self._stale_reset_task: asyncio.Task[None] | None = None
+        self._last_reannounce_at = 0.0
+        self._reannounce_lock = asyncio.Lock()
         self._identity = RuntimeIdentity(
             runtime=RUNTIME,
             runtime_version="unknown",
@@ -485,38 +493,96 @@ class PiRuntime(AgentRuntime):
             await self._utility.close()
             self._utility = None
 
+    async def reannounce_session_states(self, *, reason: str = "reconnect") -> None:
+        """Publish the authoritative state of every known session.
+
+        The platform stores runtime state in server-side caches that a backend
+        restart (for example the server host rebooting) can empty or stale
+        while this connector keeps running. Clients then refuse input based on
+        the stale state until a connector restart pushes fresh facts — which
+        would kill live sessions. Re-announcing every session's true state
+        lets the platform converge without that restart: sessions with a live
+        process keep their live status, everything else is idle.
+
+        Repeats within ``REANNOUNCE_MIN_INTERVAL_SECONDS`` are skipped so a
+        reconnect storm cannot trigger repeated full scans; the first call
+        after start (or after a long outage) always runs.
+        """
+
+        async with self._reannounce_lock:
+            now = time.monotonic()
+            if now - self._last_reannounce_at < REANNOUNCE_MIN_INTERVAL_SECONDS:
+                logger.debug(
+                    "skipping session state re-announce reason=%s (ran %.1fs ago)",
+                    reason,
+                    now - self._last_reannounce_at,
+                )
+                return
+            self._last_reannounce_at = now
+            try:
+                summaries = await self.list_complete_session_inventory()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a failed scan must not break the caller
+                logger.exception("failed to list sessions for state re-announce")
+                return
+            announced = 0
+            for summary in summaries:
+                live = self._live_for_meta(summary)
+                try:
+                    if live is not None:
+                        await self._push_state(live, force=True)
+                    else:
+                        await self.host.session_state_update(
+                            session_id=summary.session_id,
+                            runtime=RUNTIME,
+                            external_session_id=summary.external_session_id,
+                            status="idle",
+                            metadata={"sessionFile": summary.external_session_id},
+                        )
+                    announced += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "failed to re-announce session state for %s",
+                        summary.session_id,
+                    )
+            logger.info(
+                "reannounced session states reason=%s sessions=%d",
+                reason,
+                announced,
+            )
+
+    def _live_for_meta(self, summary: SessionMeta) -> PiLiveSession | None:
+        """Match an inventory entry to its live session.
+
+        Platform-created sessions keep the platform-allocated id as the live
+        key while the inventory identifies the same session by a path-derived
+        id, so fall back to matching on the session file.
+        """
+
+        live = self._live.get(summary.session_id)
+        if live is not None:
+            return live
+        external_id = summary.external_session_id
+        if external_id is None:
+            return None
+        for candidate in self._live.values():
+            if candidate.external_id == external_id:
+                return candidate
+        return None
+
     async def _reset_stale_running_states(self) -> None:
-        """Re-announce idle for sessions left running by a previous process.
+        """Re-announce states for sessions left running by a previous process.
 
         A connector restart kills live pi processes before their exit state
         can be published, so the platform keeps showing "running" until the
-        next turn. Right after start() this runtime owns no live process, so
-        idle is accurate; the platform skips states that did not change.
+        next turn. Right after start() this runtime owns no live process,
+        which makes the full re-announcement accurate for every session.
         """
 
-        try:
-            summaries = await self.list_complete_session_inventory()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # a failed scan must not break startup
-            logger.exception("failed to list sessions for stale state reset")
-            return
-        reset = 0
-        for summary in summaries:
-            try:
-                await self.host.session_state_update(
-                    session_id=summary.session_id,
-                    runtime=RUNTIME,
-                    external_session_id=summary.external_session_id,
-                    status="idle",
-                    metadata={"sessionFile": summary.external_session_id},
-                )
-                reset += 1
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("failed to reset idle state for %s", summary.session_id)
-        logger.info("reset idle state for %d sessions after restart", reset)
+        await self.reannounce_session_states(reason="runtime-start")
 
     async def _reclaim_loop(self) -> None:
         while True:
