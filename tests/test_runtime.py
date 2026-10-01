@@ -713,3 +713,47 @@ async def test_runtime_capabilities_advertise_attachments(
     # Session actions are advertised at runtime scope too so the platform's
     # per-session projection has a fallback for sessions without own facts.
     assert by_id[CAPABILITY_SESSION_SEND_MESSAGE].scope == "runtime"
+
+
+async def test_client_message_bindings_survive_connector_restart(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+) -> None:
+    """A restart must not orphan an in-flight optimistic send.
+
+    The platform reconciles optimistic sends by client message id from the
+    transcript projection; losing the id across a connector restart leaves
+    the echo showing next to the local copy (duplicate messages).
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session(
+            "sess-live",
+            "你好",
+            cwd=str(tmp_path),
+            client_message_id="opt_test_restart",
+        )
+        await wait_for(lambda: session_file.is_file())
+    finally:
+        await runtime.stop()
+
+    restarted = make_runtime(fake_pi, tmp_path, fake_host)
+    await restarted.start()
+    try:
+        snapshot = await restarted.get_session_snapshot(
+            "sess-live",
+            external_session_id=str(session_file),
+        )
+        user_items = [
+            item
+            for item in snapshot.items
+            if item.type == "message" and getattr(item, "role", None) == "user"
+        ]
+        assert user_items, "expected the projected user message"
+        assert user_items[-1].source.get("clientMessageId") == "opt_test_restart"
+    finally:
+        await restarted.stop()

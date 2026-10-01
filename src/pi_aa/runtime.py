@@ -68,6 +68,12 @@ from pi_aa.sessions import (
 
 logger = logging.getLogger(__name__)
 
+# Optimistic sends are reconciled by client message id; the pairs live in the
+# session transcript projection. Keep the most recent ones persisted per
+# session so a connector restart cannot orphan the echo of an in-flight send.
+CLIENT_MESSAGE_BINDINGS_VERSION = 1
+MAX_CLIENT_MESSAGE_BINDINGS_PER_SESSION = 200
+
 # The platform may empty or stale its runtime-state caches when the backend
 # restarts (for example the server host rebooting) while this connector keeps
 # running. Re-announcing every session's state converges them again; repeated
@@ -89,6 +95,23 @@ PI_IMAGE_MIME_TYPES: tuple[str, ...] = (
     "image/webp",
 )
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
+
+
+def _merge_client_message_pairs(
+    *groups: Sequence[tuple[str, str]],
+) -> tuple[tuple[str, str], ...]:
+    """Merge client message pairs, keeping the newest entry per (text, id)."""
+
+    seen: set[tuple[str, str]] = set()
+    merged: list[tuple[str, str]] = []
+    for group in groups:
+        for text, client_message_id in group:
+            marker = (text.strip(), client_message_id)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            merged.append((text, client_message_id))
+    return tuple(merged)
 
 
 def platform_session_id(namespace: str, external_id: str) -> str:
@@ -432,6 +455,7 @@ class PiRuntime(AgentRuntime):
         self._stopping = False
         self._reclaim_task: asyncio.Task[None] | None = None
         self._stale_reset_task: asyncio.Task[None] | None = None
+        self._client_bindings: dict[str, tuple[tuple[str, str], ...]] = {}
         self._last_reannounce_at = 0.0
         self._reannounce_lock = asyncio.Lock()
         self._identity = RuntimeIdentity(
@@ -678,6 +702,72 @@ class PiRuntime(AgentRuntime):
 
     # -- snapshots ----------------------------------------------------------
 
+    def _client_bindings_key(self, external_session_id: str) -> str:
+        return f"pi/client-message-bindings/{self.host.connector_id}/{external_session_id}"
+
+    async def _load_client_bindings(
+        self,
+        external_session_id: str | None,
+    ) -> tuple[tuple[str, str], ...]:
+        """Client message id pairs persisted for this session, if any."""
+
+        if not external_session_id:
+            return ()
+        cached = self._client_bindings.get(external_session_id)
+        if cached is not None:
+            return cached
+        pairs: tuple[tuple[str, str], ...] = ()
+        try:
+            value = await self.host.sync_state_read(self._client_bindings_key(external_session_id))
+        except Exception:
+            logger.exception(
+                "failed to read client message bindings session=%s",
+                external_session_id,
+            )
+            value = None
+        if isinstance(value, Mapping):
+            raw_bindings = value.get("bindings")
+            if isinstance(raw_bindings, list):
+                collected: list[tuple[str, str]] = []
+                for raw in raw_bindings:
+                    if not isinstance(raw, Mapping):
+                        continue
+                    text = raw.get("text")
+                    client_message_id = raw.get("clientMessageId")
+                    if isinstance(text, str) and isinstance(client_message_id, str):
+                        collected.append((text, client_message_id))
+                pairs = tuple(collected)
+        self._client_bindings[external_session_id] = pairs
+        return pairs
+
+    async def _persist_client_bindings(self, live: PiLiveSession) -> None:
+        """Persist the session's optimistic-send pairs for future projections."""
+
+        external_session_id = live.external_id
+        if not external_session_id:
+            return
+        stored = await self._load_client_bindings(external_session_id)
+        merged = _merge_client_message_pairs(stored, tuple(live.client_messages))[
+            -MAX_CLIENT_MESSAGE_BINDINGS_PER_SESSION:
+        ]
+        self._client_bindings[external_session_id] = merged
+        try:
+            await self.host.sync_state_write(
+                self._client_bindings_key(external_session_id),
+                {
+                    "version": CLIENT_MESSAGE_BINDINGS_VERSION,
+                    "bindings": [
+                        {"text": text, "clientMessageId": client_message_id}
+                        for text, client_message_id in merged
+                    ],
+                },
+            )
+        except Exception:
+            logger.exception(
+                "failed to persist client message bindings session=%s",
+                external_session_id,
+            )
+
     async def get_session_snapshot(
         self,
         session_id: str,
@@ -708,6 +798,10 @@ class PiRuntime(AgentRuntime):
             )
         live = self._live.get(session_id)
         client_messages = tuple(live.client_messages) if live is not None else ()
+        client_messages = _merge_client_message_pairs(
+            await self._load_client_bindings(doc.summary.path),
+            client_messages,
+        )
         logger.info(
             "pi project session_id=%s live=%s client_message_pairs=%d",
             session_id,
@@ -1060,6 +1154,8 @@ class PiRuntime(AgentRuntime):
         if selections:
             await self._apply_selections(live, selections)
         await live.send_prompt(content, images=images)
+        if client_message_id:
+            await self._persist_client_bindings(live)
         await self._push_meta(live)
         await self._push_state(live, force=True)
         return RuntimeOperationResult(
@@ -1085,6 +1181,7 @@ class PiRuntime(AgentRuntime):
         )
         if client_message_id:
             live.client_messages.append((content, client_message_id))
+            await self._persist_client_bindings(live)
         if selections:
             await self._apply_selections(live, selections)
         behavior = "followUp" if (live.is_streaming or live.is_compacting) else None
@@ -1105,6 +1202,7 @@ class PiRuntime(AgentRuntime):
         live = await self._ensure_live(session_id, external_session_id, None)
         if client_message_id:
             live.client_messages.append((content, client_message_id))
+            await self._persist_client_bindings(live)
         if live.is_streaming:
             await live.send_prompt(content, streaming_behavior="steer", images=images)
             return RuntimeOperationResult(result={"sessionId": session_id, "steered": True})

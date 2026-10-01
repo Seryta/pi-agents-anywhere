@@ -36,6 +36,7 @@ class FakeHost(RuntimeHostClient):
         self.turn_ends: list[dict[str, Any]] = []
         self.capability_sets: list[Any] = []
         self.attachment_downloads: list[dict[str, str]] = []
+        self.sync_state: dict[str, Any] = {}
 
     @property
     def connector_id(self) -> str:
@@ -91,6 +92,15 @@ class FakeHost(RuntimeHostClient):
         self, runtime: str, notifications: list[dict[str, Any]], runtime_id: str | None = None
     ) -> None:
         return None
+
+    async def sync_state_read(self, key: str) -> dict[str, Any] | None:
+        return self.sync_state.get(key)
+
+    async def sync_state_write(self, key: str, value: dict[str, Any]) -> None:
+        self.sync_state[key] = dict(value)
+
+    async def sync_state_delete(self, key: str) -> None:
+        self.sync_state.pop(key, None)
 
 
 @pytest.fixture
