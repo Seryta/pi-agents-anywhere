@@ -1120,6 +1120,7 @@ class PiRuntime(AgentRuntime):
     ) -> RuntimeCommandResult:
         live = await self._ensure_live(session_id, external_session_id, None)
         text = raw if raw else "/" + command + (" " + " ".join(args) if args else "")
+        logger.info("pi command execute session_id=%s text=%r", session_id, text)
         await live.send_prompt(text)
         return RuntimeCommandResult(
             command=command,
