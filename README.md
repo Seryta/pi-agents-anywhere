@@ -114,6 +114,21 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `requestTimeoutMs` | `60000` | 单条 RPC 命令超时 |
 | `idleTimeoutSeconds` | `600` | 空闲回收：会话进程空闲超过该时长后被关闭（0 禁用），会话文件保留，下一条消息自动恢复 |
 
+### 在 AA 里执行 pi 的内置命令
+
+pi 的内置 slash 命令（`/reload`、`/settings` 等）只存在于 TUI；RPC 客户端只能执行
+`get_commands` 报告的命令（扩展 / 模板 / skill）。要让 AA 里也能用某个内置命令，
+把它注册为一个扩展命令即可——例如 `examples/extensions/reload.ts` 把 `/reload`
+带入 `get_commands`：
+
+```bash
+cp examples/extensions/reload.ts ~/.pi/agent/extensions/
+```
+
+之后在 AA 的输入框里输入 `/reload`，pi 会像 TUI 一样重载配置、扩展、指令与资源
+（先提示“正在重载”，重载完成后提示“重载完成”；10 秒内无事件则静默清理标记，
+不会在重启或后续会话里误报）。
+
 ## 已知限制
 
 - **附件仅支持图片**：pi RPC 的输入是文本 + `ImageContent`，非图片附件（PDF 等）会被跳过。
