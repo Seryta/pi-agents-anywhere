@@ -98,7 +98,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `runtime.attachment` | 从平台下载附件，把图片按 base64 `ImageContent` 附加到 `prompt`/`steer`（非图片跳过） |
 | `get_session_snapshot` | 读会话文件 → 时间线投影 |
 | `list_model_catalog` | `get_available_models`（独立工具进程） |
-| `list_commands` / `execute_command` | `get_commands`；执行 = 发送 `/命令` |
+| `list_commands` / `execute_command` | `get_commands`；执行 = 发送 `/命令`，结果上报 `executionState=accepted`（2.0.3 命令契约） |
 | `get_session_notices` / `respond_interaction` | 扩展 UI 的 `select`/`confirm`/`input`/`editor` → interaction notice；`notify` → notification |
 | `session_turn_ended` | 收到 `agent_settled` 时上报 |
 
@@ -161,10 +161,11 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`43 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`58 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
 
 - 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程、图片附件转发（下载、base64 编码与命令载荷）、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
+- 兼容性：官方 Connector 2.0.0 与 2.0.3（两版源码下同一套测试全绿；PyPI `anywhere-cli` 2.0.3 wheel 与对应源码一致）。
 - 端到端：与自托管 AA Server 2.0.0 的连接、既有会话批量同步与时间线投影、模型目录上报。
 
 未验证（需要环境）：
