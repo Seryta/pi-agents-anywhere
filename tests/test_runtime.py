@@ -231,6 +231,29 @@ async def test_commands_are_listed(
         await runtime.stop()
 
 
+async def test_execute_command_reports_accepted_state(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+) -> None:
+    """AA 2.0.3 derives command follow-up behavior from ``executionState``.
+
+    Dispatch only hands the command to the pi child process; the native work
+    completes asynchronously, so ``accepted`` is the only honest outcome here.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session("sess-command", "hi", cwd=str(tmp_path))
+        result = await runtime.execute_command("sess-command", "fix-tests")
+        assert result.ok is True
+        assert result.result["executionState"] == "accepted"
+    finally:
+        await runtime.stop()
+
+
 def write_messages_session(path: Path, count: int) -> None:
     """Write a session file holding ``count`` chained user messages."""
 

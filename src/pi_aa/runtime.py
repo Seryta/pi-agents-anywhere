@@ -1126,7 +1126,9 @@ class PiRuntime(AgentRuntime):
             command=command,
             ok=True,
             message=f"已发送 {text}",
-            result={"sessionId": session_id},
+            # AA 2.0.3 command contract: dispatch only accepts the native work,
+            # completion is reported later through the timeline.
+            result={"sessionId": session_id, "executionState": "accepted"},
         )
 
     # -- session operations -------------------------------------------------
