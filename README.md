@@ -1,6 +1,7 @@
 # pi-agents-anywhere
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-222222?style=flat)](LICENSE)
+[![PyPI](https://img.shields.io/pypi/v/pi-agents-anywhere?style=flat)](https://pypi.org/project/pi-agents-anywhere/)
 
 把 [pi coding agent](https://github.com/earendil-works/pi) 接入 [Agents Anywhere](https://github.com/anywhere-labs/Agents-Anywhere) 工作台的连接器适配器。
 
@@ -35,13 +36,19 @@ pi --mode rpc （每个活跃会话一个子进程）
 
 ## 安装
 
-不依赖源码 checkout，直接安装（需要 [uv](https://docs.astral.sh/uv/)）：
+从 PyPI 安装（需要 [uv](https://docs.astral.sh/uv/)）：
+
+```bash
+uv tool install --python 3.12 pi-agents-anywhere
+```
+
+也可以直接从 GitHub 源码安装（等同最新 main）：
 
 ```bash
 uv tool install --python 3.12 "git+https://github.com/Seryta/pi-agents-anywhere"
 ```
 
-装完 `pi-aa-connector` 在 PATH 里可直接调用（`pipx install "git+https://github.com/Seryta/pi-agents-anywhere"` 等价）。
+装完 `pi-aa-connector` 在 PATH 里可直接调用（`pipx install pi-agents-anywhere` 等价）。
 
 开发或需要跟随最新源码时，用可编辑安装：
 
