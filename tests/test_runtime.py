@@ -241,6 +241,7 @@ async def test_single_provider_catalog_stays_flat(
     runtime = make_runtime(fake_pi, tmp_path, fake_host)
     await runtime.start()
     try:
+
         async def fake_command(_payload):
             return {
                 "data": {
