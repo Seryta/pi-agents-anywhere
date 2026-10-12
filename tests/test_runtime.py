@@ -14,7 +14,7 @@ from connector.runtime_protocol import (
     RuntimeConfig,
 )
 
-from pi_aa.runtime import PiRuntime, platform_session_id
+from pi_aa.runtime import REANNOUNCE_MIN_INTERVAL_SECONDS, PiRuntime, platform_session_id
 from tests.conftest import FAKE_PNG_BYTES, FakeHost, wait_for
 
 
@@ -400,6 +400,29 @@ async def test_snapshot_rejects_paths_outside_sessions_dir(
         assert snapshot.items == ()
     finally:
         await runtime.stop()
+
+
+def test_reannounce_seed_never_throttles_the_first_call(tmp_path: Path) -> None:
+    """The first re-announce runs even on a host booted seconds ago.
+
+    ``_last_reannounce_at`` is compared against monotonic time, whose zero
+    is the host boot; seeding it with 0.0 skipped the startup re-announce
+    while the machine uptime was shorter than the throttle window.
+    """
+
+    runtime = PiRuntime(
+        config=RuntimeConfig(
+            runtime="pi",
+            revision=1,
+            values={
+                "executablePath": "pi",
+                "sessionsDir": str(tmp_path / "sessions"),
+                "defaultCwd": str(tmp_path),
+            },
+        ),
+        host=FakeHost(),
+    )
+    assert runtime._last_reannounce_at <= -REANNOUNCE_MIN_INTERVAL_SECONDS
 
 
 def test_model_display_title_rules() -> None:

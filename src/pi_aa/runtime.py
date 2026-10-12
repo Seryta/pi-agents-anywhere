@@ -474,7 +474,7 @@ class PiRuntime(AgentRuntime):
         self._reclaim_task: asyncio.Task[None] | None = None
         self._stale_reset_task: asyncio.Task[None] | None = None
         self._client_bindings: dict[str, tuple[tuple[str, str], ...]] = {}
-        self._last_reannounce_at = 0.0
+        self._last_reannounce_at = -REANNOUNCE_MIN_INTERVAL_SECONDS
         self._reannounce_lock = asyncio.Lock()
         self._identity = RuntimeIdentity(
             runtime=RUNTIME,
