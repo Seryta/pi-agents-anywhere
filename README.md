@@ -26,17 +26,33 @@ pi --mode rpc （每个活跃会话一个子进程）
 
 注入点来自官方代码：`BackendRpcClient(config, agent_runtime_providers=(...))`（`connector/server/client.py`）。
 
+## 前置要求
+
+- **pi（本机）**：用官方脚本安装 `curl -fsSL https://pi.dev/install.sh | sh`，或 npm 安装（Node.js >= 22.19）：
+  `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`。确认 `pi --version` 可用，并启动 `pi` 登录至少一个模型供应商（`/login`）。
+- **Python 3.12+**：运行 Connector。依赖较重（含官方 `anywhere-cli`），建议用独立环境或 `uv tool`。
+- **Agents Anywhere Server 地址**：云端或自托管均可。
+
 ## 安装
 
-官方 Connector 自 `anywhere-cli` 2.0.0 起可从 PyPI 安装（依赖较重，建议用独立虚拟环境）：
+不依赖源码 checkout，直接安装（需要 [uv](https://docs.astral.sh/uv/)）：
 
 ```bash
-cd /path/to/pi-agents-anywhere
+uv tool install --python 3.12 "git+https://github.com/Seryta/pi-agents-anywhere"
+```
+
+装完 `pi-aa-connector` 在 PATH 里可直接调用（`pipx install "git+https://github.com/Seryta/pi-agents-anywhere"` 等价）。
+
+开发或需要跟随最新源码时，用可编辑安装：
+
+```bash
+git clone https://github.com/Seryta/pi-agents-anywhere
+cd pi-agents-anywhere
 uv venv .venv --python 3.12
 uv pip install -e .               # 依赖会从 PyPI 解析（含官方 anywhere-cli）
 ```
 
-如需跟随官方仓库的最新源码：
+如需跟随官方 Connector 仓库的最新源码：
 
 ```bash
 uv pip install -e /path/to/Agents-Anywhere/connector
@@ -48,8 +64,10 @@ uv pip install -e . --no-deps     # 依赖已由 connector 提供
 ### 1. 配对（只需一次）
 
 ```bash
-.venv/bin/pi-aa-connector pair https://your-server --no-start
+pi-aa-connector pair https://your-server --no-start
 ```
+
+源码安装时用 `.venv/bin/pi-aa-connector`；`uv tool` / `pipx` 安装则直接在 PATH 里。
 
 命令会打印配对码，在 AA 工作台的「添加设备」里输入该码；凭据保存到
 `~/.agents-anywhere/connector.json`（与官方 CLI 同一配置）。
@@ -65,9 +83,11 @@ Description=Agents Anywhere Connector (with Pi runtime)
 After=network-online.target
 
 [Service]
-# 把 %h/pi-agents-anywhere 换成实际 checkout 路径；
+# 路径按安装方式取其一：
+#   uv tool / pipx → %h/.local/bin/pi-aa-connector
+#   源码 checkout  → %h/pi-agents-anywhere/.venv/bin/pi-aa-connector
 # 裸跑 `pi-aa-connector`（不带子命令）等价于 `start`。
-ExecStart=%h/pi-agents-anywhere/.venv/bin/pi-aa-connector start
+ExecStart=%h/.local/bin/pi-aa-connector start
 Restart=on-failure
 RestartSec=5
 
@@ -161,7 +181,7 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`58 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`59 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
 
 - 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程、图片附件转发（下载、base64 编码与命令载荷）、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
