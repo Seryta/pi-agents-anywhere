@@ -82,6 +82,9 @@ REANNOUNCE_MIN_INTERVAL_SECONDS = 60.0
 
 RUNTIME = "pi"
 PLATFORM_SESSION_PREFIX = "sess_pi_"
+# Id prefix for the disabled heading entries that group catalog models by
+# provider; it must not collide with the provider-qualified model ids.
+MODEL_GROUP_ID_PREFIX = "pi-aa-group:"
 
 # How often the idle reclaim loop inspects live sessions.
 RECLAIM_INTERVAL_SECONDS = 15.0
@@ -148,24 +151,39 @@ def _model_display_title(
     model_id: str,
     directory: Sequence[tuple[str, str | None, str]],
 ) -> str:
-    """Label a model so identical names from different routes stay distinct.
+    """Label a model so ids under one name stay distinct.
 
-    Mirrors the platform's own labeling (dsh-bridge-next ``labelModels``):
-    when the same display name exists under several providers, append the
-    provider; when one provider exposes several ids under the same name,
-    append the model id as well. Labels are computed over the full directory
-    so search and pagination cannot change them.
+    Providers already act as group headings in the picker, so titles do not
+    repeat them; only the model id is appended when one provider exposes
+    several ids under the same name. Labels are computed over the full
+    directory so search and pagination cannot change them.
     """
 
     same_name = [entry for entry in directory if entry[0] == name]
-    multiple_providers = any(entry[1] != provider for entry in same_name)
     duplicate_model = any(entry[1] == provider and entry[2] != model_id for entry in same_name)
     title = name
-    if multiple_providers and provider:
-        title += f"（{provider}）"
     if duplicate_model:
         title += f" [{model_id}]"
     return title
+
+
+def _model_group_item(provider: str) -> RuntimeModelItem:
+    """A disabled heading entry that groups a provider's models in the picker.
+
+    The platform renders catalogs as a flat list and clients treat ``enabled``
+    as the clickability gate, so a disabled entry named after the provider
+    doubles as a section heading. The unique id keeps the platform's catalog
+    validation happy.
+    """
+
+    group_id = f"{MODEL_GROUP_ID_PREFIX}{provider}"
+    return RuntimeModelItem(
+        id=group_id,
+        title=provider,
+        selection_id=group_id,
+        enabled=False,
+        metadata={"provider": provider, "group": True},
+    )
 
 
 class PendingInteraction:
@@ -999,9 +1017,9 @@ class PiRuntime(AgentRuntime):
         limit: int = 100,
     ) -> RuntimeModelCatalog:
         data = response_data(await self._utility_command({"type": "get_available_models"}))
-        # Pi allows the same model name under several providers; the platform
-        # rejects catalogs with duplicate ids, so ids are provider-qualified
-        # and titles carry the provider when a name is ambiguous.
+        # Pi allows the same model name under several providers; ids stay
+        # provider-qualified and the providers render as group headings, so
+        # titles do not repeat the provider.
         entries: list[tuple[Mapping[str, Any], str, str, str | None, str]] = []
         for raw in _as_list(data.get("models")):
             if not isinstance(raw, Mapping):
@@ -1016,12 +1034,20 @@ class PiRuntime(AgentRuntime):
             provider = provider if isinstance(provider, str) and provider else None
             entries.append((raw, catalog_id, name, provider, model_id))
         directory = [(name, provider, model_id) for _, _, name, provider, model_id in entries]
+        # A stable provider order keeps the picker grouped and deterministic;
+        # pi's own order inside a provider is preserved.
+        entries.sort(key=lambda entry: entry[3] or "")
+        multiple_providers = len({entry[3] for entry in entries if entry[3]}) > 1
         models: list[RuntimeModelItem] = []
+        current_group: str | None = None
         for raw, catalog_id, name, provider, model_id in entries:
             title = _model_display_title(name, provider, model_id, directory)
             haystack = f"{catalog_id} {name} {title}".lower()
             if query and query.lower() not in haystack:
                 continue
+            if multiple_providers and provider and provider != current_group:
+                current_group = provider
+                models.append(_model_group_item(provider))
             models.append(
                 RuntimeModelItem(
                     id=catalog_id,

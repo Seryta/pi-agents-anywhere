@@ -190,18 +190,33 @@ async def test_model_catalog_and_selections(
         catalog = await runtime.list_model_catalog()
         ids = [model.id for model in catalog.models]
         # Pi can expose the same model name under several providers; ids must
-        # stay unique or the platform rejects the whole catalog.
-        assert ids == ["test:test-model", "test:other-model", "alt:test-model"]
+        # stay unique or the platform rejects the whole catalog. Providers are
+        # sorted so the picker stays deterministic and grouped, and each group
+        # starts with a disabled heading entry the clients render as a label.
+        assert ids == [
+            "pi-aa-group:alt",
+            "alt:test-model",
+            "pi-aa-group:test",
+            "test:test-model",
+            "test:other-model",
+        ]
         assert len(ids) == len(set(ids))
-        assert catalog.models[0].selection_id == "test:test-model"
-        # Ambiguous names carry the provider so the workbench can tell them
-        # apart; unambiguous names stay untouched.
+        assert catalog.models[0].enabled is False
+        assert catalog.models[0].selection_id == "pi-aa-group:alt"
+        # Providers render as group headings; titles stay plain so identical
+        # names under different providers read the same inside their groups.
         titles = [model.title for model in catalog.models]
-        assert titles == ["Test Model（test）", "Other Model", "Test Model（alt）"]
+        assert titles == [
+            "alt",
+            "Test Model",
+            "test",
+            "Test Model",
+            "Other Model",
+        ]
         filtered = await runtime.list_model_catalog(query="alt")
-        assert [model.id for model in filtered.models] == ["alt:test-model"]
+        assert [model.id for model in filtered.models] == ["pi-aa-group:alt", "alt:test-model"]
         # Labels are computed over the full directory, so filtering keeps them.
-        assert filtered.models[0].title == "Test Model（alt）"
+        assert filtered.models[-1].title == "Test Model"
 
         await runtime.create_and_start_session("sess-model", "hi", cwd=str(tmp_path))
         result = await runtime.update_session_selections(
@@ -212,6 +227,35 @@ async def test_model_catalog_and_selections(
         assert state is not None
         assert state.selections["model"] == "test:other-model"
         assert state.selections["thinkingLevel"] == "high"
+    finally:
+        await runtime.stop()
+
+
+async def test_single_provider_catalog_stays_flat(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """No headings and no provider suffixes when only one provider exists."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        async def fake_command(_payload):
+            return {
+                "data": {
+                    "models": [
+                        {"id": "solo-a", "name": "Solo A", "provider": "solo"},
+                        {"id": "solo-b", "name": "Solo B", "provider": "solo"},
+                    ]
+                }
+            }
+
+        runtime._utility_command = fake_command  # type: ignore[method-assign]
+        catalog = await runtime.list_model_catalog()
+        assert [model.id for model in catalog.models] == ["solo:solo-a", "solo:solo-b"]
+        assert [model.title for model in catalog.models] == ["Solo A", "Solo B"]
+        assert all(model.enabled for model in catalog.models)
     finally:
         await runtime.stop()
 
@@ -367,19 +411,21 @@ def test_model_display_title_rules() -> None:
         ("Routed", "test", "a"),
         ("Routed", "test", "b"),
     ]
-    # Same name under several providers: provider suffix.
+    # Several providers: titles stay plain; providers act as group headings.
     assert (
         _model_display_title("DeepSeek V4.1 Flash", "deepseek", "deepseek-flash", directory)
-        == "DeepSeek V4.1 Flash（deepseek）"
+        == "DeepSeek V4.1 Flash"
     )
-    # Unique name: untouched.
     assert (
         _model_display_title("DeepSeek V4 Pro", "deepseek", "deepseek-v4-pro", directory)
         == "DeepSeek V4 Pro"
     )
     # Same provider, several ids under one name: append the model id.
     assert _model_display_title("Routed", "test", "a", directory) == "Routed [a]"
-    assert _model_display_title("Solo", "test", "s", directory) == "Solo"
+    assert _model_display_title("Routed", "test", "b", directory) == "Routed [b]"
+    # A single-provider catalog stays untouched.
+    single = [("Solo", "test", "s"), ("Other", "test", "o")]
+    assert _model_display_title("Solo", "test", "s", single) == "Solo"
 
 
 def test_catalog_revision_is_monotonic_across_restarts(tmp_path: Path) -> None:
