@@ -188,7 +188,7 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`59 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`60 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
 
 - 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程、图片附件转发（下载、base64 编码与命令载荷）、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
