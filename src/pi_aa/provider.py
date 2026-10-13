@@ -145,6 +145,7 @@ class PiProvider(RuntimeProvider):
                     "defaultCwd",
                     "requestTimeoutMs",
                     "idleTimeoutSeconds",
+                    "attachmentRetentionDays",
                 ],
                 "executablePath": {"component": "path"},
                 "sessionsDir": {"component": "path"},

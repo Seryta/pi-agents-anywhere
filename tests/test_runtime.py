@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from connector.runtime_protocol import (
     CAPABILITY_SESSION_SEND_MESSAGE,
     RuntimeAttachment,
     RuntimeConfig,
+    attachments_root,
+    session_attachments_dir,
 )
 
 from pi_aa.rpc import PiRpcProcess, PiRpcTimeout
@@ -2346,3 +2349,159 @@ async def test_interrupt_aborts_when_clear_queue_fails(
         await wait_for(lambda: live.status == "idle")
     finally:
         await runtime.stop()
+
+
+async def test_cleanup_attachments_deletes_old_files_keeps_new(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Files older than the retention window are removed, newer ones kept."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    directory = attachments_root() / "sess-stale"
+    directory.mkdir(parents=True)
+    old_file = directory / "text-1-notes.txt"
+    old_file.write_bytes(FAKE_TEXT_BYTES)
+    old = time.time() - 31 * 86400
+    os.utime(old_file, (old, old))
+    new_file = directory / "text-2-notes.txt"
+    new_file.write_bytes(FAKE_TEXT_BYTES)
+
+    deleted = await runtime.cleanup_attachments()
+
+    assert deleted == 1
+    assert not old_file.exists()
+    assert new_file.exists()
+
+
+async def test_cleanup_attachments_skips_live_session_directories(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Directories of live sessions must survive a cleanup pass."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-live-att", cwd=str(tmp_path))
+    runtime._live["sess-live-att"] = live
+    old = time.time() - 31 * 86400
+
+    live_dir = session_attachments_dir("sess-live-att")
+    live_dir.mkdir(parents=True)
+    live_file = live_dir / "text-1-notes.txt"
+    live_file.write_bytes(FAKE_TEXT_BYTES)
+    os.utime(live_file, (old, old))
+
+    stale_dir = attachments_root() / "sess-stale"
+    stale_dir.mkdir(parents=True)
+    stale_file = stale_dir / "text-1-notes.txt"
+    stale_file.write_bytes(FAKE_TEXT_BYTES)
+    os.utime(stale_file, (old, old))
+
+    deleted = await runtime.cleanup_attachments()
+
+    assert deleted == 1
+    assert live_file.exists()
+    assert not stale_file.exists()
+
+
+async def test_cleanup_attachments_disabled_when_retention_zero(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """attachmentRetentionDays=0 disables cleanup entirely."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    config = RuntimeConfig(
+        runtime="pi",
+        revision=1,
+        values={
+            "executablePath": str(fake_pi),
+            "sessionsDir": str(tmp_path / "sessions"),
+            "defaultCwd": str(tmp_path),
+            "requestTimeoutMs": 5000,
+            "attachmentRetentionDays": 0,
+        },
+    )
+    runtime = PiRuntime(config=config, host=fake_host)
+    directory = attachments_root() / "sess-kept"
+    directory.mkdir(parents=True)
+    old_file = directory / "text-1-notes.txt"
+    old_file.write_bytes(FAKE_TEXT_BYTES)
+    old = time.time() - 60 * 86400
+    os.utime(old_file, (old, old))
+
+    deleted = await runtime.cleanup_attachments()
+
+    assert deleted == 0
+    assert old_file.exists()
+
+
+async def test_cleanup_attachments_removes_empty_directories(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Directories left empty after expiry are removed; other content kept."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    root = attachments_root()
+    (root / "sess-empty").mkdir(parents=True)
+    stale_dir = root / "sess-stale"
+    stale_dir.mkdir(parents=True)
+    stale_file = stale_dir / "text-1-notes.txt"
+    stale_file.write_bytes(FAKE_TEXT_BYTES)
+    old = time.time() - 31 * 86400
+    os.utime(stale_file, (old, old))
+    # Nested subdirectories are never recursed into.
+    nested = root / "sess-nested" / "sub"
+    nested.mkdir(parents=True)
+    nested_file = nested / "text-1-notes.txt"
+    nested_file.write_bytes(FAKE_TEXT_BYTES)
+    os.utime(nested_file, (old, old))
+
+    deleted = await runtime.cleanup_attachments()
+
+    assert deleted == 1
+    assert not (root / "sess-empty").exists()
+    assert not stale_dir.exists()
+    assert nested_file.exists()
+
+
+async def test_attachment_cleanup_task_runs_immediately_and_stops(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """start() schedules an immediate cleanup pass; stop() cancels the task."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    directory = attachments_root() / "sess-start"
+    directory.mkdir(parents=True)
+    old_file = directory / "text-1-notes.txt"
+    old_file.write_bytes(FAKE_TEXT_BYTES)
+    old = time.time() - 31 * 86400
+    os.utime(old_file, (old, old))
+
+    await runtime.start()
+    cleanup_task = runtime._cleanup_task
+    assert cleanup_task is not None and not cleanup_task.done()
+
+    # The first pass runs immediately without waiting for the interval.
+    await asyncio.sleep(0)
+    assert not old_file.exists()
+
+    await runtime.stop()
+    assert runtime._cleanup_task is None
+    assert cleanup_task.done()

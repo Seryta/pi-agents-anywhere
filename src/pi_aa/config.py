@@ -20,6 +20,7 @@ DEFAULT_SESSIONS_DIR = "~/.pi/agent/sessions"
 DEFAULT_CWD = "~"
 DEFAULT_REQUEST_TIMEOUT_MS = 60_000
 DEFAULT_IDLE_TIMEOUT_SECONDS = 600
+DEFAULT_ATTACHMENT_RETENTION_DAYS = 30
 PROBE_TIMEOUT_SECONDS = 20.0
 
 
@@ -108,6 +109,13 @@ def pi_config_schema() -> dict[str, Any]:
                 ),
                 "default": DEFAULT_IDLE_TIMEOUT_SECONDS,
             },
+            "attachmentRetentionDays": {
+                "type": "integer",
+                "minimum": 0,
+                "title": "附件保留（天）",
+                "description": ("保留 N 天后清理连接器附件目录中非活跃会话的文件，0 禁用。"),
+                "default": DEFAULT_ATTACHMENT_RETENTION_DAYS,
+            },
         },
         "additionalProperties": False,
     }
@@ -120,6 +128,7 @@ def default_config_values() -> dict[str, Any]:
         "defaultCwd": DEFAULT_CWD,
         "requestTimeoutMs": DEFAULT_REQUEST_TIMEOUT_MS,
         "idleTimeoutSeconds": DEFAULT_IDLE_TIMEOUT_SECONDS,
+        "attachmentRetentionDays": DEFAULT_ATTACHMENT_RETENTION_DAYS,
     }
 
 
@@ -155,4 +164,12 @@ def normalized_config_values(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise RuntimeInvalidRequestError(
             "idleTimeoutSeconds must be an integer between 0 and 86400"
         )
+
+    retention_days = values.get("attachmentRetentionDays")
+    if (
+        not isinstance(retention_days, int)
+        or isinstance(retention_days, bool)
+        or retention_days < 0
+    ):
+        raise RuntimeInvalidRequestError("attachmentRetentionDays must be an integer >= 0")
     return values

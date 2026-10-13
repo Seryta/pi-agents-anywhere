@@ -50,6 +50,8 @@ from connector.runtime_protocol import (
     SessionSourceState,
     SessionState,
     attachment_target,
+    attachments_root,
+    session_attachments_dir,
 )
 from connector.runtime_protocol.host import RuntimeHostClient
 from connector.runtime_protocol.timeline import TimelineSource, timeline_content_hash
@@ -97,6 +99,10 @@ MODEL_GROUP_ID_PREFIX = "pi-aa-group:"
 
 # How often the idle reclaim loop inspects live sessions.
 RECLAIM_INTERVAL_SECONDS = 15.0
+
+# How often the attachment cleanup loop expires inactive session attachment
+# directories (files older than the retention window, then empty directories).
+ATTACHMENT_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 
 # Pi consumes images as base64 ``ImageContent``; these are the formats the
 # model providers behind Pi accept in practice.
@@ -948,6 +954,7 @@ class PiRuntime(AgentRuntime):
         self.executable = str(values["executablePath"])
         self.request_timeout = int(values["requestTimeoutMs"]) / 1000
         self._idle_timeout = float(values["idleTimeoutSeconds"])
+        self._attachment_retention_days = int(values["attachmentRetentionDays"])
         self.default_cwd = str(values["defaultCwd"])
         self.sessions_dir = Path(str(values["sessionsDir"]))
         self.directory = SessionDirectory(self.sessions_dir)
@@ -960,6 +967,7 @@ class PiRuntime(AgentRuntime):
         self._stopping = False
         self._reclaim_task: asyncio.Task[None] | None = None
         self._stale_reset_task: asyncio.Task[None] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._client_bindings: dict[str, tuple[tuple[str, str], ...]] = {}
         self._last_reannounce_at = -REANNOUNCE_MIN_INTERVAL_SECONDS
         self._reannounce_lock = asyncio.Lock()
@@ -986,6 +994,7 @@ class PiRuntime(AgentRuntime):
         self._stale_reset_task = asyncio.create_task(self._reset_stale_running_states())
         if self._idle_timeout > 0:
             self._reclaim_task = asyncio.create_task(self._reclaim_loop())
+        self._cleanup_task = asyncio.create_task(self._attachment_cleanup_loop())
 
     async def _publish_runtime_capabilities(self) -> None:
         """Push runtime-scoped facts so the platform persists them.
@@ -1004,7 +1013,7 @@ class PiRuntime(AgentRuntime):
 
     async def stop(self) -> None:
         self._stopping = True
-        for task in (self._reclaim_task, self._stale_reset_task):
+        for task in (self._reclaim_task, self._stale_reset_task, self._cleanup_task):
             if task is None:
                 continue
             task.cancel()
@@ -1014,6 +1023,7 @@ class PiRuntime(AgentRuntime):
                 pass
         self._reclaim_task = None
         self._stale_reset_task = None
+        self._cleanup_task = None
         for live in list(self._live.values()):
             await live.stop()
         self._live.clear()
@@ -1155,6 +1165,70 @@ class PiRuntime(AgentRuntime):
                 now - live.last_activity,
             )
             await live.stop()
+
+    async def _attachment_cleanup_loop(self) -> None:
+        """Run the attachment cleanup pass immediately, then on an interval.
+
+        A failing pass is logged and the loop still waits out the interval, so
+        a transient error cannot turn the loop into a hot retry.
+        """
+
+        while True:
+            try:
+                await self.cleanup_attachments()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # a failed pass must not kill the loop
+                logger.exception("pi attachment cleanup pass failed")
+            await asyncio.sleep(ATTACHMENT_CLEANUP_INTERVAL_SECONDS)
+
+    async def cleanup_attachments(self) -> int:
+        """Expire files of inactive session attachment directories.
+
+        Only the one directory level under the attachments root is considered:
+        directories whose name matches a live session's attachment directory
+        are skipped wholesale; files older than the retention window are
+        removed from every other directory, and a directory left empty is
+        deleted. A retention of zero disables cleanup and touches nothing.
+        Returns the number of deleted files.
+        """
+
+        if self._attachment_retention_days <= 0:
+            return 0
+        root = attachments_root()
+        cutoff = time.time() - self._attachment_retention_days * 86400
+        live_names = {session_attachments_dir(session_id).name for session_id in self._live}
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            logger.warning("attachment cleanup: attachments root unreadable: %s", root)
+            return 0
+        deleted = 0
+        for entry in entries:
+            if not entry.is_dir() or entry.name in live_names:
+                continue
+            try:
+                for child in list(entry.iterdir()):
+                    if not child.is_file():
+                        continue
+                    try:
+                        if child.stat().st_mtime < cutoff:
+                            child.unlink()
+                            deleted += 1
+                    except OSError:
+                        logger.warning(
+                            "attachment cleanup: failed to remove %s",
+                            child,
+                        )
+                if not any(entry.iterdir()):
+                    entry.rmdir()
+            except OSError:
+                logger.warning(
+                    "attachment cleanup: failed to clean directory %s",
+                    entry,
+                )
+        logger.info("attachment cleanup deleted files=%d", deleted)
+        return deleted
 
     # -- discovery / inventory ---------------------------------------------
 

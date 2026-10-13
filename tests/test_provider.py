@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 from connector.runtime_protocol import RuntimeInvalidRequestError
 
-from pi_aa.config import default_config_values, normalized_config_values, pi_config_schema
+from pi_aa.config import (
+    DEFAULT_ATTACHMENT_RETENTION_DAYS,
+    default_config_values,
+    normalized_config_values,
+    pi_config_schema,
+)
 from pi_aa.provider import PiProvider, probe_pi_version
 
 
@@ -18,7 +23,12 @@ def test_schema_shape() -> None:
         "defaultCwd",
         "requestTimeoutMs",
         "idleTimeoutSeconds",
+        "attachmentRetentionDays",
     }
+    retention = schema["properties"]["attachmentRetentionDays"]
+    assert retention["type"] == "integer"
+    assert retention["minimum"] == 0
+    assert retention["default"] == DEFAULT_ATTACHMENT_RETENTION_DAYS
     assert schema["additionalProperties"] is False
 
 
@@ -28,11 +38,17 @@ def test_normalized_defaults(tmp_path: Path) -> None:
     assert values["sessionsDir"].startswith(str(tmp_path))
     assert values["requestTimeoutMs"] == default_config_values()["requestTimeoutMs"]
     assert values["idleTimeoutSeconds"] == default_config_values()["idleTimeoutSeconds"]
+    assert values["attachmentRetentionDays"] == DEFAULT_ATTACHMENT_RETENTION_DAYS
 
 
 def test_normalized_rejects_bad_timeout() -> None:
     with pytest.raises(RuntimeInvalidRequestError):
         normalized_config_values({"requestTimeoutMs": 10})
+
+
+def test_normalized_rejects_negative_retention() -> None:
+    with pytest.raises(RuntimeInvalidRequestError):
+        normalized_config_values({"attachmentRetentionDays": -1})
 
 
 async def test_probe_version(fake_pi: Path) -> None:
