@@ -169,7 +169,7 @@ curl -fsSL -o ~/.pi/agent/extensions/reload.ts \
 
 ## 已知限制
 
-- **附件大小上限**：单个非图片附件超过 64 MiB 会被跳过（防磁盘滥用），日志有记录。
+- **附件大小上限**：单个附件（含图片）超过 64 MiB 会被跳过（防磁盘滥用），日志有记录。
 - **无权限目录**：pi 没有运行时工具审批概念（工具权限由启动配置决定），因此没有 permission catalog。
 - **流式为消息级聚合**：文本/思考在生成过程中按约 300ms 聚合推送（非逐 token），工具输出同样节流；轮次结束后临时项由会话文件的全量投影替换。
 - **对话框覆盖范围**：`select`/`confirm`/`input`/`editor` 映射为 interaction notice；`setStatus` 映射为状态元数据；`setWidget`/`setTitle`/`set_editor_text` 仍被忽略（RPC 模式无对应展示位置）。
@@ -199,9 +199,9 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`119 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`136 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项；未开启真 pi 时为 `132 passed, 5 skipped`）：
 
-- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→done 收敛、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、内置命令代理（compact/name/stats/export）、命令 `sourceInfo` 元数据、会话统计与上下文预警、扩展 `setStatus`/`notify` 生命周期、非图片附件落盘与乐观消息对账、附件目录保留策略、Provider 配置、Runtime 生命周期与交互流程、图片附件转发、CLI 参数解析与错误映射。
+- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→终态收敛（done/cancelled/failed）、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、内置命令代理（compact/name/stats/export）、命令 id 消毒后按 pi 原生名派发、命令 `sourceInfo` 元数据、会话统计与上下文预警、扩展 `setStatus`/`notify` 生命周期、非图片附件落盘与乐观消息对账、附件目录保留策略、Provider 配置、Runtime 生命周期与交互流程、图片附件转发、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
 - 兼容性：官方 Connector 2.0.0 与 2.0.3（两版源码下同一套测试全绿；PyPI `anywhere-cli` 2.0.3 wheel 与对应源码一致）。
 - 端到端：与自托管 AA Server 2.0.0 的连接、既有会话批量同步与时间线投影、模型目录上报。
