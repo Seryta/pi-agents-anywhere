@@ -167,6 +167,26 @@ def _platform_command_id(name: str, taken: set[str]) -> str:
         suffix += 1
 
 
+def _restore_native_command_text(raw: str, command: str, native: str) -> str:
+    """Swap the platform command token in a raw line for the pi-native name.
+
+    The client builds ``raw`` from the platform id (``/skill-pdf-tools now``);
+    when sanitizing changed the id, dispatching that line verbatim would reach
+    pi as an unknown command. Only the leading ``/<id>`` token is rewritten;
+    the argument text is forwarded untouched. Lines that do not start with the
+    platform id (or whose id already is native) are returned unchanged.
+    """
+
+    if native == command:
+        return raw
+    prefix = "/" + command
+    if not raw.lower().startswith(prefix.lower()):
+        return raw
+    if len(raw) > len(prefix) and not raw[len(prefix)].isspace():
+        return raw
+    return "/" + native + raw[len(prefix) :]
+
+
 # Fields of pi's per-command ``sourceInfo`` block that are stable metadata for
 # the platform; the rest (if pi ever adds any) is dropped, not forwarded.
 COMMAND_SOURCE_INFO_KEYS = ("path", "source", "scope", "origin", "baseDir")
@@ -1073,6 +1093,9 @@ class PiRuntime(AgentRuntime):
         self._synced: dict[str, tuple[float, int]] = {}
         self._utility: PiRpcProcess | None = None
         self._catalog_revision = 0
+        # Platform command id -> pi-native command name, filled by
+        # ``list_commands`` and consumed by ``execute_command``.
+        self._command_native_names: dict[str, str] = {}
         self._stopping = False
         self._reclaim_task: asyncio.Task[None] | None = None
         self._stale_reset_task: asyncio.Task[None] | None = None
@@ -1932,6 +1955,7 @@ class PiRuntime(AgentRuntime):
                 continue
             command_id = _platform_command_id(name, taken)
             taken.add(command_id)
+            self._command_native_names[command_id] = name
             metadata: dict[str, Any] = {"source": raw.get("source")}
             source_info = _command_source_info(raw)
             if source_info is not None:
@@ -1964,8 +1988,23 @@ class PiRuntime(AgentRuntime):
             return await self._execute_builtin_command(
                 session_id, command, external_session_id, args
             )
+        native = self._command_native_names.get(command)
+        if native is None:
+            # The platform may dispatch a command cached from an earlier
+            # catalog; refresh the full catalog once so the id map can
+            # translate it.
+            try:
+                await self.list_commands(session_id, external_session_id, limit=0)
+            except Exception:  # the catalog refresh is best-effort
+                logger.exception("failed to refresh the pi command catalog")
+            native = self._command_native_names.get(command, command)
         live = await self._ensure_live(session_id, external_session_id, None)
-        text = raw if raw else "/" + command + (" " + " ".join(args) if args else "")
+        if raw:
+            # ``raw`` is authoritative except for the command token, which the
+            # platform may have sanitized away from the pi-native name.
+            text = _restore_native_command_text(raw, command, native)
+        else:
+            text = "/" + native + (" " + " ".join(args) if args else "")
         logger.info("pi command execute session_id=%s text=%r", session_id, text)
         await live.send_prompt(text)
         return RuntimeCommandResult(

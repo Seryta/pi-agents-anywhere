@@ -1179,6 +1179,71 @@ async def test_command_catalog_declares_argument_support(
         await runtime.stop()
 
 
+async def test_execute_command_restores_native_names_for_platform_ids(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sanitized platform id reaches pi under its native name.
+
+    ``skill:pdf-tools`` is listed as ``skill-pdf-tools``; dispatch must map the
+    id back and rewrite the raw line's command token, while an id that was
+    never sanitized still forwards ``raw`` verbatim.
+    """
+
+    commands_file = tmp_path / "pi-commands.jsonl"
+    monkeypatch.setenv("PI_FAKE_COMMANDS_FILE", str(commands_file))
+
+    async def fake_command(_payload):
+        return {
+            "data": {
+                "commands": [{"name": "skill:pdf-tools", "description": "PDF", "source": "skill"}]
+            }
+        }
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        runtime._utility_command = fake_command  # type: ignore[method-assign]
+        # No catalog was listed first: execute_command refreshes the id map
+        # itself (utility process, the session is started afterwards).
+        result = await runtime.execute_command("sess-skill", "skill-pdf-tools", args=("做", "PDF"))
+        assert result.ok is True
+        assert result.message == "已发送 /skill:pdf-tools 做 PDF"
+
+        # The raw line is built from the platform id and gets translated too.
+        result = await runtime.execute_command(
+            "sess-skill", "skill-pdf-tools", raw="/skill-pdf-tools make it"
+        )
+        assert result.ok is True
+        assert result.message == "已发送 /skill:pdf-tools make it"
+
+        # A never-sanitized id keeps ``raw`` authoritative, spacing included.
+        result = await runtime.execute_command(
+            "sess-skill", "fix-tests", raw="/fix-tests  keep  spacing"
+        )
+        assert result.ok is True
+        assert result.message == "已发送 /fix-tests  keep  spacing"
+
+        def prompt_messages() -> list[str]:
+            if not commands_file.is_file():
+                return []
+            records = [
+                json.loads(line) for line in commands_file.read_text(encoding="utf-8").splitlines()
+            ]
+            return [record["message"] for record in records if record["type"] == "prompt"]
+
+        await wait_for(lambda: len(prompt_messages()) >= 3)
+        assert prompt_messages() == [
+            "/skill:pdf-tools 做 PDF",
+            "/skill:pdf-tools make it",
+            "/fix-tests  keep  spacing",
+        ]
+    finally:
+        await runtime.stop()
+
+
 async def test_context_usage_warning_opens_on_settle_and_resolves(
     fake_pi: Path,
     tmp_path: Path,
