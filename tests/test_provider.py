@@ -49,6 +49,21 @@ async def test_discover_available(fake_pi: Path) -> None:
     assert descriptor.metadata["version"] == "9.9.9-fake"
 
 
+async def test_config_ui_order_covers_every_schema_field() -> None:
+    """Clients render the config form from ``ui_schema.order``.
+
+    A field missing from the order (``idleTimeoutSeconds`` was) never shows
+    up in the form even though the schema defines a default for it and the
+    README lists it in the config table.
+    """
+
+    config_schema = await PiProvider().get_config_schema()
+    properties = set(config_schema.schema["properties"])
+    order = list(config_schema.ui_schema["order"])
+    assert len(order) == len(set(order))
+    assert set(order) == properties
+
+
 async def test_validate_config(fake_pi: Path, tmp_path: Path) -> None:
     runtime_config = await PiProvider().validate_config({"sessionsDir": str(tmp_path / "sessions")})
     assert runtime_config.runtime == "pi"

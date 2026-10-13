@@ -144,6 +144,7 @@ class PiProvider(RuntimeProvider):
                     "sessionsDir",
                     "defaultCwd",
                     "requestTimeoutMs",
+                    "idleTimeoutSeconds",
                 ],
                 "executablePath": {"component": "path"},
                 "sessionsDir": {"component": "path"},
