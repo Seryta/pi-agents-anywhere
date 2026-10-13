@@ -332,6 +332,17 @@ def _prompt_with_attachment_notes(
     return content + "\n\n" + "\n".join(lines)
 
 
+def _attachment_note_name(name: str) -> str:
+    """Collapse an attachment name to a single prompt-note line.
+
+    Each note is one ``- {name}: {path}`` line, so a name with embedded line
+    breaks could forge extra entries in the list the model reads; collapsing
+    whitespace runs keeps the name on its own line.
+    """
+
+    return " ".join(name.split())
+
+
 class PendingInteraction:
     """One open extension UI dialog waiting for a platform response."""
 
@@ -2806,7 +2817,7 @@ class PiRuntime(AgentRuntime):
                     target,
                 )
                 continue
-            notes.append((name, str(target)))
+            notes.append((_attachment_note_name(name) or target.name, str(target)))
         return tuple(images), tuple(notes)
 
     async def _apply_selections(
