@@ -1183,14 +1183,16 @@ class PiRuntime(AgentRuntime):
             await asyncio.sleep(ATTACHMENT_CLEANUP_INTERVAL_SECONDS)
 
     async def cleanup_attachments(self) -> int:
-        """Expire files of inactive session attachment directories.
+        """Expire files of pi-owned inactive session attachment directories.
 
-        Only the one directory level under the attachments root is considered:
-        directories whose name matches a live session's attachment directory
-        are skipped wholesale; files older than the retention window are
-        removed from every other directory, and a directory left empty is
-        deleted. A retention of zero disables cleanup and touches nothing.
-        Returns the number of deleted files.
+        Only the one directory level under the attachments root is considered,
+        and only directories that provably belong to pi are touched: a session
+        must be live, be known to this runtime, or match a pi session file on
+        disk. Directories of other runtimes (or unknown owners) and symlinks
+        are left alone. Files older than the retention window are removed from
+        pi-owned inactive directories, and a directory left empty is deleted.
+        A retention of zero disables cleanup and touches nothing. Returns the
+        number of deleted files.
         """
 
         if self._attachment_retention_days <= 0:
@@ -1198,6 +1200,14 @@ class PiRuntime(AgentRuntime):
         root = attachments_root()
         cutoff = time.time() - self._attachment_retention_days * 86400
         live_names = {session_attachments_dir(session_id).name for session_id in self._live}
+        owned = set(live_names)
+        owned.update(session_attachments_dir(session_id).name for session_id in self._known_paths)
+        try:
+            for summary in self.directory.list_sessions(0):
+                session_id = platform_session_id(self.host.session_namespace, summary.path)
+                owned.add(session_attachments_dir(session_id).name)
+        except OSError:
+            logger.warning("attachment cleanup: pi session scan failed")
         try:
             entries = list(root.iterdir())
         except OSError:
@@ -1205,11 +1215,14 @@ class PiRuntime(AgentRuntime):
             return 0
         deleted = 0
         for entry in entries:
-            if not entry.is_dir() or entry.name in live_names:
+            # is_dir() follows symlinks; never walk or unlink through one.
+            if entry.is_symlink() or not entry.is_dir() or entry.name in live_names:
+                continue
+            if entry.name not in owned:
                 continue
             try:
                 for child in list(entry.iterdir()):
-                    if not child.is_file():
+                    if child.is_symlink() or not child.is_file():
                         continue
                     try:
                         if child.stat().st_mtime < cutoff:

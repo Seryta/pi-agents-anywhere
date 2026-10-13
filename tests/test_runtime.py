@@ -42,6 +42,30 @@ def make_runtime(fake_pi: Path, tmp_path: Path, host: FakeHost) -> PiRuntime:
     return PiRuntime(config=config, host=host)
 
 
+def pi_owned_attachments_dir(runtime: PiRuntime, tmp_path: Path, name: str) -> Path:
+    """Create a pi session file and return its pi-owned attachments directory."""
+
+    session_file = tmp_path / "sessions" / f"{name}.jsonl"
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    session_file.write_text(
+        json.dumps(
+            {
+                "type": "session",
+                "version": 3,
+                "id": name,
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "cwd": str(tmp_path),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    session_id = platform_session_id(runtime.host.session_namespace, str(session_file))
+    directory = session_attachments_dir(session_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
 def session_user_contents(session_file: Path) -> list[object]:
     """Content of every user message pi persisted, in order."""
 
@@ -2361,8 +2385,7 @@ async def test_cleanup_attachments_deletes_old_files_keeps_new(
 
     monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
     runtime = make_runtime(fake_pi, tmp_path, fake_host)
-    directory = attachments_root() / "sess-stale"
-    directory.mkdir(parents=True)
+    directory = pi_owned_attachments_dir(runtime, tmp_path, "stale")
     old_file = directory / "text-1-notes.txt"
     old_file.write_bytes(FAKE_TEXT_BYTES)
     old = time.time() - 31 * 86400
@@ -2397,8 +2420,7 @@ async def test_cleanup_attachments_skips_live_session_directories(
     live_file.write_bytes(FAKE_TEXT_BYTES)
     os.utime(live_file, (old, old))
 
-    stale_dir = attachments_root() / "sess-stale"
-    stale_dir.mkdir(parents=True)
+    stale_dir = pi_owned_attachments_dir(runtime, tmp_path, "stale")
     stale_file = stale_dir / "text-1-notes.txt"
     stale_file.write_bytes(FAKE_TEXT_BYTES)
     os.utime(stale_file, (old, old))
@@ -2431,8 +2453,7 @@ async def test_cleanup_attachments_disabled_when_retention_zero(
         },
     )
     runtime = PiRuntime(config=config, host=fake_host)
-    directory = attachments_root() / "sess-kept"
-    directory.mkdir(parents=True)
+    directory = pi_owned_attachments_dir(runtime, tmp_path, "kept")
     old_file = directory / "text-1-notes.txt"
     old_file.write_bytes(FAKE_TEXT_BYTES)
     old = time.time() - 60 * 86400
@@ -2454,16 +2475,14 @@ async def test_cleanup_attachments_removes_empty_directories(
 
     monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
     runtime = make_runtime(fake_pi, tmp_path, fake_host)
-    root = attachments_root()
-    (root / "sess-empty").mkdir(parents=True)
-    stale_dir = root / "sess-stale"
-    stale_dir.mkdir(parents=True)
+    empty_dir = pi_owned_attachments_dir(runtime, tmp_path, "empty")
+    stale_dir = pi_owned_attachments_dir(runtime, tmp_path, "stale")
     stale_file = stale_dir / "text-1-notes.txt"
     stale_file.write_bytes(FAKE_TEXT_BYTES)
     old = time.time() - 31 * 86400
     os.utime(stale_file, (old, old))
     # Nested subdirectories are never recursed into.
-    nested = root / "sess-nested" / "sub"
+    nested = pi_owned_attachments_dir(runtime, tmp_path, "nested") / "sub"
     nested.mkdir(parents=True)
     nested_file = nested / "text-1-notes.txt"
     nested_file.write_bytes(FAKE_TEXT_BYTES)
@@ -2472,9 +2491,62 @@ async def test_cleanup_attachments_removes_empty_directories(
     deleted = await runtime.cleanup_attachments()
 
     assert deleted == 1
-    assert not (root / "sess-empty").exists()
+    assert not empty_dir.exists()
     assert not stale_dir.exists()
     assert nested_file.exists()
+
+
+async def test_cleanup_attachments_skips_symlinked_directories(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A symlink under the root must never lead cleanup outside of it."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    owned_dir = pi_owned_attachments_dir(runtime, tmp_path, "link-owner")
+    # Give the link a pi-owned name so it would be cleaned without the
+    # symlink guard, then point it at a directory outside the root.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "important-a.txt"
+    outside_file.write_bytes(FAKE_TEXT_BYTES)
+    old = time.time() - 31 * 86400
+    os.utime(outside_file, (old, old))
+    owned_dir.rmdir()
+    owned_dir.symlink_to(outside, target_is_directory=True)
+
+    deleted = await runtime.cleanup_attachments()
+
+    assert deleted == 0
+    assert owned_dir.is_symlink()
+    assert outside_file.exists()
+
+
+async def test_cleanup_attachments_leaves_other_runtime_directories(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Other runtimes share the attachments root; their caches stay untouched."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    other_dir = attachments_root() / "sess_codex_other_123"
+    other_dir.mkdir(parents=True)
+    old_file = other_dir / "old.txt"
+    old_file.write_bytes(FAKE_TEXT_BYTES)
+    old = time.time() - 31 * 86400
+    os.utime(old_file, (old, old))
+
+    deleted = await runtime.cleanup_attachments()
+
+    assert deleted == 0
+    assert old_file.exists()
+    assert other_dir.is_dir()
 
 
 async def test_attachment_cleanup_task_runs_immediately_and_stops(
@@ -2487,8 +2559,7 @@ async def test_attachment_cleanup_task_runs_immediately_and_stops(
 
     monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
     runtime = make_runtime(fake_pi, tmp_path, fake_host)
-    directory = attachments_root() / "sess-start"
-    directory.mkdir(parents=True)
+    directory = pi_owned_attachments_dir(runtime, tmp_path, "start")
     old_file = directory / "text-1-notes.txt"
     old_file.write_bytes(FAKE_TEXT_BYTES)
     old = time.time() - 31 * 86400
