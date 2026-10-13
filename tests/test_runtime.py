@@ -1075,3 +1075,165 @@ async def test_client_message_bindings_survive_connector_restart(
         assert user_items[-1].source.get("clientMessageId") == "opt_test_restart"
     finally:
         await restarted.stop()
+
+
+async def test_queue_update_event_pushes_pending_queue_metadata(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """Queue changes must reach the platform even when status stays put."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-queue-meta", cwd=str(tmp_path))
+    runtime._live["sess-queue-meta"] = live
+
+    # Non-string queue entries are dropped; the queues hold complete snapshots.
+    await runtime.handle_live_event(
+        live,
+        {"type": "queue_update", "steering": ["steer-a", 42], "followUp": ["f1", "f2"]},
+    )
+    state = fake_host.states[-1]
+    assert state["metadata"]["pendingSteering"] == ["steer-a"]
+    assert state["metadata"]["pendingFollowUp"] == ["f1", "f2"]
+    assert state["metadata"]["pendingMessageCount"] == 3
+    assert live.pending_message_count == 3
+
+    # The queue participates in the state key: clearing it is a new state even
+    # though the status is still idle.
+    await runtime.handle_live_event(live, {"type": "queue_update", "steering": [], "followUp": []})
+    assert len(fake_host.states) == 2
+    assert fake_host.states[-1]["metadata"]["pendingMessageCount"] == 0
+    assert live.steering_queue == []
+    assert live.followup_queue == []
+
+
+async def test_followup_message_is_queued_while_busy(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second message during streaming queues and is still answered.
+
+    ``start_turn`` switches to ``streamingBehavior: followUp`` while the
+    session is busy; the fake mirrors pi in reporting the queued text via
+    ``queue_update`` and running it once the busy turn settles.
+    """
+
+    monkeypatch.setenv("PI_FAKE_BUSY_FIRST_PROMPT", "1")
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.start_turn("sess-queue-followup", None, "first question")
+        live = runtime._live["sess-queue-followup"]
+        await wait_for(lambda: live.is_streaming)
+
+        second = await runtime.start_turn("sess-queue-followup", None, "second question")
+        assert second.result["queued"] is True
+        await wait_for(
+            lambda: any(
+                state.get("metadata", {}).get("pendingFollowUp") == ["second question"]
+                for state in fake_host.states
+            )
+        )
+
+        # pi eventually answers the queued text and the session settles idle.
+        await wait_for(lambda: len(fake_host.turn_ends) >= 2)
+        await wait_for(lambda: live.status == "idle")
+        replies = [
+            item.content["text"]
+            for sync in fake_host.timeline_syncs
+            for item in sync["items"]
+            if item.type == "message" and item.role == "assistant"
+        ]
+        assert "reply to second question" in replies
+    finally:
+        await runtime.stop()
+
+
+async def test_interrupt_clears_queue_before_abort(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Interrupt mirrors the TUI's Esc: clear the queue, then abort.
+
+    A plain abort would keep running whatever is still queued; the cleared
+    texts ride back in the state metadata so the client can restore them.
+    """
+
+    monkeypatch.setenv("PI_FAKE_BUSY_FIRST_PROMPT", "1")
+    monkeypatch.setenv(
+        "PI_FAKE_CLEAR_QUEUE_DATA",
+        json.dumps({"steering": [], "followUp": ["queued idea"]}),
+    )
+    commands_file = tmp_path / "pi-commands.jsonl"
+    monkeypatch.setenv("PI_FAKE_COMMANDS_FILE", str(commands_file))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.start_turn("sess-queue-interrupt", None, "first question")
+        live = runtime._live["sess-queue-interrupt"]
+        await wait_for(lambda: live.is_streaming)
+
+        result = await runtime.interrupt_session("sess-queue-interrupt")
+        assert result.ok is True
+        assert result.result["clearedQueue"] == {
+            "steering": [],
+            "followUp": ["queued idea"],
+        }
+        await wait_for(lambda: commands_file.is_file())
+        commands = [
+            json.loads(line)["type"]
+            for line in commands_file.read_text(encoding="utf-8").splitlines()
+        ]
+        sequence = [entry for entry in commands if entry in ("clear_queue", "abort")]
+        assert sequence == ["clear_queue", "abort"]
+        await wait_for(
+            lambda: any(
+                state.get("metadata", {}).get("clearedQueue")
+                == {"steering": [], "followUp": ["queued idea"]}
+                for state in fake_host.states
+            )
+        )
+    finally:
+        await runtime.stop()
+
+
+async def test_interrupt_aborts_when_clear_queue_fails(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing ``clear_queue`` must never block the abort."""
+
+    monkeypatch.setenv("PI_FAKE_BUSY_FIRST_PROMPT", "1")
+    monkeypatch.setenv("PI_FAKE_CLEAR_QUEUE_FAIL", "1")
+    commands_file = tmp_path / "pi-commands.jsonl"
+    monkeypatch.setenv("PI_FAKE_COMMANDS_FILE", str(commands_file))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.start_turn("sess-queue-clear-fail", None, "first question")
+        live = runtime._live["sess-queue-clear-fail"]
+        await wait_for(lambda: live.is_streaming)
+
+        result = await runtime.interrupt_session("sess-queue-clear-fail")
+        assert result.ok is True
+        assert "clearedQueue" not in result.result
+        await wait_for(lambda: commands_file.is_file())
+        commands = [
+            json.loads(line)["type"]
+            for line in commands_file.read_text(encoding="utf-8").splitlines()
+        ]
+        assert commands[-2:] == ["clear_queue", "abort"]
+        await wait_for(lambda: not live.is_streaming)
+        await wait_for(lambda: live.status == "idle")
+    finally:
+        await runtime.stop()

@@ -344,6 +344,13 @@ class PiLiveSession:
         self.pending_ui: dict[str, PendingInteraction] = {}
         # (text, clientMessageId) pairs waiting for their projected user message.
         self.client_messages: list[tuple[str, str]] = []
+        # Queued steering/follow-up texts pi reports via ``queue_update``; the
+        # event carries the complete queues, so these are replaced wholesale.
+        self.steering_queue: list[str] = []
+        self.followup_queue: list[str] = []
+        self.pending_message_count = 0
+        # Steering/follow-up texts pi returned from the last ``clear_queue``.
+        self.cleared_queue: dict[str, list[str]] | None = None
         self.last_activity = time.monotonic()
         self._start_lock = asyncio.Lock()
         self.last_state_key: tuple[Any, ...] | None = None
@@ -451,6 +458,9 @@ class PiLiveSession:
         count = data.get("messageCount")
         if isinstance(count, int) and not isinstance(count, bool):
             self.message_count = count
+        pending = data.get("pendingMessageCount")
+        if isinstance(pending, int) and not isinstance(pending, bool):
+            self.pending_message_count = pending
 
     async def command(
         self,
@@ -502,6 +512,8 @@ class PiLiveSession:
             self.status,
             _model_selection_id(self.model or {}),
             self.thinking_level,
+            tuple(self.steering_queue),
+            tuple(self.followup_queue),
         )
 
 
@@ -949,6 +961,14 @@ class PiRuntime(AgentRuntime):
             metadata["piSessionId"] = live.pi_session_id
         if live.session_name:
             metadata["sessionName"] = live.session_name
+        metadata["pendingMessageCount"] = max(
+            live.pending_message_count,
+            len(live.steering_queue) + len(live.followup_queue),
+        )
+        metadata["pendingSteering"] = list(live.steering_queue)
+        metadata["pendingFollowUp"] = list(live.followup_queue)
+        if live.cleared_queue is not None:
+            metadata["clearedQueue"] = live.cleared_queue
         active_pending = live.active_pending_ui()
         if active_pending:
             metadata["pendingInteractions"] = len(active_pending)
@@ -1312,8 +1332,37 @@ class PiRuntime(AgentRuntime):
             return RuntimeOperationResult(result={"sessionId": session_id, "noop": True})
         if not (live.is_streaming or live.is_compacting):
             return RuntimeOperationResult(result={"sessionId": session_id, "noop": True})
+        # Mirror the TUI's Esc (docs/rpc-commands.md): drain the queue first so
+        # abort does not keep running the queued messages, and hand the returned
+        # text back to the client so it can restore the editor. A failed clear
+        # must never block the abort.
+        try:
+            data = response_data(
+                await live.command(
+                    {"type": "clear_queue"}, timeout=max(self.request_timeout, 120.0)
+                )
+            )
+            cleared: dict[str, list[str]] = {}
+            for key in ("steering", "followUp"):
+                items = data.get(key)
+                cleared[key] = (
+                    [item for item in items if isinstance(item, str)]
+                    if isinstance(items, list)
+                    else []
+                )
+            live.cleared_queue = cleared
+        except Exception:  # a failed clear must never block the abort
+            logger.warning(
+                "pi clear_queue failed for session %s; aborting anyway",
+                session_id,
+                exc_info=True,
+            )
         await live.command({"type": "abort"}, timeout=max(self.request_timeout, 120.0))
-        return RuntimeOperationResult(result={"sessionId": session_id})
+        await self._push_state(live, force=True)
+        result: dict[str, Any] = {"sessionId": session_id}
+        if live.cleared_queue is not None:
+            result["clearedQueue"] = live.cleared_queue
+        return RuntimeOperationResult(result=result)
 
     async def update_session_selections(
         self,
@@ -1417,6 +1466,22 @@ class PiRuntime(AgentRuntime):
             if isinstance(level, str):
                 live.thinking_level = level
                 await self._push_state(live)
+            return
+        if event_type == "queue_update":
+            steering = record.get("steering")
+            live.steering_queue = (
+                [item for item in steering if isinstance(item, str)]
+                if isinstance(steering, list)
+                else []
+            )
+            followup = record.get("followUp")
+            live.followup_queue = (
+                [item for item in followup if isinstance(item, str)]
+                if isinstance(followup, list)
+                else []
+            )
+            live.pending_message_count = len(live.steering_queue) + len(live.followup_queue)
+            await self._push_state(live)
             return
         if event_type == "session_info_changed":
             name = record.get("name")

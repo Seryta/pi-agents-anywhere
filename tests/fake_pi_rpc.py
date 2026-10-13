@@ -9,6 +9,18 @@ Behaviour is controlled by environment variables:
   extension UI dialog and waits for ``extension_ui_response`` before settling.
 - ``PI_FAKE_SESSIONS``: number of synthetic sessions to report for inventory
   (not used yet; sessions are discovered from files).
+- ``PI_FAKE_BUSY_FIRST_PROMPT``: when ``1``, the first prompt flips the session
+  to streaming and never settles; a later prompt with
+  ``streamingBehavior == "followUp"`` is queued (reported via ``queue_update``),
+  and unblocks the busy run: it settles, then the queued texts run as normal
+  turns.
+- ``PI_FAKE_CLEAR_QUEUE_DATA``: JSON text of the data block the ``clear_queue``
+  response returns (``{"steering": [...], "followUp": [...]}``); defaults to
+  the live queue contents.
+- ``PI_FAKE_CLEAR_QUEUE_FAIL``: when ``1``, ``clear_queue`` answers
+  ``success: false``.
+- ``PI_FAKE_COMMANDS_FILE``: when set, every received command is appended as
+  one JSON line, in arrival order (used to assert command sequences).
 """
 
 from __future__ import annotations
@@ -20,6 +32,11 @@ import uuid
 from pathlib import Path
 
 VERSION = os.environ.get("PI_FAKE_VERSION", "9.9.9-fake")
+
+# Queued text pi reports via ``queue_update`` events; the events carry the
+# complete queues, so callers replace these wholesale.
+QUEUE: dict[str, list[str]] = {"steering": [], "followUp": []}
+_BUSY_FIRST_PROMPT = os.environ.get("PI_FAKE_BUSY_FIRST_PROMPT") == "1"
 
 STATE: dict[str, object] = {
     "model": {
@@ -38,6 +55,7 @@ STATE: dict[str, object] = {
     "messageCount": 0,
     "waitingUi": False,
     "uiIssued": False,
+    "firstPromptConsumed": False,
 }
 
 
@@ -104,14 +122,65 @@ def state_data() -> dict:
         "sessionId": STATE["sessionId"],
         "sessionName": STATE["sessionName"],
         "messageCount": STATE["messageCount"],
-        "pendingMessageCount": 0,
+        "pendingMessageCount": len(QUEUE["steering"]) + len(QUEUE["followUp"]),
     }
 
 
 def settle_after_ui() -> None:
+    settle_current_turn()
+
+
+def queue_snapshot() -> dict[str, list[str]]:
+    return {"steering": list(QUEUE["steering"]), "followUp": list(QUEUE["followUp"])}
+
+
+def emit_queue_update() -> None:
+    """Emit the full current queue, as pi's ``queue_update`` contract does."""
+
+    snapshot = queue_snapshot()
+    emit(
+        {
+            "type": "queue_update",
+            "steering": snapshot["steering"],
+            "followUp": snapshot["followUp"],
+        }
+    )
+
+
+def log_command(command: dict) -> None:
+    """Append one line per received command for sequence assertions."""
+
+    path = os.environ.get("PI_FAKE_COMMANDS_FILE")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(command, ensure_ascii=False) + "\n")
+
+
+def first_prompt_stays_busy() -> bool:
+    """Busy-first mode keeps the first prompt streaming without settling."""
+
+    if not _BUSY_FIRST_PROMPT or STATE["firstPromptConsumed"]:
+        return False
+    STATE["firstPromptConsumed"] = True
+    return True
+
+
+def settle_current_turn() -> None:
     STATE["isStreaming"] = False
     emit({"type": "agent_end", "messages": [], "willRetry": False})
     emit({"type": "agent_settled"})
+
+
+def drain_queued_turns() -> None:
+    """Settle the busy run, then take queued texts as ordinary turns."""
+
+    settle_current_turn()
+    for kind in ("followUp", "steering"):
+        while QUEUE[kind]:
+            text = QUEUE[kind].pop(0)
+            emit_queue_update()
+            handle_prompt({"message": text})
 
 
 def issue_ui_if_needed() -> bool:
@@ -132,6 +201,26 @@ def issue_ui_if_needed() -> bool:
         request["options"] = ["alpha", "beta"]
     emit(request)
     return True
+
+
+def handle_prompt_command(command: dict) -> None:
+    """Queue follow-up/steering texts, or run a plain prompt as a turn."""
+
+    behavior = command.get("streamingBehavior")
+    text = command.get("message", "")
+    if behavior == "followUp":
+        QUEUE["followUp"].append(str(text))
+        emit_queue_update()
+        # Busy-first mode: the queued message unblocks the first run; the
+        # draining turns then answer every queued text.
+        if _BUSY_FIRST_PROMPT:
+            drain_queued_turns()
+        return
+    if behavior == "steer":
+        QUEUE["steering"].append(str(text))
+        emit_queue_update()
+        return
+    handle_prompt(command)
 
 
 def handle_prompt(command: dict) -> None:
@@ -215,15 +304,15 @@ def handle_prompt(command: dict) -> None:
         }
     )
     emit({"type": "turn_end", "message": {"role": "assistant"}, "toolResults": []})
-    if not issue_ui_if_needed():
-        emit({"type": "agent_end", "messages": [], "willRetry": False})
-        emit({"type": "agent_settled"})
-        STATE["isStreaming"] = False
+    busy = first_prompt_stays_busy()
+    if not issue_ui_if_needed() and not busy:
+        settle_current_turn()
 
 
 def handle_command(command: dict) -> None:
     command_type = command.get("type")
     request_id = command.get("id")
+    log_command(command)
     if command_type == "get_state":
         emit(
             {
@@ -243,9 +332,55 @@ def handle_command(command: dict) -> None:
                 "success": True,
             }
         )
-        handle_prompt(command)
+        handle_prompt_command(command)
     elif command_type == "steer":
         emit({"id": request_id, "type": "response", "command": "steer", "success": True})
+    elif command_type == "clear_queue":
+        if os.environ.get("PI_FAKE_CLEAR_QUEUE_FAIL") == "1":
+            emit(
+                {
+                    "id": request_id,
+                    "type": "response",
+                    "command": "clear_queue",
+                    "success": False,
+                    "error": "fake clear_queue failure",
+                }
+            )
+            return
+        data = queue_snapshot()
+        preset = os.environ.get("PI_FAKE_CLEAR_QUEUE_DATA")
+        if preset:
+            try:
+                preset_data = json.loads(preset)
+            except json.JSONDecodeError:
+                preset_data = None
+            if isinstance(preset_data, dict):
+                preset_steering = preset_data.get("steering")
+                preset_followup = preset_data.get("followUp")
+                data = {
+                    "steering": (
+                        [item for item in preset_steering if isinstance(item, str)]
+                        if isinstance(preset_steering, list)
+                        else []
+                    ),
+                    "followUp": (
+                        [item for item in preset_followup if isinstance(item, str)]
+                        if isinstance(preset_followup, list)
+                        else []
+                    ),
+                }
+        QUEUE["steering"] = []
+        QUEUE["followUp"] = []
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": "clear_queue",
+                "success": True,
+                "data": data,
+            }
+        )
+        emit_queue_update()
     elif command_type == "abort":
         STATE["isStreaming"] = False
         emit({"id": request_id, "type": "response", "command": "abort", "success": True})
