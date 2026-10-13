@@ -766,7 +766,15 @@ class PiLiveSession:
                         thinking[len(thinking)] = block["thinking"]
             stream.text = text
             stream.thinking = thinking
-            items = self._stream_message_items(stream, "done")
+            # Match the complete projection: an aborted or failed turn must
+            # not publish its final stream item as done.
+            stop_reason = message.get("stopReason")
+            status = "done"
+            if stop_reason == "aborted":
+                status = "cancelled"
+            elif stop_reason == "error":
+                status = "failed"
+            items = self._stream_message_items(stream, status)
             self.stream_message = None
             await self.cancel_stream_flush()
             await self._publish_stream_items(items)

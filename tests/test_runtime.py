@@ -2896,6 +2896,40 @@ async def test_stream_publishes_resume_after_settle(
     )
 
 
+@pytest.mark.parametrize(
+    ("stop_reason", "expected"),
+    [("stop", "done"), ("aborted", "cancelled"), ("error", "failed")],
+)
+async def test_finish_stream_message_maps_stop_reason_to_status(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    stop_reason: str,
+    expected: str,
+) -> None:
+    """The final streamed message carries the same status as the projection.
+
+    The complete projection maps ``aborted`` to ``cancelled`` and ``error``
+    to ``failed``; the streaming push that lands ahead of it must agree, or
+    the platform briefly shows an interrupted turn as completed.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-stream-status", cwd=str(tmp_path))
+    runtime._live["sess-stream-status"] = live
+
+    await live.finish_stream_message(
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "partial reply"}],
+            "stopReason": stop_reason,
+        }
+    )
+
+    messages = [item for item in fake_host.timeline_items if item.type == "message"]
+    assert [item.status for item in messages] == [expected]
+
+
 async def test_stop_cancels_pending_stream_flush(
     fake_pi: Path,
     tmp_path: Path,
