@@ -199,7 +199,7 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`136 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项；未开启真 pi 时为 `132 passed, 5 skipped`）：
+已验证（`137 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项；未开启真 pi 时为 `133 passed, 5 skipped`）：
 
 - 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→终态收敛（done/cancelled/failed）、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、内置命令代理（compact/name/stats/export）、命令 id 消毒后按 pi 原生名派发、命令 `sourceInfo` 元数据、会话统计与上下文预警、扩展 `setStatus`/`notify` 生命周期、非图片附件落盘与乐观消息对账、附件目录保留策略、Provider 配置、Runtime 生命周期与交互流程、图片附件转发、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
