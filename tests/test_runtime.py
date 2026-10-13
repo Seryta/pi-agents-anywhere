@@ -2202,6 +2202,30 @@ async def test_interrupt_clears_queue_before_abort(
         await runtime.stop()
 
 
+async def test_settle_clears_the_interrupt_queue_receipt(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """The cleared-queue receipt belongs to one state push, not the session.
+
+    The receipt only exists to hand the queued texts back to the client once;
+    leaving it on the live session would re-send the stale queue contents in
+    every later state push.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-cleared", cwd=str(tmp_path))
+    live.cleared_queue = {"steering": [], "followUp": ["queued idea"]}
+    runtime._live["sess-cleared"] = live
+
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+
+    assert live.cleared_queue is None
+    assert fake_host.states
+    assert all("clearedQueue" not in state.get("metadata", {}) for state in fake_host.states)
+
+
 def _upserts_by_id(host: FakeHost, item_type: str) -> dict[str, list]:
     grouped: dict[str, list] = {}
     for item in host.timeline_items:

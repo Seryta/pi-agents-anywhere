@@ -2355,6 +2355,10 @@ class PiRuntime(AgentRuntime):
             live.is_streaming = False
             live.is_compacting = False
             live.status_reason = None
+            # The interrupt receipt was delivered by the state push that
+            # carried it; later pushes must not keep re-sending the stale
+            # queue contents forever.
+            live.cleared_queue = None
             # The full sync below replaces every temporary stream item; settle
             # the stream generation first so the in-flight upsert lands ahead
             # of the replace and late ``message_end`` events cannot upsert
