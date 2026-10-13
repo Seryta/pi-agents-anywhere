@@ -2400,6 +2400,173 @@ async def test_streaming_keeps_full_timeline_sync_on_settle(
     assert fake_host.timeline_syncs[-1]["items"]
 
 
+def _write_stream_session_file(path: Path, tmp_path: Path, session_id: str) -> None:
+    """Write a minimal session file the full projection can read."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session",
+                        "version": 3,
+                        "id": session_id,
+                        "timestamp": "2026-01-01T00:00:00.000Z",
+                        "cwd": str(tmp_path),
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "u1",
+                        "timestamp": "2026-01-01T00:00:01.000Z",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "hello"}],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "id": "a1",
+                        "parentId": "u1",
+                        "timestamp": "2026-01-01T00:00:02.000Z",
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "final reply"}],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+async def test_settle_replace_waits_for_inflight_stream_upsert(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow stream upsert must land before the settle's complete replace.
+
+    ``message_end`` and ``agent_settled`` are scheduled as separate event
+    tasks, so the settle can reach its ``timeline_sync(complete=True)`` while
+    the final stream upsert is still in flight. Without the settle fence the
+    upsert lands after the replace and resurrects the temporary item the
+    platform just deleted.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    session_path = tmp_path / "sessions" / "stream-order.jsonl"
+    _write_stream_session_file(session_path, tmp_path, "stream-order")
+    live = PiLiveSession(runtime, "sess-stream-order", cwd=str(tmp_path))
+    live.session_file = str(session_path)
+    runtime._live["sess-stream-order"] = live
+
+    order: list[str] = []
+    upsert_started = asyncio.Event()
+    release_upsert = asyncio.Event()
+    original_upsert = fake_host.timeline_item_upsert
+    original_sync = fake_host.timeline_sync
+
+    async def slow_upsert(item):
+        if item.metadata.get("stream") is True:
+            upsert_started.set()
+            await release_upsert.wait()
+        order.append("upsert")
+        await original_upsert(item)
+
+    async def recording_sync(*args, **kwargs):
+        order.append("sync")
+        await original_sync(*args, **kwargs)
+
+    monkeypatch.setattr(fake_host, "timeline_item_upsert", slow_upsert)
+    monkeypatch.setattr(fake_host, "timeline_sync", recording_sync)
+
+    message_end = asyncio.create_task(
+        runtime.handle_live_event(
+            live,
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "streamed reply"}],
+                },
+            },
+        )
+    )
+    await asyncio.wait_for(upsert_started.wait(), timeout=5)
+    settle = asyncio.create_task(runtime.handle_live_event(live, {"type": "agent_settled"}))
+    # Let the settle task reach its publish fence while the upsert is stuck.
+    await asyncio.sleep(0.05)
+    release_upsert.set()
+    await asyncio.wait_for(asyncio.gather(message_end, settle), timeout=5)
+
+    assert order == ["upsert", "sync"], order
+    assert fake_host.timeline_syncs[-1]["complete"] is True
+
+
+async def test_stream_publishes_resume_after_settle(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """Late events stay dropped until ``agent_start`` reopens the next turn."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-stream-resume", cwd=str(tmp_path))
+    runtime._live["sess-stream-resume"] = live
+
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+
+    # A late ``message_end``/tool end from the settled run must not upsert a
+    # temporary item after the replace.
+    await runtime.handle_live_event(
+        live,
+        {
+            "type": "message_end",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "late"}]},
+        },
+    )
+    await runtime.handle_live_event(
+        live,
+        {
+            "type": "tool_execution_end",
+            "toolCallId": "late-call",
+            "toolName": "bash",
+            "result": {"content": [{"type": "text", "text": "late output"}], "details": {}},
+        },
+    )
+    assert fake_host.timeline_items == []
+
+    # The next turn streams normally once ``agent_start`` resets the gate.
+    await runtime.handle_live_event(live, {"type": "agent_start"})
+    live.begin_stream_message()
+    live.apply_stream_delta({"type": "text_delta", "contentIndex": 0, "delta": "next reply"})
+    await wait_for(
+        lambda: any(item.metadata.get("stream") is True for item in fake_host.timeline_items)
+    )
+    await runtime.handle_live_event(
+        live,
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "next reply"}],
+            },
+        },
+    )
+    assert any(
+        item.status == "done" and item.content.get("text") == "next reply"
+        for item in fake_host.timeline_items
+    )
+
+
 async def test_stop_cancels_pending_stream_flush(
     fake_pi: Path,
     tmp_path: Path,

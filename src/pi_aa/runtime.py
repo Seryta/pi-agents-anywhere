@@ -518,6 +518,14 @@ class PiLiveSession:
         self.stream_tools: dict[str, _StreamTool] = {}
         self.stream_task: asyncio.Task[None] | None = None
         self.stream_dirty = False
+        # Stream operations (a terminal message/tool push, one flush-loop
+        # publish) currently in flight. ``settle_stream`` waits for them so
+        # their upserts land ahead of the complete replace, while the
+        # ``stream_settled`` gate drops operations started afterwards.
+        self.stream_ops = 0
+        self.stream_ops_idle = asyncio.Event()
+        self.stream_ops_idle.set()
+        self.stream_settled = False
         self.last_activity = time.monotonic()
         self._start_lock = asyncio.Lock()
         self.last_state_key: tuple[Any, ...] | None = None
@@ -634,6 +642,8 @@ class PiLiveSession:
     def begin_stream_message(self) -> None:
         """Start buffering a new assistant message under a fresh stream id."""
 
+        if self.stream_settled:
+            return
         self.stream_index += 1
         self.stream_message = _StreamMessage(index=self.stream_index)
 
@@ -644,6 +654,8 @@ class PiLiveSession:
         cards, and creating them from both sources would duplicate them.
         """
 
+        if self.stream_settled:
+            return
         event_type = event.get("type")
         if event_type not in ("text_delta", "text_end", "thinking_delta", "thinking_end"):
             return
@@ -669,30 +681,38 @@ class PiLiveSession:
     async def finish_stream_message(self, message: Mapping[str, Any]) -> None:
         """Rebuild the message from its final content and push it immediately."""
 
-        stream = self.stream_message
-        if stream is None:
-            self.begin_stream_message()
+        if self.stream_settled:
+            return
+        self._begin_stream_op()
+        try:
             stream = self.stream_message
-        assert stream is not None
-        text: dict[int, str] = {}
-        thinking: dict[int, str] = {}
-        blocks = message.get("content")
-        if isinstance(blocks, list):
-            for block in blocks:
-                if not isinstance(block, Mapping):
-                    continue
-                if block.get("type") == "text" and isinstance(block.get("text"), str):
-                    text[len(text)] = block["text"]
-                elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
-                    thinking[len(thinking)] = block["thinking"]
-        stream.text = text
-        stream.thinking = thinking
-        items = self._stream_message_items(stream, "done")
-        self.stream_message = None
-        await self.cancel_stream_flush()
-        await self.publish_stream_items(items)
+            if stream is None:
+                self.begin_stream_message()
+                stream = self.stream_message
+            assert stream is not None
+            text: dict[int, str] = {}
+            thinking: dict[int, str] = {}
+            blocks = message.get("content")
+            if isinstance(blocks, list):
+                for block in blocks:
+                    if not isinstance(block, Mapping):
+                        continue
+                    if block.get("type") == "text" and isinstance(block.get("text"), str):
+                        text[len(text)] = block["text"]
+                    elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
+                        thinking[len(thinking)] = block["thinking"]
+            stream.text = text
+            stream.thinking = thinking
+            items = self._stream_message_items(stream, "done")
+            self.stream_message = None
+            await self.cancel_stream_flush()
+            await self._publish_stream_items(items)
+        finally:
+            self._end_stream_op()
 
     def start_tool_call(self, call_id: str, name: str, arguments: Any) -> None:
+        if self.stream_settled:
+            return
         self._ensure_stream_tool(call_id, name, arguments)
         self.notify_stream_change()
 
@@ -703,6 +723,8 @@ class PiLiveSession:
         arguments: Any,
         partial_result: Any,
     ) -> None:
+        if self.stream_settled:
+            return
         tool = self._ensure_stream_tool(call_id, name, arguments)
         content = partial_result.get("content") if isinstance(partial_result, Mapping) else None
         tool.output = projection.content_text(content)
@@ -715,24 +737,30 @@ class PiLiveSession:
         result: Any,
         is_error: bool,
     ) -> None:
-        tool = self.stream_tools.pop(call_id, None)
-        if tool is None:
-            # A result without a recorded start (connector restarted mid-call):
-            # still surface the terminal card instead of dropping the activity.
-            tool = self._make_stream_tool(call_id, name, {})
-        details = result.get("details") if isinstance(result, Mapping) else None
-        output = result.get("content") if isinstance(result, Mapping) else None
-        tool.output = projection.content_text(output)
-        tool.status = "failed" if is_error else "done"
-        exit_code = projection.tool_exit_code(details)
-        if exit_code is not None:
-            tool.content["exitCode"] = exit_code
-        if tool.content.get("kind") == "file_change":
-            changes = projection.tool_result_changes(tool.content, details)
-            if changes is not None:
-                tool.content["changes"] = changes
-        await self.cancel_stream_flush()
-        await self.publish_stream_items([self._stream_tool_item(tool)])
+        if self.stream_settled:
+            return
+        self._begin_stream_op()
+        try:
+            tool = self.stream_tools.pop(call_id, None)
+            if tool is None:
+                # A result without a recorded start (connector restarted mid-call):
+                # still surface the terminal card instead of dropping the activity.
+                tool = self._make_stream_tool(call_id, name, {})
+            details = result.get("details") if isinstance(result, Mapping) else None
+            output = result.get("content") if isinstance(result, Mapping) else None
+            tool.output = projection.content_text(output)
+            tool.status = "failed" if is_error else "done"
+            exit_code = projection.tool_exit_code(details)
+            if exit_code is not None:
+                tool.content["exitCode"] = exit_code
+            if tool.content.get("kind") == "file_change":
+                changes = projection.tool_result_changes(tool.content, details)
+                if changes is not None:
+                    tool.content["changes"] = changes
+            await self.cancel_stream_flush()
+            await self._publish_stream_items([self._stream_tool_item(tool)])
+        finally:
+            self._end_stream_op()
 
     def clear_stream_state(self) -> None:
         """Drop temporary stream buffers after the full projection replaced them."""
@@ -743,6 +771,8 @@ class PiLiveSession:
     def notify_stream_change(self) -> None:
         """Mark the session dirty and make sure one flush loop is running."""
 
+        if self.stream_settled:
+            return
         self.stream_dirty = True
         task = self.stream_task
         if task is None or task.done():
@@ -781,11 +811,54 @@ class PiLiveSession:
             if not task.cancelled():
                 raise
 
+    def _begin_stream_op(self) -> None:
+        self.stream_ops += 1
+        self.stream_ops_idle.clear()
+
+    def _end_stream_op(self) -> None:
+        self.stream_ops -= 1
+        if self.stream_ops <= 0:
+            self.stream_ops = 0
+            self.stream_ops_idle.set()
+
+    async def settle_stream(self) -> None:
+        """Fence stream publishes behind the upcoming complete replace.
+
+        Settles the stream gate so operations started afterwards drop, then
+        waits for the operations already in flight (a terminal message/tool
+        push, the flush loop's current upsert). Their upserts therefore land
+        ahead of the complete timeline sync that follows, which replaces
+        every temporary item the settled run produced -- instead of letting
+        a late ``message_end`` resurrect one behind the replace. Stream
+        operations only wait on the host, never on this method, so the wait
+        cannot deadlock.
+        """
+
+        self.stream_settled = True
+        if self.stream_ops:
+            await self.stream_ops_idle.wait()
+        await self.cancel_stream_flush()
+        self.clear_stream_state()
+
     async def publish_stream_items(
         self,
         terminal: Sequence[RuntimeTimelineItem] = (),
     ) -> None:
         """Upsert the current stream snapshot through the host."""
+
+        if self.stream_settled:
+            return
+        self._begin_stream_op()
+        try:
+            await self._publish_stream_items(terminal)
+        finally:
+            self._end_stream_op()
+
+    async def _publish_stream_items(
+        self,
+        terminal: Sequence[RuntimeTimelineItem] = (),
+    ) -> None:
+        """Push one snapshot; the caller has fenced it against settle."""
 
         pending = list(terminal)
         if self.stream_message is not None:
@@ -2259,6 +2332,9 @@ class PiRuntime(AgentRuntime):
                 )
             return
         if event_type == "agent_start":
+            # The previous settle closed the stream gate; this turn may stream
+            # again.
+            live.stream_settled = False
             live.status_reason = None
             live.is_streaming = True
             await self._push_state(live)
@@ -2271,10 +2347,11 @@ class PiRuntime(AgentRuntime):
             live.is_streaming = False
             live.is_compacting = False
             live.status_reason = None
-            # The full sync below replaces every temporary stream item; stop
-            # the coalescing loop first so a late push cannot resurrect one.
-            await live.cancel_stream_flush()
-            live.clear_stream_state()
+            # The full sync below replaces every temporary stream item; settle
+            # the stream generation first so the in-flight upsert lands ahead
+            # of the replace and late ``message_end`` events cannot upsert
+            # another one behind it.
+            await live.settle_stream()
             # Refresh before publishing so the pushed state carries current
             # token, cost, and context-usage metadata.
             await self.refresh_session_stats(live)
@@ -2345,8 +2422,7 @@ class PiRuntime(AgentRuntime):
 
     async def handle_live_exit(self, live: PiLiveSession, code: int | None) -> None:
         logger.info("pi session %s process exited code=%s", live.platform_id, code)
-        await live.cancel_stream_flush()
-        live.clear_stream_state()
+        await live.settle_stream()
         if self._stopping:
             return
         live.is_streaming = False
