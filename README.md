@@ -122,12 +122,13 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `interrupt_session` | `clear_queue` + `abort`（与 TUI 的 Esc 一致：丢弃排队消息再中断，被清除文本记入状态元数据） |
 | `update_session_selections` | `set_model` / `set_thinking_level` |
 | `get_session_state` | `get_state` + 进程内存态（运行/空闲/等待交互）+ 队列事实（`pendingMessageCount` / `pendingSteering` / `pendingFollowUp`） |
-| `runtime.attachment` | 从平台下载附件，把图片按 base64 `ImageContent` 附加到 `prompt`/`steer`（非图片跳过） |
+| `runtime.attachment` | 从平台下载附件：图片按 base64 `ImageContent` 附加到 `prompt`/`steer`；非图片保存到连接器附件目录（单文件 ≤64 MiB），并把路径写入 prompt 供 pi 读取 |
 | `get_session_snapshot` | 读会话文件 → 时间线投影（edit 结果附 unified diff `changes`，供工作台 diff 面板与文件预览） |
 | 实时推送（`timeline_item_upsert`） | `message_update` 的文本/思考与 `tool_execution_*` 工具状态，按约 300ms 聚合；轮次结束由全量投影替换 |
 | `list_model_catalog` | `get_available_models`（独立工具进程） |
-| `list_commands` / `execute_command` | `get_commands`；执行 = 发送 `/命令`，结果上报 `executionState=accepted`（2.0.3 命令契约） |
-| `get_session_notices` / `respond_interaction` | 扩展 UI 的 `select`/`confirm`/`input`/`editor` → interaction notice；`notify` → notification |
+| `list_commands` / `execute_command` | `get_commands`（扩展/模板/skill）；另代理 4 个 TUI 内置命令：`compact` / `name` / `stats` / `export`（connector 直接调用对应 RPC，不走 prompt 文本）；其余命令 = 发送 `/命令`，结果上报 `executionState=accepted`（2.0.3 命令契约） |
+| 会话统计 | `get_session_stats`：每轮 `agent_settled` 后刷新 token/成本/`contextUsage` 进状态元数据；上下文 ≥90% 时发预警 notice，回落自动 resolved |
+| `get_session_notices` / `respond_interaction` | 扩展 UI 的 `select`/`confirm`/`input`/`editor` → interaction notice；`notify` → notification（轮次结束/进程退出时 resolved）；`setStatus` → 状态元数据 `extensionStatus` |
 | `session_turn_ended` | 收到 `agent_settled` 时上报 |
 
 同步模型：**流式增量 + 轮询兜底 + 结束即推**。消息与工具状态按约 300ms 聚合实时 upsert；Connector 默认每 30s 扫描一次；Runtime 在 `agent_settled` 时立刻重读会话文件并推送一次全量快照（替换流式临时项），最终一致性由会话文件保证。
@@ -167,13 +168,12 @@ curl -fsSL -o ~/.pi/agent/extensions/reload.ts \
 
 ## 已知限制
 
-- **附件仅支持图片**：pi RPC 的输入是文本 + `ImageContent`，非图片附件（PDF 等）会被跳过。
+- **附件大小上限**：单个非图片附件超过 64 MiB 会被跳过（防磁盘滥用），日志有记录。
 - **无权限目录**：pi 没有运行时工具审批概念（工具权限由启动配置决定），因此没有 permission catalog。
 - **流式为消息级聚合**：文本/思考在生成过程中按约 300ms 聚合推送（非逐 token），工具输出同样节流；轮次结束后临时项由会话文件的全量投影替换。
-- **`notify` 通知不会被自动清除**：映射为 `open` 状态的 notification notice。
+- **对话框覆盖范围**：`select`/`confirm`/`input`/`editor` 映射为 interaction notice；`setStatus` 映射为状态元数据；`setWidget`/`setTitle`/`set_editor_text` 仍被忽略（RPC 模式无对应展示位置）。
 - **超过 64 MiB 的会话文件会被跳过**：超过 `MAX_SESSION_FILE_BYTES`（`src/pi_aa/sessions.py`，64 MiB）的会话文件不参与投影，会从会话列表消失且无提示（仅超大单文件场景；正常会话远小于此）。
 - **时间线跟随 pi 的活跃分支**：在 pi 中切换分支（`/tree`）后，旧分支的远端时间线项会被移除；切回该分支后会重新投影恢复。pi 的会话文件始终保留全部分支，此行为可逆。
-- 仅覆盖 `select/confirm/input/editor` 四种对话框交互；`setStatus`/`setWidget` 等无副作用调用被忽略。
 
 ## 开发与测试
 
@@ -198,9 +198,9 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`93 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`111 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
 
-- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→done 收敛、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、Provider 配置、Runtime 生命周期与交互流程、图片附件转发（下载、base64 编码与命令载荷）、CLI 参数解析与错误映射。
+- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→done 收敛、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、内置命令代理（compact/name/stats/export）、会话统计与上下文预警、扩展 `setStatus`/`notify` 生命周期、非图片附件落盘与乐观消息对账、Provider 配置、Runtime 生命周期与交互流程、图片附件转发、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
 - 兼容性：官方 Connector 2.0.0 与 2.0.3（两版源码下同一套测试全绿；PyPI `anywhere-cli` 2.0.3 wheel 与对应源码一致）。
 - 端到端：与自托管 AA Server 2.0.0 的连接、既有会话批量同步与时间线投影、模型目录上报。
