@@ -23,7 +23,7 @@ pi --mode rpc （每个活跃会话一个子进程）
 
 - **PiProvider**：发现本机 pi（`pi --version`）、配置校验、按配置创建 Runtime 实例。
 - **PiRuntime**：会话清单（扫描 `~/.pi/agent/sessions`）、会话快照、状态、发送/打断/转向、图片附件、模型目录、命令、扩展 UI 交互。
-- **Timeline 投影**：把 pi 会话文件里的消息、工具调用、轮次翻译成 AA 的 `RuntimeTimelineItem`（同样的投影同时用于历史会话与实时推送）。注意：pi 投影生成的 `turn.start`/`turn.end` 分界项与 `turnId` 会被官方 Connector/Server 2.0.x 的边界主动过滤，工作台时间线不显示轮次分界（属官方 2.0.x 的 session-only boundary 设计，非缺陷）。
+- **Timeline 投影**：把 pi 会话文件里的消息、工具调用、轮次翻译成 AA 的 `RuntimeTimelineItem`（同样的投影同时用于历史会话与实时推送）。运行时还会把 `message_update` 的文本/思考增量与 `tool_execution_*` 的工具状态按约 300ms 聚合，通过 `timeline_item_upsert` 实时推送到工作台；轮次结束时由全量投影替换为正式时间线项。注意：pi 投影生成的 `turn.start`/`turn.end` 分界项与 `turnId` 会被官方 Connector/Server 2.0.x 的边界主动过滤，工作台时间线不显示轮次分界（属官方 2.0.x 的 session-only boundary 设计，非缺陷）。
 
 注入点来自官方代码：`BackendRpcClient(config, agent_runtime_providers=(...))`（`connector/server/client.py`）。
 
@@ -117,19 +117,20 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | --- | --- |
 | `list_sessions` / `list_complete_session_inventory` | 扫描会话目录的 JSONL 头与名称 |
 | `create_and_start_session` | 启动新的 `pi --mode rpc` 子进程并发送消息 |
-| `start_turn` | `prompt`（会话忙时自动用 `streamingBehavior=followUp` 排队） |
+| `start_turn` | `prompt`（会话忙时自动用 `streamingBehavior=followUp` 排队；排队内容通过状态元数据可见） |
 | `steer_turn` | `steer`（空闲时退化为普通 prompt） |
-| `interrupt_session` | `abort` |
+| `interrupt_session` | `clear_queue` + `abort`（与 TUI 的 Esc 一致：丢弃排队消息再中断，被清除文本记入状态元数据） |
 | `update_session_selections` | `set_model` / `set_thinking_level` |
-| `get_session_state` | `get_state` + 进程内存态（运行/空闲/等待交互） |
+| `get_session_state` | `get_state` + 进程内存态（运行/空闲/等待交互）+ 队列事实（`pendingMessageCount` / `pendingSteering` / `pendingFollowUp`） |
 | `runtime.attachment` | 从平台下载附件，把图片按 base64 `ImageContent` 附加到 `prompt`/`steer`（非图片跳过） |
-| `get_session_snapshot` | 读会话文件 → 时间线投影 |
+| `get_session_snapshot` | 读会话文件 → 时间线投影（edit 结果附 unified diff `changes`，供工作台 diff 面板与文件预览） |
+| 实时推送（`timeline_item_upsert`） | `message_update` 的文本/思考与 `tool_execution_*` 工具状态，按约 300ms 聚合；轮次结束由全量投影替换 |
 | `list_model_catalog` | `get_available_models`（独立工具进程） |
 | `list_commands` / `execute_command` | `get_commands`；执行 = 发送 `/命令`，结果上报 `executionState=accepted`（2.0.3 命令契约） |
 | `get_session_notices` / `respond_interaction` | 扩展 UI 的 `select`/`confirm`/`input`/`editor` → interaction notice；`notify` → notification |
 | `session_turn_ended` | 收到 `agent_settled` 时上报 |
 
-同步模型：**轮询为主 + 结束即推**。Connector 默认每 30s 扫描一次；Runtime 在 `agent_settled` 时立刻重读会话文件并推送一次快照，因此工作台的延迟主要取决于这一条链路，而不是轮询周期。
+同步模型：**流式增量 + 轮询兜底 + 结束即推**。消息与工具状态按约 300ms 聚合实时 upsert；Connector 默认每 30s 扫描一次；Runtime 在 `agent_settled` 时立刻重读会话文件并推送一次全量快照（替换流式临时项），最终一致性由会话文件保证。
 
 ## 配置项
 
@@ -168,7 +169,7 @@ curl -fsSL -o ~/.pi/agent/extensions/reload.ts \
 
 - **附件仅支持图片**：pi RPC 的输入是文本 + `ImageContent`，非图片附件（PDF 等）会被跳过。
 - **无权限目录**：pi 没有运行时工具审批概念（工具权限由启动配置决定），因此没有 permission catalog。
-- **非逐 token 流式**：Timeline 在轮次结束（`agent_settled`）时推送，不推送 delta 级文本。
+- **流式为消息级聚合**：文本/思考在生成过程中按约 300ms 聚合推送（非逐 token），工具输出同样节流；轮次结束后临时项由会话文件的全量投影替换。
 - **`notify` 通知不会被自动清除**：映射为 `open` 状态的 notification notice。
 - **超过 64 MiB 的会话文件会被跳过**：超过 `MAX_SESSION_FILE_BYTES`（`src/pi_aa/sessions.py`，64 MiB）的会话文件不参与投影，会从会话列表消失且无提示（仅超大单文件场景；正常会话远小于此）。
 - **时间线跟随 pi 的活跃分支**：在 pi 中切换分支（`/tree`）后，旧分支的远端时间线项会被移除；切回该分支后会重新投影恢复。pi 的会话文件始终保留全部分支，此行为可逆。
@@ -197,9 +198,9 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`66 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`93 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
 
-- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影、Provider 配置、Runtime 生命周期与交互流程、图片附件转发（下载、base64 编码与命令载荷）、CLI 参数解析与错误映射。
+- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→done 收敛、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、Provider 配置、Runtime 生命周期与交互流程、图片附件转发（下载、base64 编码与命令载荷）、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
 - 兼容性：官方 Connector 2.0.0 与 2.0.3（两版源码下同一套测试全绿；PyPI `anywhere-cli` 2.0.3 wheel 与对应源码一致）。
 - 端到端：与自托管 AA Server 2.0.0 的连接、既有会话批量同步与时间线投影、模型目录上报。
