@@ -230,6 +230,31 @@ async def test_extension_ui_interaction_flow(
         await runtime.stop()
 
 
+async def test_respond_interaction_expires_cleanly_without_process(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """A live session whose process is gone must not raise in the RPC path.
+
+    The pending dialog references a process that no longer exists (reclaimed
+    or exited); the response must come back as an expired interaction instead
+    of an AssertionError killing the command channel.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-ui-gone", cwd=str(tmp_path))
+    pending = PendingInteraction({"id": "req-gone", "method": "confirm", "title": "确认"})
+    live.pending_ui[pending.request_id] = pending
+    runtime._live["sess-ui-gone"] = live
+
+    result = await runtime.respond_interaction("sess-ui-gone", pending.notice_id, "confirm")
+
+    assert result.ok is False
+    assert result.code == "pi_interaction_expired"
+    assert live.pending_ui.get("req-gone") is pending
+
+
 async def test_extension_set_status_reaches_session_metadata(
     fake_pi: Path,
     tmp_path: Path,

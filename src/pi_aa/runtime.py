@@ -2271,7 +2271,15 @@ class PiRuntime(AgentRuntime):
                 message="该交互已处理或已失效。",
             )
         payload = pending.response_payload(action_id, input_data)
-        assert live.process is not None
+        # The process dies only between ``ensure_started`` and now (or the
+        # session was reclaimed); a hard assert would kill the critical RPC
+        # channel, so report the interaction as expired instead.
+        if live.process is None or not live.process.alive:
+            return RuntimeOperationResult(
+                ok=False,
+                code="pi_interaction_expired",
+                message="该交互已失效（会话进程不在运行）。",
+            )
         await live.process.notify(payload)
         live.pending_ui.pop(request_id, None)
         await self.host.notice_upsert(pending.as_notice(session_id, status="resolved"))
