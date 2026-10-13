@@ -1516,6 +1516,44 @@ async def test_oversized_attachment_is_skipped(
     assert fake_host.attachment_downloads == [{"session_id": "sess-big", "file_id": "text-1"}]
 
 
+async def test_oversized_image_attachment_is_skipped(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The size cap applies to images too: no image content, nothing on disk."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    monkeypatch.setattr("pi_aa.runtime.MAX_ATTACHMENT_BYTES", 4)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        attachment = RuntimeAttachment(
+            file_id="file-1",
+            name="shot.png",
+            media_type="image/png",
+        )
+        result = await runtime.start_turn(
+            "sess-big-image",
+            None,
+            "大图片",
+            attachments=(attachment,),
+        )
+        assert result.ok is True
+        await wait_for(
+            lambda: session_file.is_file() and "大图片" in session_file.read_text(encoding="utf-8")
+        )
+    finally:
+        await runtime.stop()
+
+    # The text reaches the prompt; the image is skipped, not sent or saved.
+    assert session_user_contents(session_file) == ["大图片"]
+    assert not (tmp_path / "attachments" / "sess-big-image").exists()
+    assert fake_host.attachment_downloads == [{"session_id": "sess-big-image", "file_id": "file-1"}]
+
+
 async def test_steer_turn_saves_non_image_attachments(
     fake_pi: Path,
     tmp_path: Path,

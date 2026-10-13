@@ -2595,6 +2595,13 @@ class PiRuntime(AgentRuntime):
                     attachment.file_id,
                 )
                 continue
+            if len(downloaded.content) > MAX_ATTACHMENT_BYTES:
+                logger.warning(
+                    "pi runtime skipped oversized attachment file_id=%s size=%d",
+                    attachment.file_id,
+                    len(downloaded.content),
+                )
+                continue
             if media_type.startswith("image/"):
                 resolved_media_type = (downloaded.media_type or media_type).strip().lower()
                 images.append(
@@ -2603,13 +2610,6 @@ class PiRuntime(AgentRuntime):
                         "data": base64.b64encode(downloaded.content).decode("ascii"),
                         "mimeType": resolved_media_type,
                     }
-                )
-                continue
-            if len(downloaded.content) > MAX_ATTACHMENT_BYTES:
-                logger.warning(
-                    "pi runtime skipped oversized attachment file_id=%s size=%d",
-                    attachment.file_id,
-                    len(downloaded.content),
                 )
                 continue
             name = attachment.name or downloaded.name
