@@ -731,7 +731,9 @@ class PiRuntime(AgentRuntime):
         cursor: str | None = None,
         force: bool = False,
     ) -> tuple[SessionMeta, ...]:
-        _ = cursor, force
+        _ = cursor, force  # Pagination is not implemented: no server 2.0.x
+        # call site uses session.discover today, so a cursor would never be
+        # issued; if it ever is, this method needs real cursor/force handling.
         summaries = await asyncio.to_thread(
             self.directory.list_sessions, limit if limit and limit > 0 else 0
         )
