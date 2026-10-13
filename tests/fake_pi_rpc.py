@@ -668,6 +668,12 @@ def handle_command(command: dict) -> None:
                             "name": "fix-tests",
                             "description": "Fix failing tests",
                             "source": "prompt",
+                            "sourceInfo": {
+                                "path": "/home/user/myproject/.pi/agent/prompts/fix-tests.md",
+                                "source": "local",
+                                "scope": "project",
+                                "origin": "top-level",
+                            },
                         }
                     ]
                 },

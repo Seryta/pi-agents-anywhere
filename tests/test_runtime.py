@@ -764,6 +764,106 @@ async def test_list_commands_prepends_builtin_commands(
         await runtime.stop()
 
 
+async def test_list_commands_carries_command_source_info(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """pi's ``sourceInfo`` block lands on the platform command metadata.
+
+    The known string fields (path/source/scope/origin/baseDir) are picked
+    verbatim; the legacy ``source`` key stays untouched for compatibility.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        commands = await runtime.list_commands("sess-none")
+        pi_commands = [
+            command for command in commands if command.metadata.get("source") != "pi-builtin"
+        ]
+        assert pi_commands[0].id == "fix-tests"
+        assert pi_commands[0].metadata["source"] == "prompt"
+        assert pi_commands[0].metadata["sourceInfo"] == {
+            "path": "/home/user/myproject/.pi/agent/prompts/fix-tests.md",
+            "source": "local",
+            "scope": "project",
+            "origin": "top-level",
+        }
+    finally:
+        await runtime.stop()
+
+
+async def test_list_commands_without_source_info_stays_clean(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """Commands without (or with an unusable) ``sourceInfo`` are tolerated.
+
+    The metadata key is simply omitted, and no validation error from a
+    malformed block may escape ``list_commands``.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+
+        async def fake_command(_payload):
+            return {
+                "data": {
+                    "commands": [
+                        {
+                            "name": "plain-cmd",
+                            "description": "no source info",
+                            "source": "extension",
+                        },
+                        {
+                            "name": "odd-cmd",
+                            "description": "bad source info",
+                            "source": "prompt",
+                            "sourceInfo": 42,
+                        },
+                        {
+                            "name": "empty-cmd",
+                            "description": "empty source info",
+                            "source": "prompt",
+                            "sourceInfo": {},
+                        },
+                        {
+                            "name": "mixed-cmd",
+                            "description": "mixed source info",
+                            "source": "prompt",
+                            "sourceInfo": {
+                                "path": "/tmp/x.md",
+                                "scope": 7,
+                                "unknown": "kept?",
+                            },
+                        },
+                    ]
+                }
+            }
+
+        runtime._utility_command = fake_command  # type: ignore[method-assign]
+        commands = await runtime.list_commands("sess-none")
+        pi_commands = [
+            command for command in commands if command.metadata.get("source") != "pi-builtin"
+        ]
+        assert [command.id for command in pi_commands] == [
+            "plain-cmd",
+            "odd-cmd",
+            "empty-cmd",
+            "mixed-cmd",
+        ]
+        # Missing, non-mapping, and empty ``sourceInfo`` blocks leave no key.
+        assert all("sourceInfo" not in command.metadata for command in pi_commands[:3])
+        # Only known string fields are forwarded; the rest is dropped.
+        assert pi_commands[3].metadata["sourceInfo"] == {"path": "/tmp/x.md"}
+        assert "unknown" not in pi_commands[3].metadata["sourceInfo"]
+    finally:
+        await runtime.stop()
+
+
 async def test_execute_builtin_compact_sends_custom_instructions(
     fake_pi: Path,
     tmp_path: Path,

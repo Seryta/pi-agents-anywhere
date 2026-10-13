@@ -125,6 +125,26 @@ BUILTIN_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 BUILTIN_COMMAND_NAMES = frozenset(name for name, _ in BUILTIN_COMMANDS)
 
+# Fields of pi's per-command ``sourceInfo`` block that are stable metadata for
+# the platform; the rest (if pi ever adds any) is dropped, not forwarded.
+COMMAND_SOURCE_INFO_KEYS = ("path", "source", "scope", "origin", "baseDir")
+
+
+def _command_source_info(raw: Mapping[str, Any]) -> dict[str, str] | None:
+    """Pick the known string fields of a command's ``sourceInfo`` block.
+
+    Returns ``None`` when the block is missing or has no usable fields, so
+    callers can skip the metadata key altogether instead of carrying an empty
+    dict; non-string values and unknown keys are ignored rather than raised.
+    """
+
+    info = raw.get("sourceInfo")
+    if not isinstance(info, Mapping):
+        return None
+    picked = {key: info[key] for key in COMMAND_SOURCE_INFO_KEYS if isinstance(info.get(key), str)}
+    return picked or None
+
+
 # Warn once when the model context passes this utilization; dropping below it
 # (or pi no longer reporting usage) resolves the same notice.
 CONTEXT_WARNING_PERCENT = 90
@@ -1709,6 +1729,10 @@ class PiRuntime(AgentRuntime):
                 continue
             if needle and needle not in name.lower():
                 continue
+            metadata: dict[str, Any] = {"source": raw.get("source")}
+            source_info = _command_source_info(raw)
+            if source_info is not None:
+                metadata["sourceInfo"] = source_info
             commands.append(
                 RuntimeCommand(
                     id=name,
@@ -1717,7 +1741,7 @@ class PiRuntime(AgentRuntime):
                     if isinstance(raw.get("description"), str)
                     else None,
                     scope="session",
-                    metadata={"source": raw.get("source")},
+                    metadata=metadata,
                 )
             )
         if limit > 0:
