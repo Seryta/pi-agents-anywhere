@@ -1267,7 +1267,7 @@ async def test_context_usage_warning_opens_on_settle_and_resolves(
         assert opened[0].type == "notification"
         assert "95" in (opened[0].message or "")
         live = runtime._live["sess-ctx"]
-        assert live.context_warning_open is True
+        assert "sess-ctx" in runtime._context_warning_sessions
         state = await runtime.get_session_state("sess-ctx")
         assert state is not None
         assert state.metadata["contextUsage"]["percent"] == 95.0
@@ -1286,14 +1286,57 @@ async def test_context_usage_warning_opens_on_settle_and_resolves(
         )
         opened = [notice for notice in fake_host.notices if notice.notice_id == notice_id]
         assert [notice.status for notice in opened] == ["open", "resolved"]
-        assert live.context_warning_open is False
+        assert "sess-ctx" not in runtime._context_warning_sessions
 
         # Missing usage resolves as well, without crashing on the absent percent.
-        live.context_warning_open = True
+        runtime._context_warning_sessions.add("sess-ctx")
         await runtime._sync_context_warning(live, {})
         assert fake_host.notices[-1].status == "resolved"
     finally:
         await runtime.stop()
+
+
+async def test_context_warning_resolves_after_live_replacement(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """The open-warning flag must outlive the process that opened it.
+
+    Idle reclaim swaps the ``PiLiveSession`` object; if the flag lived on the
+    live session, a replacement would never resolve the notice the old
+    process opened and the platform would show "context nearly full" forever.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    notice_id = "pi-context-sess-ctx-swap"
+    opened = PiLiveSession(runtime, "sess-ctx-swap", cwd=str(tmp_path))
+    runtime._live["sess-ctx-swap"] = opened
+    await runtime._sync_context_warning(
+        opened,
+        {"contextUsage": {"tokens": 121600, "contextWindow": 128000, "percent": 95}},
+    )
+    assert [notice.status for notice in fake_host.notices] == ["open"]
+
+    # The replacement object carries no flag of its own, but the runtime does.
+    replacement = PiLiveSession(runtime, "sess-ctx-swap", cwd=str(tmp_path))
+    runtime._live["sess-ctx-swap"] = replacement
+    await runtime._sync_context_warning(
+        replacement,
+        {"contextUsage": {"tokens": 38400, "contextWindow": 128000, "percent": 30}},
+    )
+    resolved = [notice for notice in fake_host.notices if notice.notice_id == notice_id]
+    assert [notice.status for notice in resolved] == ["open", "resolved"]
+
+    # After a resolve, a later reading above the threshold opens a fresh
+    # notice: the flag was dropped with the resolved episode, not left behind.
+    reopened = PiLiveSession(runtime, "sess-ctx-swap", cwd=str(tmp_path))
+    await runtime._sync_context_warning(
+        reopened,
+        {"contextUsage": {"tokens": 121600, "contextWindow": 128000, "percent": 95}},
+    )
+    states = [notice.status for notice in fake_host.notices if notice.notice_id == notice_id]
+    assert states == ["open", "resolved", "open"]
 
 
 def write_messages_session(path: Path, count: int) -> None:

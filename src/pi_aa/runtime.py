@@ -547,10 +547,6 @@ class PiLiveSession:
         # Latest ``get_session_stats`` payload, cached so state reads do not
         # need an RPC of their own.
         self.session_stats: dict[str, Any] | None = None
-        # Whether the "context nearly full" notice is currently open; the
-        # flag keeps settles from re-upserting it and lets the recovery
-        # resolve the same notice id.
-        self.context_warning_open = False
         self.pending_ui: dict[str, PendingInteraction] = {}
         # pi extension ``setStatus`` entries, keyed by statusKey; published as
         # ``extensionStatus`` metadata and cleared by an event without text.
@@ -1096,6 +1092,11 @@ class PiRuntime(AgentRuntime):
         # Platform command id -> pi-native command name, filled by
         # ``list_commands`` and consumed by ``execute_command``.
         self._command_native_names: dict[str, str] = {}
+        # Platform session ids whose "context nearly full" notice is open.
+        # Runtime-level so a reclaimed process (idle reclaim swaps the
+        # PiLiveSession object) cannot lose the flag and leave the notice
+        # open forever when the context usage recovers.
+        self._context_warning_sessions: set[str] = set()
         self._stopping = False
         self._reclaim_task: asyncio.Task[None] | None = None
         self._stale_reset_task: asyncio.Task[None] | None = None
@@ -1676,12 +1677,15 @@ class PiRuntime(AgentRuntime):
 
         The notice id is stable per session, so repeated settles above the
         threshold keep the open notice untouched instead of re-upserting it.
+        The open flag lives on the runtime instead of the live session:
+        idle reclaim replaces the process (and its ``PiLiveSession``), and the
+        notice the old process opened must still resolve when usage drops.
         """
 
         percent = _context_usage_percent(data)
         notice_id = f"pi-context-{live.platform_id}"
         if percent is not None and percent >= CONTEXT_WARNING_PERCENT:
-            if live.context_warning_open:
+            if live.platform_id in self._context_warning_sessions:
                 return
             try:
                 await self.host.notice_upsert(
@@ -1700,9 +1704,9 @@ class PiRuntime(AgentRuntime):
             except Exception:  # a failed notice must not affect the settle path
                 logger.exception("failed to publish pi context warning for %s", live.platform_id)
                 return
-            live.context_warning_open = True
+            self._context_warning_sessions.add(live.platform_id)
             return
-        if not live.context_warning_open:
+        if live.platform_id not in self._context_warning_sessions:
             return
         try:
             await self.host.notice_upsert(
@@ -1725,7 +1729,7 @@ class PiRuntime(AgentRuntime):
         except Exception:  # a failed notice must not affect the settle path
             logger.exception("failed to resolve pi context warning for %s", live.platform_id)
             return
-        live.context_warning_open = False
+        self._context_warning_sessions.discard(live.platform_id)
 
     async def get_runtime_capabilities(self) -> RuntimeCapabilitySet:
         """Runtime-scoped capability facts advertised to the platform.
