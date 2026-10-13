@@ -35,6 +35,10 @@ Behaviour is controlled by environment variables:
 - ``PI_FAKE_TOOLS``: when ``1``, a bash execution (start/update/end with
   ``details.exitCode``) and an edit execution (``details.patch``) are emitted
   after the streamed reply.
+- ``PI_FAKE_SET_STATUS``: when ``1``, the first prompt emits a ``setStatus``
+  extension UI request (key ``fake-ext``) before the normal turn events.
+- ``PI_FAKE_NOTIFY``: when ``1``, the first prompt emits a transient
+  ``notify`` extension UI request; combinable with ``PI_FAKE_SET_STATUS``.
 """
 
 from __future__ import annotations
@@ -54,6 +58,8 @@ QUEUE: dict[str, list[str]] = {"steering": [], "followUp": []}
 _BUSY_FIRST_PROMPT = os.environ.get("PI_FAKE_BUSY_FIRST_PROMPT") == "1"
 _STREAM = os.environ.get("PI_FAKE_STREAM") == "1"
 _TOOLS = os.environ.get("PI_FAKE_TOOLS") == "1"
+_SET_STATUS = os.environ.get("PI_FAKE_SET_STATUS") == "1"
+_NOTIFY = os.environ.get("PI_FAKE_NOTIFY") == "1"
 # Small enough to keep the suite fast, large enough for the runtime's 300ms
 # flush loop to observe the running snapshot before the terminal event.
 _STREAM_PAUSE_SECONDS = 0.05
@@ -76,6 +82,7 @@ STATE: dict[str, object] = {
     "messageCount": 0,
     "waitingUi": False,
     "uiIssued": False,
+    "extensionUiIssued": False,
     "firstPromptConsumed": False,
 }
 
@@ -224,6 +231,40 @@ def issue_ui_if_needed() -> bool:
     return True
 
 
+def emit_extension_ui_extras() -> None:
+    """Emit the opt-in fire-and-forget extension UI events for a prompt.
+
+    ``PI_FAKE_SET_STATUS`` sends one ``setStatus`` entry and ``PI_FAKE_NOTIFY``
+    one transient ``notify``, both before the normal turn events. They fire on
+    the first prompt only so multi-turn tests do not stack notices or rewrite
+    the same status key.
+    """
+
+    if STATE["extensionUiIssued"] or not (_SET_STATUS or _NOTIFY):
+        return
+    STATE["extensionUiIssued"] = True
+    if _SET_STATUS:
+        emit(
+            {
+                "type": "extension_ui_request",
+                "id": "ext-status-1",
+                "method": "setStatus",
+                "statusKey": "fake-ext",
+                "statusText": "fake status",
+            }
+        )
+    if _NOTIFY:
+        emit(
+            {
+                "type": "extension_ui_request",
+                "id": "ext-notify-1",
+                "method": "notify",
+                "message": "fake notification",
+                "notifyType": "warning",
+            }
+        )
+
+
 def _reply_chunks(reply: str) -> list[str]:
     """Split a reply into three deltas for streaming mode."""
 
@@ -317,6 +358,7 @@ def handle_prompt_command(command: dict) -> None:
 
 
 def handle_prompt(command: dict) -> None:
+    emit_extension_ui_extras()
     text = command.get("message", "")
     images = command.get("images") or []
     # Pi renders image inputs as block content on the persisted user message.

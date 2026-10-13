@@ -187,6 +187,194 @@ async def test_extension_ui_interaction_flow(
         await runtime.stop()
 
 
+async def test_extension_set_status_reaches_session_metadata(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fire-and-forget ``setStatus`` must land in the published metadata.
+
+    pi extensions announce progress through ``setStatus``; the platform only
+    sees what the state push carries, so dropping the event leaves the session
+    looking idle while an extension is still running.
+    """
+
+    monkeypatch.setenv("PI_FAKE_SET_STATUS", "1")
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session("sess-status", "hello", cwd=str(tmp_path))
+
+        def status_pushed() -> bool:
+            return any(
+                state.get("metadata", {}).get("extensionStatus") == {"fake-ext": "fake status"}
+                for state in fake_host.states
+            )
+
+        await wait_for(status_pushed)
+        state = await runtime.get_session_state("sess-status")
+        assert state is not None
+        assert state.metadata["extensionStatus"] == {"fake-ext": "fake status"}
+    finally:
+        await runtime.stop()
+
+
+async def test_extension_set_status_tracks_changes_and_clears(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """``setStatus`` rewrites one key at a time and a missing text clears it.
+
+    The state push is deduplicated through ``state_key``, so the extension map
+    must be part of that key or a second update for the same key never reaches
+    the platform.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-status-direct", cwd=str(tmp_path))
+    runtime._live["sess-status-direct"] = live
+
+    await runtime._handle_ui_request(
+        live,
+        {
+            "type": "extension_ui_request",
+            "id": "status-1",
+            "method": "setStatus",
+            "statusKey": "my-ext",
+            "statusText": "Turn 3 running...",
+        },
+    )
+    state = await runtime.get_session_state("sess-status-direct")
+    assert state is not None
+    assert state.metadata["extensionStatus"] == {"my-ext": "Turn 3 running..."}
+
+    # Same key, new text: the state key must change so the platform sees it.
+    await runtime._handle_ui_request(
+        live,
+        {
+            "type": "extension_ui_request",
+            "id": "status-2",
+            "method": "setStatus",
+            "statusKey": "my-ext",
+            "statusText": "Turn 4 running...",
+        },
+    )
+    assert fake_host.states[-1]["metadata"]["extensionStatus"] == {"my-ext": "Turn 4 running..."}
+
+    # Omitting statusText clears the entry, dropping it from the metadata.
+    await runtime._handle_ui_request(
+        live,
+        {
+            "type": "extension_ui_request",
+            "id": "status-3",
+            "method": "setStatus",
+            "statusKey": "my-ext",
+        },
+    )
+    state = await runtime.get_session_state("sess-status-direct")
+    assert state is not None
+    assert "extensionStatus" not in state.metadata
+    assert "extensionStatus" not in fake_host.states[-1]["metadata"]
+
+    # Non-string keys and texts are ignored, never coerced.
+    pushed = len(fake_host.states)
+    await runtime._handle_ui_request(
+        live,
+        {
+            "type": "extension_ui_request",
+            "id": "status-4",
+            "method": "setStatus",
+            "statusKey": 7,
+            "statusText": "nope",
+        },
+    )
+    await runtime._handle_ui_request(
+        live,
+        {
+            "type": "extension_ui_request",
+            "id": "status-5",
+            "method": "setStatus",
+            "statusKey": "my-ext",
+            "statusText": 9,
+        },
+    )
+    assert len(fake_host.states) == pushed
+    assert live.extension_status == {}
+
+
+async def test_notify_toast_resolves_when_turn_settles(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """``notify`` is transient and must close when the run that sent it ends.
+
+    pi never emits a resolve event for fire-and-forget notifications, so the
+    runtime tracks the notices it opened and resolves them on settle; a second
+    settle must not publish the resolution twice.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-notify", cwd=str(tmp_path))
+    runtime._live["sess-notify"] = live
+
+    await runtime._handle_ui_request(
+        live,
+        {
+            "type": "extension_ui_request",
+            "id": "notify-1",
+            "method": "notify",
+            "message": "Build finished",
+            "notifyType": "warning",
+        },
+    )
+    notice_id = "pi-notify-notify-1"
+    assert [notice.status for notice in fake_host.notices] == ["open"]
+    assert fake_host.notices[0].notice_id == notice_id
+    assert fake_host.notices[0].severity == "warning"
+    assert live.open_notifications.keys() == {notice_id}
+
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+    assert [notice.status for notice in fake_host.notices] == ["open", "resolved"]
+    assert fake_host.notices[-1].notice_id == notice_id
+    assert live.open_notifications == {}
+
+    # A repeated settle has nothing left to resolve.
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+    assert [notice.status for notice in fake_host.notices] == ["open", "resolved"]
+
+
+async def test_extension_notify_round_trip_through_fake(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fake's ``PI_FAKE_NOTIFY`` switch drives the full settle path."""
+
+    monkeypatch.setenv("PI_FAKE_NOTIFY", "1")
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session("sess-notify-fake", "hello", cwd=str(tmp_path))
+        notice_id = "pi-notify-ext-notify-1"
+
+        def resolved_notice_seen() -> bool:
+            return any(
+                notice.notice_id == notice_id and notice.status == "resolved"
+                for notice in fake_host.notices
+            )
+
+        await wait_for(resolved_notice_seen)
+        statuses = [n.status for n in fake_host.notices if n.notice_id == notice_id]
+        assert statuses == ["open", "resolved"]
+        assert runtime._live["sess-notify-fake"].open_notifications == {}
+    finally:
+        await runtime.stop()
+
+
 @pytest.mark.parametrize(
     ("method", "expected"),
     [

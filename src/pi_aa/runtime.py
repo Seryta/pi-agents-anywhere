@@ -450,6 +450,12 @@ class PiLiveSession:
         # resolve the same notice id.
         self.context_warning_open = False
         self.pending_ui: dict[str, PendingInteraction] = {}
+        # pi extension ``setStatus`` entries, keyed by statusKey; published as
+        # ``extensionStatus`` metadata and cleared by an event without text.
+        self.extension_status: dict[str, str] = {}
+        # Fire-and-forget ``notify`` toasts still open for this run, keyed by
+        # notice id; settle and process exit resolve them.
+        self.open_notifications: dict[str, SessionNotice] = {}
         # (text, clientMessageId) pairs waiting for their projected user message.
         self.client_messages: list[tuple[str, str]] = []
         # Queued steering/follow-up texts pi reports via ``queue_update``; the
@@ -888,6 +894,7 @@ class PiLiveSession:
             self.thinking_level,
             tuple(self.steering_queue),
             tuple(self.followup_queue),
+            tuple(sorted(self.extension_status.items())),
         )
 
 
@@ -1341,6 +1348,8 @@ class PiRuntime(AgentRuntime):
         )
         metadata["pendingSteering"] = list(live.steering_queue)
         metadata["pendingFollowUp"] = list(live.followup_queue)
+        if live.extension_status:
+            metadata["extensionStatus"] = dict(live.extension_status)
         if live.cleared_queue is not None:
             metadata["clearedQueue"] = live.cleared_queue
         active_pending = live.active_pending_ui()
@@ -2118,6 +2127,7 @@ class PiRuntime(AgentRuntime):
             # pi applies a dialog's timeout on its own side without notifying
             # the client, so expire those entries before publishing state.
             await self._expire_pending_interactions(live)
+            await self._resolve_open_notifications(live)
             live.is_streaming = False
             live.is_compacting = False
             live.status_reason = None
@@ -2204,6 +2214,7 @@ class PiRuntime(AgentRuntime):
         for pending in list(live.pending_ui.values()):
             await self.host.notice_upsert(pending.as_notice(live.platform_id, status="resolved"))
         live.pending_ui.clear()
+        await self._resolve_open_notifications(live)
         if self._live.get(live.platform_id) is not live:
             # The session was reclaimed or replaced while this process was
             # shutting down; a new live may already have pushed "running", and
@@ -2236,6 +2247,20 @@ class PiRuntime(AgentRuntime):
             await self.host.notice_upsert(pending.as_notice(live.platform_id))
             await self._push_state(live, force=True)
             return
+        if method == "setStatus":
+            status_key = record.get("statusKey")
+            if not isinstance(status_key, str) or not status_key:
+                return
+            status_text = record.get("statusText")
+            if status_text is None:
+                live.extension_status.pop(status_key, None)
+            elif isinstance(status_text, str):
+                live.extension_status[status_key] = status_text
+            else:
+                logger.debug("ignoring non-string setStatus text for %r", status_key)
+                return
+            await self._push_state(live)
+            return
         if method == "notify":
             message = record.get("message")
             if not isinstance(message, str) or not message:
@@ -2243,18 +2268,18 @@ class PiRuntime(AgentRuntime):
             notify_type = record.get("notifyType")
             severity = notify_type if notify_type in ("info", "warning", "error") else "info"
             request_id = str(record.get("id"))
-            await self.host.notice_upsert(
-                SessionNotice(
-                    notice_id=f"pi-notify-{request_id}",
-                    session_id=live.platform_id,
-                    runtime=RUNTIME,
-                    type="notification",
-                    title=message,
-                    severity=severity,  # type: ignore[arg-type]
-                    status="open",
-                    source={"runtime": RUNTIME, "component": "pi.extension-ui"},
-                )
+            notice = SessionNotice(
+                notice_id=f"pi-notify-{request_id}",
+                session_id=live.platform_id,
+                runtime=RUNTIME,
+                type="notification",
+                title=message,
+                severity=severity,  # type: ignore[arg-type]
+                status="open",
+                source={"runtime": RUNTIME, "component": "pi.extension-ui"},
             )
+            live.open_notifications[notice.notice_id] = notice
+            await self.host.notice_upsert(notice)
             return
         logger.debug("ignoring pi extension UI method %r", method)
 
@@ -2278,6 +2303,29 @@ class PiRuntime(AgentRuntime):
                     live.platform_id,
                 )
         return bool(expired)
+
+    async def _resolve_open_notifications(self, live: PiLiveSession) -> None:
+        """Close the transient ``notify`` toasts left open by a finished run.
+
+        pi never sends a resolve event for fire-and-forget notifications, so
+        without this the platform keeps showing them for the session's whole
+        life. Failures only log: settle and process exit must not fail because
+        a toast could not be closed.
+        """
+
+        if not live.open_notifications:
+            return
+        notices = list(live.open_notifications.values())
+        live.open_notifications.clear()
+        for notice in notices:
+            try:
+                await self.host.notice_upsert(replace(notice, status="resolved"))
+            except Exception:
+                logger.exception(
+                    "failed to resolve notify session=%s notice=%s",
+                    live.platform_id,
+                    notice.notice_id,
+                )
 
     # -- internal helpers ---------------------------------------------------
 
