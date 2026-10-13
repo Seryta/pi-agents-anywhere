@@ -119,10 +119,17 @@ class TranscriptProjector:
         external_session_id: str,
         *,
         client_messages: Sequence[tuple[str, str]] = (),
+        max_items: int | None = None,
     ) -> None:
         self.session_id = session_id
         self.external_session_id = external_session_id
         self._items: list[RuntimeTimelineItem] = []
+        # A truncated snapshot only needs the tail, so cap the retained items
+        # instead of materializing every item just to slice it afterwards.
+        self._max_items = max_items if max_items and max_items > 0 else None
+        self._dropped_items = 0
+        self._appended_items = 0
+        self._last_assistant_status: str | None = None
         self._tool_index: dict[str, int] = {}
         self._order = 0
         self._turn_counter = 0
@@ -295,8 +302,7 @@ class TranscriptProjector:
         call_id = _as_text(message.get("toolCallId")) or _as_text(entry_id) or "tool"
         output = content_text(message.get("content"))
         is_error = message.get("isError") is True
-        index = self._tool_index.get(call_id)
-        if index is None:
+        if call_id not in self._tool_index:
             # A result without a recorded call (e.g. truncated history).
             content = {
                 "kind": "tool_result",
@@ -314,7 +320,12 @@ class TranscriptProjector:
                 native_type="toolResult",
             )
             return
-        item = self._items[index]
+        index = self._tool_index[call_id]
+        item = self._item_at(index)
+        if item is None:
+            # The call already left the retained window; the update is not
+            # observable in the projection output.
+            return
         completed_content = dict(item.content)
         completed_content["output"] = output
         completed_content["result"] = message.get("details")
@@ -393,13 +404,11 @@ class TranscriptProjector:
         self._current_turn_id = None
 
     def _turn_end_status(self) -> str:
-        for item in reversed(self._items):
-            if item.type == "message" and item.role == "assistant":
-                if item.status == "failed":
-                    return "failed"
-                if item.status == "cancelled":
-                    return "interrupted"
-                return "done"
+        status = self._last_assistant_status
+        if status == "failed":
+            return "failed"
+        if status == "cancelled":
+            return "interrupted"
         return "done"
 
     # -- item construction --------------------------------------------------
@@ -432,6 +441,8 @@ class TranscriptProjector:
         metadata: Mapping[str, Any] | None = None,
         client_message_id: str | None = None,
     ) -> RuntimeTimelineItem:
+        if role == "assistant":
+            self._last_assistant_status = status
         return self._append(
             key=key,
             item_type="message",
@@ -492,7 +503,7 @@ class TranscriptProjector:
             content=content,
             native_type="toolCall",
         )
-        self._tool_index[call_id] = len(self._items) - 1
+        self._tool_index[call_id] = self._appended_items - 1
         return item
 
     def _append(
@@ -522,7 +533,20 @@ class TranscriptProjector:
             client_message_id=client_message_id,
         )
         self._items.append(item)
+        self._appended_items += 1
+        if self._max_items is not None and len(self._items) > self._max_items:
+            dropped = len(self._items) - self._max_items
+            del self._items[:dropped]
+            self._dropped_items += dropped
         return item
+
+    def _item_at(self, index: int) -> RuntimeTimelineItem | None:
+        """Look up an appended item by its absolute append position."""
+
+        position = index - self._dropped_items
+        if 0 <= position < len(self._items):
+            return self._items[position]
+        return None
 
     def _replace(
         self,
@@ -531,7 +555,9 @@ class TranscriptProjector:
         status: str,
         content: Mapping[str, Any],
     ) -> None:
-        previous = self._items[index]
+        previous = self._item_at(index)
+        if previous is None:
+            return
         updated = replace(
             previous,
             status=status,
@@ -544,7 +570,7 @@ class TranscriptProjector:
             ),
             revision=previous.revision + 1,
         )
-        self._items[index] = updated
+        self._items[index - self._dropped_items] = updated
 
     def _build(
         self,
@@ -595,11 +621,19 @@ def project_session(
     session_id: str,
     external_session_id: str,
     client_messages: Sequence[tuple[str, str]] = (),
+    max_items: int | None = None,
 ) -> tuple[RuntimeTimelineItem, ...]:
-    """Project the active branch of a parsed Pi session document."""
+    """Project the active branch of a parsed Pi session document.
+
+    When ``max_items`` is set the projector retains only that many trailing
+    items, which yields the same tail as projecting everything and slicing.
+    """
 
     projector = TranscriptProjector(
-        session_id, external_session_id, client_messages=client_messages
+        session_id,
+        external_session_id,
+        client_messages=client_messages,
+        max_items=max_items,
     )
     projector.project_entries(doc_entries)
     return projector.items()

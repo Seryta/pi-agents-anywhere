@@ -158,3 +158,249 @@ def test_compaction_marker() -> None:
     assert len(items) == 1
     assert items[0].type == "marker"
     assert items[0].content["kind"] == "compact"
+
+
+def long_transcript() -> list[dict]:
+    """Four turns of user/assistant/tool traffic to slice from many angles."""
+
+    records: list[dict] = []
+    parent: str | None = None
+
+    def add(entry: dict, entry_id: str) -> None:
+        nonlocal parent
+        entry["id"] = entry_id
+        entry["parentId"] = parent
+        entry["timestamp"] = "t"
+        records.append(entry)
+        parent = entry_id
+
+    for turn in range(4):
+        add(
+            {
+                "type": "message",
+                "message": {"role": "user", "content": f"问题 {turn}", "timestamp": turn},
+            },
+            f"u{turn}",
+        )
+        add(
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "toolUse",
+                    "timestamp": turn,
+                    "content": [
+                        {"type": "text", "text": f"先看 {turn}"},
+                        {
+                            "type": "toolCall",
+                            "id": f"call_{turn}",
+                            "name": "bash",
+                            "arguments": {"command": f"ls {turn}"},
+                        },
+                    ],
+                },
+            },
+            f"a{turn}",
+        )
+        add(
+            {
+                "type": "message",
+                "message": {
+                    "role": "toolResult",
+                    "toolCallId": f"call_{turn}",
+                    "toolName": "bash",
+                    "content": [{"type": "text", "text": f"out {turn}"}],
+                    "details": {"exitCode": 0},
+                    "isError": False,
+                    "timestamp": turn,
+                },
+            },
+            f"r{turn}",
+        )
+        add(
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "stop",
+                    "timestamp": turn,
+                    "content": [{"type": "text", "text": f"完成 {turn}"}],
+                },
+            },
+            f"b{turn}",
+        )
+    return records
+
+
+def test_windowed_projection_matches_full_tail() -> None:
+    """A capped projection must equal the tail of the full one, item for item."""
+
+    records = long_transcript()
+    full = project_session(records, session_id="s", external_session_id="/tmp/s.jsonl")
+    assert len(full) > 12
+    for limit in (1, 2, 3, 5, 8, 13, len(full), len(full) + 5):
+        windowed = project_session(
+            records,
+            session_id="s",
+            external_session_id="/tmp/s.jsonl",
+            max_items=limit,
+        )
+        assert windowed == full[-limit:], f"limit={limit}"
+
+
+def test_windowed_projection_drops_tool_result_for_dropped_call() -> None:
+    """A call that left the window must not resurface as a standalone result."""
+
+    records: list[dict] = [
+        {
+            "type": "message",
+            "id": "u1",
+            "parentId": None,
+            "timestamp": "t",
+            "message": {"role": "user", "content": "开始", "timestamp": 1},
+        },
+        {
+            "type": "message",
+            "id": "a1",
+            "parentId": "u1",
+            "timestamp": "t",
+            "message": {
+                "role": "assistant",
+                "stopReason": "toolUse",
+                "timestamp": 2,
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "call_late",
+                        "name": "bash",
+                        "arguments": {"command": "sleep 1"},
+                    }
+                ],
+            },
+        },
+    ]
+    parent = "a1"
+    for index in range(6):
+        records.append(
+            {
+                "type": "message",
+                "id": f"fill{index}",
+                "parentId": parent,
+                "timestamp": "t",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "stop",
+                    "timestamp": 10 + index,
+                    "content": [{"type": "text", "text": f"填充 {index}"}],
+                },
+            }
+        )
+        parent = f"fill{index}"
+    records.append(
+        {
+            "type": "message",
+            "id": "r1",
+            "parentId": parent,
+            "timestamp": "t",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call_late",
+                "toolName": "bash",
+                "content": [{"type": "text", "text": "done"}],
+                "details": {"exitCode": 0},
+                "isError": False,
+                "timestamp": 99,
+            },
+        }
+    )
+
+    full = project_session(records, session_id="s", external_session_id="/tmp/s.jsonl")
+    limit = 4
+    assert all(
+        not (item.type == "tool" and item.content.get("command") == "sleep 1")
+        for item in full[-limit:]
+    ), "test setup: the call must be outside the retained tail"
+    windowed = project_session(
+        records,
+        session_id="s",
+        external_session_id="/tmp/s.jsonl",
+        max_items=limit,
+    )
+    assert windowed == full[-limit:]
+    assert not any(item.content.get("kind") == "tool_result" for item in windowed)
+
+
+def test_windowed_projection_keeps_turn_end_status() -> None:
+    """Turn completion status may come from an assistant item outside the window."""
+
+    records: list[dict] = [
+        {
+            "type": "message",
+            "id": "u1",
+            "parentId": None,
+            "timestamp": "t",
+            "message": {"role": "user", "content": "第一步", "timestamp": 1},
+        },
+        {
+            "type": "message",
+            "id": "a1",
+            "parentId": "u1",
+            "timestamp": "t",
+            "message": {
+                "role": "assistant",
+                "stopReason": "aborted",
+                "timestamp": 2,
+                "content": [{"type": "text", "text": "被中断"}],
+            },
+        },
+    ]
+    parent = "a1"
+    for index in range(8):
+        records.append(
+            {
+                "type": "custom_message",
+                "id": f"fill{index}",
+                "parentId": parent,
+                "timestamp": "t",
+                "content": f"填充 {index}",
+                "display": True,
+            }
+        )
+        parent = f"fill{index}"
+    records.append(
+        {
+            "type": "message",
+            "id": "u2",
+            "parentId": parent,
+            "timestamp": "t",
+            "message": {"role": "user", "content": "第二步", "timestamp": 99},
+        }
+    )
+    records.append(
+        {
+            "type": "message",
+            "id": "a2",
+            "parentId": "u2",
+            "timestamp": "t",
+            "message": {
+                "role": "assistant",
+                "stopReason": "stop",
+                "timestamp": 100,
+                "content": [{"type": "text", "text": "继续"}],
+            },
+        }
+    )
+
+    full = project_session(records, session_id="s", external_session_id="/tmp/s.jsonl")
+    ends = [item for item in full if item.type == "turn.end"]
+    assert ends and ends[0].status == "interrupted"
+
+    limit = 5
+    assert any(item.type == "turn.end" and item.status == "interrupted" for item in full[-limit:])
+    windowed = project_session(
+        records,
+        session_id="s",
+        external_session_id="/tmp/s.jsonl",
+        max_items=limit,
+    )
+    assert windowed == full[-limit:]

@@ -826,13 +826,16 @@ class PiRuntime(AgentRuntime):
             live is not None,
             len(client_messages),
         )
+        truncated = limit is not None and limit > 0
         items = projection.project_session(
             doc.entries,
             session_id=session_id,
             external_session_id=doc.summary.path,
             client_messages=client_messages,
+            # Build only the tail the caller asked for; full construction is
+            # wasted work for long transcripts (the platform polls snapshots).
+            max_items=limit if truncated else None,
         )
-        truncated = limit is not None and limit > 0
         if truncated:
             items = items[-limit:]
         self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
