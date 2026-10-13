@@ -21,6 +21,14 @@ Behaviour is controlled by environment variables:
   ``success: false``.
 - ``PI_FAKE_COMMANDS_FILE``: when set, every received command is appended as
   one JSON line, in arrival order (used to assert command sequences).
+- ``PI_FAKE_CONTEXT_PERCENT``: percent reported in the ``get_session_stats``
+  ``contextUsage`` block (default ``30``; ``none``, ``missing`` or an empty
+  value omits the block entirely).
+- The ``compact``, ``get_session_stats`` and ``export_html`` commands respond
+  with the structures used by the connector's builtin command tests:
+  ``compact`` echoes the received ``customInstructions`` through the command
+  log and returns ``tokensBefore``/``estimatedTokensAfter``; ``export_html``
+  returns ``outputPath`` (or ``<cwd>/session-export.html``).
 - ``PI_FAKE_STREAM``: when ``1``, the assistant reply streams as several
   thinking/text deltas with tiny pauses (so the throttled flush can push a
   running snapshot) before the final ``message_end``.
@@ -621,6 +629,73 @@ def handle_command(command: dict) -> None:
                         }
                     ]
                 },
+            }
+        )
+    elif command_type == "compact":
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": "compact",
+                "success": True,
+                "data": {
+                    "summary": "fake compacted summary",
+                    "firstKeptEntryId": last_entry_id() or "entry-0",
+                    "tokensBefore": 150000,
+                    "estimatedTokensAfter": 32000,
+                    "usage": {
+                        "input": 1,
+                        "output": 1,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                    },
+                },
+            }
+        )
+    elif command_type == "get_session_stats":
+        context_window = 128_000
+        percent_raw = os.environ.get("PI_FAKE_CONTEXT_PERCENT", "30")
+        stats: dict = {
+            "tokens": {
+                "input": 12000,
+                "output": 8000,
+                "cacheRead": 1000,
+                "cacheWrite": 500,
+                "total": 21500,
+            },
+            "cost": 0.0123,
+            "userMessages": 3,
+        }
+        if percent_raw.strip().lower() not in ("", "none", "missing"):
+            try:
+                percent = float(percent_raw)
+            except ValueError:
+                percent = 30.0
+            stats["contextUsage"] = {
+                "tokens": int(context_window * percent / 100),
+                "contextWindow": context_window,
+                "percent": percent,
+            }
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": "get_session_stats",
+                "success": True,
+                "data": stats,
+            }
+        )
+    elif command_type == "export_html":
+        output_path = command.get("outputPath")
+        if not isinstance(output_path, str) or not output_path:
+            output_path = str(Path(os.getcwd()) / "session-export.html")
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": "export_html",
+                "success": True,
+                "data": {"path": output_path},
             }
         )
     elif command_type == "extension_ui_response":

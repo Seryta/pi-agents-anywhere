@@ -107,6 +107,29 @@ PI_IMAGE_MIME_TYPES: tuple[str, ...] = (
 )
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
 
+# Pi's TUI-only slash commands never show up in the ``get_commands`` RPC
+# payload, so the connector proxies them as regular platform commands and
+# performs the matching RPC call itself.
+BUILTIN_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("compact", "压缩当前会话上下文，可带自定义指令"),
+    ("name", "设置或查看会话名称"),
+    ("stats", "查看 token/成本/上下文占用"),
+    ("export", "导出会话为 HTML 文件"),
+)
+BUILTIN_COMMAND_NAMES = frozenset(name for name, _ in BUILTIN_COMMANDS)
+
+# Warn once when the model context passes this utilization; dropping below it
+# (or pi no longer reporting usage) resolves the same notice.
+CONTEXT_WARNING_PERCENT = 90
+
+# Compacting a long transcript can take minutes, far past the configured
+# request timeout.
+COMPACT_REQUEST_TIMEOUT_SECONDS = 180.0
+
+# RPC failures builtin handlers translate into ``ok=False`` results instead
+# of letting them escape into the platform command dispatch.
+BUILTIN_RPC_ERRORS = (PiRpcProcessExited, PiRpcRequestFailed, PiRpcTimeout, TimeoutError)
+
 # Notice.interactionType is validated against the server's ``InteractionType``
 # literal (server ``agent_server/core/models.py``; identical in 2.0.0 and
 # 2.0.3), which rejects pi's private ``pi.<method>`` values outright. Collapse
@@ -349,6 +372,51 @@ class _StreamTool:
     status: str = "running"
 
 
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _context_usage_percent(data: Mapping[str, Any]) -> float | None:
+    """The ``contextUsage.percent`` value, when pi reports one."""
+
+    usage = data.get("contextUsage")
+    if not isinstance(usage, Mapping):
+        return None
+    percent = usage.get("percent")
+    return float(percent) if _is_number(percent) else None
+
+
+def _format_session_stats(data: Mapping[str, Any]) -> str:
+    """Human-readable one-liner for the ``stats`` command result."""
+
+    parts: list[str] = []
+    tokens = data.get("tokens")
+    total: Any = None
+    if isinstance(tokens, Mapping):
+        total = tokens.get("total")
+        if not _is_number(total):
+            fallback = [
+                value
+                for value in (
+                    tokens.get("input"),
+                    tokens.get("output"),
+                    tokens.get("cacheRead"),
+                    tokens.get("cacheWrite"),
+                )
+                if _is_number(value)
+            ]
+            total = sum(fallback) if fallback else None
+    if _is_number(total):
+        parts.append(f"tokens {total}")
+    cost = data.get("cost")
+    if _is_number(cost):
+        parts.append(f"成本 ${cost:.6f}")
+    percent = _context_usage_percent(data)
+    if percent is not None:
+        parts.append(f"上下文 {percent:g}%")
+    return "，".join(parts) if parts else "暂无法读取会话统计"
+
+
 class PiLiveSession:
     """A platform session backed by one running Pi RPC process."""
 
@@ -374,6 +442,13 @@ class PiLiveSession:
         self.is_compacting = False
         self.message_count = 0
         self.status_reason: str | None = None
+        # Latest ``get_session_stats`` payload, cached so state reads do not
+        # need an RPC of their own.
+        self.session_stats: dict[str, Any] | None = None
+        # Whether the "context nearly full" notice is currently open; the
+        # flag keeps settles from re-upserting it and lets the recovery
+        # resolve the same notice id.
+        self.context_warning_open = False
         self.pending_ui: dict[str, PendingInteraction] = {}
         # (text, clientMessageId) pairs waiting for their projected user message.
         self.client_messages: list[tuple[str, str]] = []
@@ -1271,6 +1346,17 @@ class PiRuntime(AgentRuntime):
         active_pending = live.active_pending_ui()
         if active_pending:
             metadata["pendingInteractions"] = len(active_pending)
+        stats = live.session_stats
+        if stats is not None:
+            tokens = stats.get("tokens")
+            if isinstance(tokens, Mapping):
+                metadata["tokens"] = dict(tokens)
+            cost = stats.get("cost")
+            if _is_number(cost):
+                metadata["cost"] = cost
+            context_usage = stats.get("contextUsage")
+            if isinstance(context_usage, Mapping):
+                metadata["contextUsage"] = dict(context_usage)
         return SessionState(
             session_id=live.platform_id,
             external_session_id=live.external_id,
@@ -1292,6 +1378,86 @@ class PiRuntime(AgentRuntime):
         if live is None:
             return ()
         return tuple(pending.as_notice(session_id) for pending in live.active_pending_ui())
+
+    async def refresh_session_stats(self, live: PiLiveSession) -> Mapping[str, Any] | None:
+        """Refresh the cached ``get_session_stats`` payload for a live session.
+
+        Called after a run settles so the published state carries fresh token
+        and context usage. pi rejects the call before the first model turn, so
+        a failure only logs and leaves the previous cache untouched.
+        """
+
+        process = live.process
+        if process is None or not process.alive:
+            return None
+        try:
+            data = response_data(await process.request({"type": "get_session_stats"}))
+        except BUILTIN_RPC_ERRORS:
+            logger.warning("pi get_session_stats failed session_id=%s", live.platform_id)
+            return None
+        live.session_stats = dict(data)
+        await self._sync_context_warning(live, data)
+        return data
+
+    async def _sync_context_warning(
+        self,
+        live: PiLiveSession,
+        data: Mapping[str, Any],
+    ) -> None:
+        """Open or resolve the context-usage notice at threshold crossings.
+
+        The notice id is stable per session, so repeated settles above the
+        threshold keep the open notice untouched instead of re-upserting it.
+        """
+
+        percent = _context_usage_percent(data)
+        notice_id = f"pi-context-{live.platform_id}"
+        if percent is not None and percent >= CONTEXT_WARNING_PERCENT:
+            if live.context_warning_open:
+                return
+            try:
+                await self.host.notice_upsert(
+                    SessionNotice(
+                        notice_id=notice_id,
+                        session_id=live.platform_id,
+                        runtime=RUNTIME,
+                        type="notification",
+                        title="上下文接近上限",
+                        message=f"会话上下文已使用 {percent:g}%，请考虑压缩会话 (compact)。",
+                        severity="warning",
+                        status="open",
+                        source={"runtime": RUNTIME, "component": "pi.context"},
+                    )
+                )
+            except Exception:  # a failed notice must not affect the settle path
+                logger.exception("failed to publish pi context warning for %s", live.platform_id)
+                return
+            live.context_warning_open = True
+            return
+        if not live.context_warning_open:
+            return
+        try:
+            await self.host.notice_upsert(
+                SessionNotice(
+                    notice_id=notice_id,
+                    session_id=live.platform_id,
+                    runtime=RUNTIME,
+                    type="notification",
+                    title="上下文接近上限",
+                    message=(
+                        f"会话上下文已回落到 {percent:g}%。"
+                        if percent is not None
+                        else "会话上下文占用已回落。"
+                    ),
+                    severity="warning",
+                    status="resolved",
+                    source={"runtime": RUNTIME, "component": "pi.context"},
+                )
+            )
+        except Exception:  # a failed notice must not affect the settle path
+            logger.exception("failed to resolve pi context warning for %s", live.platform_id)
+            return
+        live.context_warning_open = False
 
     async def get_runtime_capabilities(self) -> RuntimeCapabilitySet:
         """Runtime-scoped capability facts advertised to the platform.
@@ -1494,14 +1660,25 @@ class PiRuntime(AgentRuntime):
             if live is not None
             else await self._utility_command({"type": "get_commands"})
         )
-        commands: list[RuntimeCommand] = []
+        needle = query.lower() if query else None
+        commands: list[RuntimeCommand] = [
+            RuntimeCommand(
+                id=name,
+                title=name,
+                description=description,
+                scope="session",
+                metadata={"source": "pi-builtin"},
+            )
+            for name, description in BUILTIN_COMMANDS
+            if not needle or needle in name.lower()
+        ]
         for raw in _as_list(response_data(data).get("commands")):
             if not isinstance(raw, Mapping):
                 continue
             name = raw.get("name")
             if not isinstance(name, str) or not name:
                 continue
-            if query and query.lower() not in name.lower():
+            if needle and needle not in name.lower():
                 continue
             commands.append(
                 RuntimeCommand(
@@ -1514,8 +1691,8 @@ class PiRuntime(AgentRuntime):
                     metadata={"source": raw.get("source")},
                 )
             )
-            if len(commands) >= limit:
-                break
+        if limit > 0:
+            commands = commands[:limit]
         return tuple(commands)
 
     async def execute_command(
@@ -1526,6 +1703,10 @@ class PiRuntime(AgentRuntime):
         raw: str | None = None,
         args: tuple[str, ...] = (),
     ) -> RuntimeCommandResult:
+        if command in BUILTIN_COMMAND_NAMES:
+            return await self._execute_builtin_command(
+                session_id, command, external_session_id, args
+            )
         live = await self._ensure_live(session_id, external_session_id, None)
         text = raw if raw else "/" + command + (" " + " ".join(args) if args else "")
         logger.info("pi command execute session_id=%s text=%r", session_id, text)
@@ -1537,6 +1718,173 @@ class PiRuntime(AgentRuntime):
             # AA 2.0.3 command contract: dispatch only accepts the native work,
             # completion is reported later through the timeline.
             result={"sessionId": session_id, "executionState": "accepted"},
+        )
+
+    async def _execute_builtin_command(
+        self,
+        session_id: str,
+        command: str,
+        external_session_id: str | None,
+        args: tuple[str, ...],
+    ) -> RuntimeCommandResult:
+        """Run one of the proxied TUI commands through the RPC interface."""
+
+        if command == "compact":
+            return await self._execute_compact_command(session_id, external_session_id, args)
+        if command == "name":
+            return await self._execute_name_command(session_id, external_session_id, args)
+        if command == "stats":
+            return await self._execute_stats_command(session_id, external_session_id)
+        return await self._execute_export_command(session_id, external_session_id, args)
+
+    async def _execute_compact_command(
+        self,
+        session_id: str,
+        external_session_id: str | None,
+        args: tuple[str, ...],
+    ) -> RuntimeCommandResult:
+        live = await self._ensure_live(session_id, external_session_id, None)
+        custom_instructions = " ".join(args).strip() if args else ""
+        payload: dict[str, Any] = {"type": "compact"}
+        if custom_instructions:
+            payload["customInstructions"] = custom_instructions
+        logger.info("pi builtin compact session_id=%s has_args=%s", session_id, bool(args))
+        try:
+            data = response_data(
+                await live.command(
+                    payload,
+                    timeout=max(self.request_timeout, COMPACT_REQUEST_TIMEOUT_SECONDS),
+                )
+            )
+        except BUILTIN_RPC_ERRORS as exc:
+            return RuntimeCommandResult(
+                command="compact",
+                ok=False,
+                code="pi_compact_failed",
+                message=f"压缩失败：{exc}",
+            )
+        tokens_before = data.get("tokensBefore")
+        tokens_after = data.get("estimatedTokensAfter")
+        if _is_number(tokens_before) and _is_number(tokens_after):
+            message = f"已压缩 {tokens_before} → {tokens_after} tokens"
+        else:
+            message = "会话上下文已压缩"
+        return RuntimeCommandResult(
+            command="compact",
+            ok=True,
+            message=message,
+            result={"sessionId": session_id, "executionState": "accepted"},
+        )
+
+    async def _execute_name_command(
+        self,
+        session_id: str,
+        external_session_id: str | None,
+        args: tuple[str, ...],
+    ) -> RuntimeCommandResult:
+        live = await self._ensure_live(session_id, external_session_id, None)
+        if not args:
+            if live.session_name:
+                return RuntimeCommandResult(
+                    command="name",
+                    ok=True,
+                    message=f"当前会话名称：{live.session_name}",
+                    result={"sessionId": session_id},
+                )
+            return RuntimeCommandResult(
+                command="name",
+                ok=True,
+                message="当前会话尚未设置名称。",
+                result={"sessionId": session_id},
+            )
+        name = " ".join(args).strip()
+        if not name:
+            return RuntimeCommandResult(
+                command="name",
+                ok=False,
+                code="pi_name_invalid",
+                message="会话名称不能为空。",
+            )
+        try:
+            await live.command({"type": "set_session_name", "name": name})
+        except BUILTIN_RPC_ERRORS as exc:
+            return RuntimeCommandResult(
+                command="name",
+                ok=False,
+                code="pi_name_failed",
+                message=f"设置会话名称失败：{exc}",
+            )
+        live.session_name = name
+        await self._push_meta(live)
+        return RuntimeCommandResult(
+            command="name",
+            ok=True,
+            message=f"会话名称已设置为 {name}",
+            result={"sessionId": session_id, "name": name},
+        )
+
+    async def _execute_stats_command(
+        self,
+        session_id: str,
+        external_session_id: str | None,
+    ) -> RuntimeCommandResult:
+        live = await self._ensure_live(session_id, external_session_id, None)
+        live.touch()
+        data = await self.refresh_session_stats(live)
+        if not data:
+            return RuntimeCommandResult(
+                command="stats",
+                ok=False,
+                code="pi_stats_unavailable",
+                message="暂无法读取会话统计（pi 可能尚未完成首次模型调用）。",
+            )
+        return RuntimeCommandResult(
+            command="stats",
+            ok=True,
+            message=_format_session_stats(data),
+            result={"sessionId": session_id, "executionState": "accepted"},
+        )
+
+    async def _execute_export_command(
+        self,
+        session_id: str,
+        external_session_id: str | None,
+        args: tuple[str, ...],
+    ) -> RuntimeCommandResult:
+        live = await self._ensure_live(session_id, external_session_id, None)
+        payload: dict[str, Any] = {"type": "export_html"}
+        if args:
+            output_path = args[0].strip()
+            if not output_path:
+                return RuntimeCommandResult(
+                    command="export",
+                    ok=False,
+                    code="pi_export_invalid",
+                    message="导出路径不能为空。",
+                )
+            payload["outputPath"] = output_path
+        try:
+            data = response_data(await live.command(payload))
+        except BUILTIN_RPC_ERRORS as exc:
+            return RuntimeCommandResult(
+                command="export",
+                ok=False,
+                code="pi_export_failed",
+                message=f"导出失败：{exc}",
+            )
+        path = data.get("path")
+        if not isinstance(path, str) or not path:
+            return RuntimeCommandResult(
+                command="export",
+                ok=False,
+                code="pi_export_failed",
+                message="pi 未返回导出文件路径。",
+            )
+        return RuntimeCommandResult(
+            command="export",
+            ok=True,
+            message=f"已导出到 {path}",
+            result={"sessionId": session_id, "executionState": "accepted", "path": path},
         )
 
     # -- session operations -------------------------------------------------
@@ -1777,6 +2125,9 @@ class PiRuntime(AgentRuntime):
             # the coalescing loop first so a late push cannot resurrect one.
             await live.cancel_stream_flush()
             live.clear_stream_state()
+            # Refresh before publishing so the pushed state carries current
+            # token, cost, and context-usage metadata.
+            await self.refresh_session_stats(live)
             await self._push_state(live, force=True)
             await self._publish_timeline(live)
             await self._push_meta(live)

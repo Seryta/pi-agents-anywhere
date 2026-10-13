@@ -496,7 +496,11 @@ async def test_commands_are_listed(
     await runtime.start()
     try:
         commands = await runtime.list_commands("sess-none")
-        assert [command.id for command in commands] == ["fix-tests"]
+        # The builtin proxies come first; the pi-provided commands follow.
+        pi_commands = [
+            command for command in commands if command.metadata.get("source") != "pi-builtin"
+        ]
+        assert [command.id for command in pi_commands] == ["fix-tests"]
     finally:
         await runtime.stop()
 
@@ -520,6 +524,248 @@ async def test_execute_command_reports_accepted_state(
         result = await runtime.execute_command("sess-command", "fix-tests")
         assert result.ok is True
         assert result.result["executionState"] == "accepted"
+    finally:
+        await runtime.stop()
+
+
+async def test_list_commands_prepends_builtin_commands(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """The TUI-only slash commands are proxied ahead of pi's own commands.
+
+    pi's RPC ``get_commands`` only returns prompt commands; the TUI builtins
+    (compact/name/stats/export) must still be offered by the platform.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        commands = await runtime.list_commands("sess-none")
+        assert [command.id for command in commands] == [
+            "compact",
+            "name",
+            "stats",
+            "export",
+            "fix-tests",
+        ]
+        builtins = commands[:4]
+        assert all(command.metadata["source"] == "pi-builtin" for command in builtins)
+        assert all(command.description for command in builtins)
+        assert commands[4].metadata["source"] == "prompt"
+        # Search covers the builtins too.
+        filtered = await runtime.list_commands("sess-none", query="stat")
+        assert [command.id for command in filtered] == ["stats"]
+    finally:
+        await runtime.stop()
+
+
+async def test_execute_builtin_compact_sends_custom_instructions(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``compact`` must call the RPC instead of sending a ``/compact`` prompt."""
+
+    commands_file = tmp_path / "pi-commands.jsonl"
+    monkeypatch.setenv("PI_FAKE_COMMANDS_FILE", str(commands_file))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        result = await runtime.execute_command("sess-compact", "compact", args=("focus",))
+        assert result.ok is True
+        assert result.result["executionState"] == "accepted"
+        assert result.message == "已压缩 150000 → 32000 tokens"
+        await wait_for(lambda: commands_file.is_file())
+        commands = [
+            json.loads(line) for line in commands_file.read_text(encoding="utf-8").splitlines()
+        ]
+        compacts = [command for command in commands if command["type"] == "compact"]
+        assert compacts[0]["customInstructions"] == "focus"
+        assert not [command for command in commands if command["type"] == "prompt"]
+
+        # Several args join with spaces; no args omits the key entirely.
+        result = await runtime.execute_command("sess-compact", "compact", args=("take", "five"))
+        assert result.ok is True
+        result = await runtime.execute_command("sess-compact", "compact")
+        assert result.ok is True
+        commands = [
+            json.loads(line) for line in commands_file.read_text(encoding="utf-8").splitlines()
+        ]
+        compacts = [command for command in commands if command["type"] == "compact"]
+        assert [command.get("customInstructions") for command in compacts] == [
+            "focus",
+            "take five",
+            None,
+        ]
+    finally:
+        await runtime.stop()
+
+
+async def test_execute_builtin_name_sets_and_reads_session_name(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """``name`` writes through to pi, refreshes the meta, and reads back."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session("sess-name", "你好", cwd=str(tmp_path))
+        live = runtime._live["sess-name"]
+        assert live.session_name is None
+
+        metas_before = len(fake_host.metas)
+        result = await runtime.execute_command("sess-name", "name", args=("my-session",))
+        assert result.ok is True
+        assert live.session_name == "my-session"
+        assert len(fake_host.metas) > metas_before
+        state = await runtime.get_session_state("sess-name")
+        assert state is not None
+        assert state.metadata["sessionName"] == "my-session"
+
+        result = await runtime.execute_command("sess-name", "name")
+        assert result.ok is True
+        assert "my-session" in (result.message or "")
+
+        await runtime.create_and_start_session("sess-noname", "你好", cwd=str(tmp_path))
+        result = await runtime.execute_command("sess-noname", "name")
+        assert result.ok is True
+        assert "未设置" in (result.message or "")
+    finally:
+        await runtime.stop()
+
+
+async def test_execute_builtin_stats_reports_and_caches_context_usage(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """``stats`` returns a summary and caches it for the session state."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        result = await runtime.execute_command("sess-stats", "stats")
+        assert result.ok is True
+        assert "30%" in (result.message or "")
+        assert "21500" in (result.message or "")
+
+        state = await runtime.get_session_state("sess-stats")
+        assert state is not None
+        assert state.metadata["contextUsage"] == {
+            "tokens": 38400,
+            "contextWindow": 128000,
+            "percent": 30.0,
+        }
+        assert state.metadata["tokens"]["total"] == 21500
+        assert state.metadata["cost"] == 0.0123
+    finally:
+        await runtime.stop()
+
+
+async def test_execute_builtin_export_returns_html_path(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """``export`` returns the path pi wrote, honouring an explicit output path."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        result = await runtime.execute_command("sess-export", "export")
+        assert result.ok is True
+        assert result.result["path"].endswith("session-export.html")
+        assert "session-export.html" in (result.message or "")
+
+        target = str(tmp_path / "exports" / "custom.html")
+        result = await runtime.execute_command("sess-export", "export", args=(target,))
+        assert result.ok is True
+        assert result.result["path"] == target
+        assert target in (result.message or "")
+    finally:
+        await runtime.stop()
+
+
+async def test_non_builtin_command_still_sends_slash_prompt(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Names outside the builtin set keep the ``/command`` prompt behaviour."""
+
+    commands_file = tmp_path / "pi-commands.jsonl"
+    monkeypatch.setenv("PI_FAKE_COMMANDS_FILE", str(commands_file))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.create_and_start_session("sess-slash", "你好", cwd=str(tmp_path))
+        result = await runtime.execute_command("sess-slash", "fix-tests", args=("now",))
+        assert result.ok is True
+        assert result.result["executionState"] == "accepted"
+        assert result.message == "已发送 /fix-tests now"
+        commands = [
+            json.loads(line) for line in commands_file.read_text(encoding="utf-8").splitlines()
+        ]
+        prompts = [command for command in commands if command["type"] == "prompt"]
+        assert any(command["message"] == "/fix-tests now" for command in prompts)
+    finally:
+        await runtime.stop()
+
+
+async def test_context_usage_warning_opens_on_settle_and_resolves(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A nearly full context warns once and resolves when usage drops."""
+
+    monkeypatch.setenv("PI_FAKE_CONTEXT_PERCENT", "95")
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.start_turn("sess-ctx", None, "hello")
+        notice_id = "pi-context-sess-ctx"
+        await wait_for(lambda: any(notice.notice_id == notice_id for notice in fake_host.notices))
+        opened = [notice for notice in fake_host.notices if notice.notice_id == notice_id]
+        assert len(opened) == 1
+        assert opened[0].status == "open"
+        assert opened[0].severity == "warning"
+        assert opened[0].type == "notification"
+        assert "95" in (opened[0].message or "")
+        live = runtime._live["sess-ctx"]
+        assert live.context_warning_open is True
+        state = await runtime.get_session_state("sess-ctx")
+        assert state is not None
+        assert state.metadata["contextUsage"]["percent"] == 95.0
+
+        # A second settle at the same percent must not stack another notice.
+        await runtime.start_turn("sess-ctx", None, "again")
+        await wait_for(lambda: len(fake_host.turn_ends) >= 2)
+        opened = [notice for notice in fake_host.notices if notice.notice_id == notice_id]
+        assert len(opened) == 1
+
+        # pi may report a healthy percent after a compact: the same notice id
+        # must resolve instead of leaving a stale warning open.
+        await runtime._sync_context_warning(
+            live,
+            {"contextUsage": {"tokens": 38400, "contextWindow": 128000, "percent": 30}},
+        )
+        opened = [notice for notice in fake_host.notices if notice.notice_id == notice_id]
+        assert [notice.status for notice in opened] == ["open", "resolved"]
+        assert live.context_warning_open is False
+
+        # Missing usage resolves as well, without crashing on the absent percent.
+        live.context_warning_open = True
+        await runtime._sync_context_warning(live, {})
+        assert fake_host.notices[-1].status == "resolved"
     finally:
         await runtime.stop()
 
@@ -933,6 +1179,9 @@ async def test_reclaims_idle_sessions(
         await runtime.create_and_start_session("sess-idle", "你好", cwd=str(tmp_path))
         live = runtime._live["sess-idle"]
         assert live.alive
+        # The turn settles asynchronously; wait for the settled state so the
+        # idle expiry below cannot race the still-running turn.
+        await wait_for(lambda: len(fake_host.turn_ends) >= 1)
         runtime._idle_timeout = 0.05
         live.last_activity -= 1.0
         await runtime._reclaim_idle_sessions()
