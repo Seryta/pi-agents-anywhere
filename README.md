@@ -142,6 +142,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `defaultCwd` | `~` | 未指定工作目录时使用的目录 |
 | `requestTimeoutMs` | `60000` | 单条 RPC 命令超时 |
 | `idleTimeoutSeconds` | `600` | 空闲回收：会话进程空闲超过该时长后被关闭（0 禁用），会话文件保留，下一条消息自动恢复 |
+| `attachmentRetentionDays` | `30` | 保留 N 天后清理连接器附件目录中非活跃会话的文件（0 禁用） |
 
 ### 在 AA 里执行 pi 的内置命令
 
@@ -198,9 +199,9 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 
 ### 验证状态
 
-已验证（`111 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
+已验证（`119 passed, 1 skipped`；含真 pi 集成在列，真实模型轮次为可选项）：
 
-- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→done 收敛、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、内置命令代理（compact/name/stats/export）、会话统计与上下文预警、扩展 `setStatus`/`notify` 生命周期、非图片附件落盘与乐观消息对账、Provider 配置、Runtime 生命周期与交互流程、图片附件转发、CLI 参数解析与错误映射。
+- 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→done 收敛、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、内置命令代理（compact/name/stats/export）、命令 `sourceInfo` 元数据、会话统计与上下文预警、扩展 `setStatus`/`notify` 生命周期、非图片附件落盘与乐观消息对账、附件目录保留策略、Provider 配置、Runtime 生命周期与交互流程、图片附件转发、CLI 参数解析与错误映射。
 - 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态、真实模型的完整投影。
 - 兼容性：官方 Connector 2.0.0 与 2.0.3（两版源码下同一套测试全绿；PyPI `anywhere-cli` 2.0.3 wheel 与对应源码一致）。
 - 端到端：与自托管 AA Server 2.0.0 的连接、既有会话批量同步与时间线投影、模型目录上报。
