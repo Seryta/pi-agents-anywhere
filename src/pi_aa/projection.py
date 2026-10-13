@@ -110,6 +110,31 @@ def _tool_exit_code(details: Any) -> int | None:
     return None
 
 
+def tool_result_changes(content: Mapping[str, Any], details: Any) -> list[dict[str, Any]] | None:
+    """Build the platform ``changes`` array for a completed file-change call.
+
+    The platform renders ``diff`` entries as a diff panel when the text is a
+    unified diff, which Pi provides in ``details.patch``; ``details.diff`` is
+    the looser fallback. The path comes from the retained tool call input.
+    """
+
+    if not isinstance(details, Mapping):
+        return None
+    diff = _as_text(details.get("patch")) or _as_text(details.get("diff"))
+    if diff is None:
+        return None
+    arguments = content.get("input")
+    args = arguments if isinstance(arguments, Mapping) else {}
+    path: str | None = None
+    for key in ("path", "file_path", "filePath"):
+        path = _as_text(args.get(key))
+        if path is not None:
+            break
+    if path is None:
+        return None
+    return [{"path": path, "action": "modify", "diff": diff}]
+
+
 class TranscriptProjector:
     """Builds an ordered timeline for one Pi session."""
 
@@ -335,6 +360,10 @@ class TranscriptProjector:
         exit_code = _tool_exit_code(message.get("details"))
         if exit_code is not None:
             completed_content["exitCode"] = exit_code
+        if completed_content.get("kind") == "file_change":
+            changes = tool_result_changes(completed_content, message.get("details"))
+            if changes is not None:
+                completed_content["changes"] = changes
         self._replace(
             index,
             status="failed" if is_error else "done",

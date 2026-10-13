@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pi_aa.projection import project_session
+from pi_aa.projection import project_session, tool_result_changes
 
 
 def entries() -> list[dict]:
@@ -404,3 +404,106 @@ def test_windowed_projection_keeps_turn_end_status() -> None:
         max_items=limit,
     )
     assert windowed == full[-limit:]
+
+
+def edit_turn(arguments: dict, details: dict) -> list[dict]:
+    """An assistant edit call followed by its tool result."""
+
+    return [
+        {
+            "type": "message",
+            "id": "u1",
+            "parentId": None,
+            "timestamp": "t",
+            "message": {"role": "user", "content": "改文件", "timestamp": 1},
+        },
+        {
+            "type": "message",
+            "id": "a1",
+            "parentId": "u1",
+            "timestamp": "t",
+            "message": {
+                "role": "assistant",
+                "stopReason": "toolUse",
+                "timestamp": 2,
+                "content": [
+                    {
+                        "type": "toolCall",
+                        "id": "call_edit",
+                        "name": "edit",
+                        "arguments": arguments,
+                    }
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "id": "r1",
+            "parentId": "a1",
+            "timestamp": "t",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call_edit",
+                "toolName": "edit",
+                "content": [{"type": "text", "text": "edited"}],
+                "details": details,
+                "isError": False,
+                "timestamp": 3,
+            },
+        },
+    ]
+
+
+def only_tool_item(records: list[dict]):
+    items = project_session(records, session_id="s", external_session_id="/tmp/s.jsonl")
+    (tool,) = [item for item in items if item.type == "tool"]
+    return tool
+
+
+def test_edit_tool_result_projects_patch_into_changes() -> None:
+    """The platform renders this as a diff panel, so the patch must survive."""
+
+    patch = "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-old\n+new\n"
+    tool = only_tool_item(
+        edit_turn(
+            {"path": "foo.py", "oldText": "old", "newText": "new"},
+            # patch is the unified diff; it wins over the looser diff detail.
+            {"patch": patch, "diff": "1 old\n1 new\n"},
+        )
+    )
+    assert tool.content["kind"] == "file_change"
+    assert tool.content["changes"] == [{"path": "foo.py", "action": "modify", "diff": patch}]
+
+
+def test_edit_tool_result_falls_back_to_diff_detail() -> None:
+    diff = "@@ -1 +1 @@\n-old\n+new\n"
+    tool = only_tool_item(
+        edit_turn(
+            {"file_path": "src/bar.py", "oldText": "old", "newText": "new"},
+            {"diff": diff},
+        )
+    )
+    assert tool.content["changes"] == [{"path": "src/bar.py", "action": "modify", "diff": diff}]
+
+
+def test_edit_tool_result_without_diff_has_no_changes() -> None:
+    tool = only_tool_item(edit_turn({"filePath": "baz.py", "oldText": "o", "newText": "n"}, {}))
+    assert "changes" not in tool.content
+
+
+def test_non_file_change_tool_result_has_no_changes() -> None:
+    """Only file_change items carry changes, even when details contain a diff."""
+
+    records = edit_turn({"file_path": "x.py", "oldText": "o", "newText": "n"}, {"patch": "d"})
+    # Swap the recorded edit call for a bash call; the result keeps the patch.
+    records[1]["message"]["content"][0]["name"] = "bash"
+    records[1]["message"]["content"][0]["arguments"] = {"command": "true"}
+    tool = only_tool_item(records)
+    assert tool.content["kind"] == "command"
+    assert "changes" not in tool.content
+
+
+def test_tool_result_changes_needs_a_path() -> None:
+    """A diff without a file path in the tool call input cannot be projected."""
+
+    assert tool_result_changes({"input": {"oldText": "old"}}, {"patch": "d"}) is None
