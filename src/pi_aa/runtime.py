@@ -1915,6 +1915,8 @@ class PiRuntime(AgentRuntime):
                 title=name,
                 description=description,
                 scope="session",
+                # compact/name/export proxy a text argument; stats ignores one.
+                accepts_args=name != "stats",
                 metadata={"source": "pi-builtin"},
             )
             for name, description in BUILTIN_COMMANDS
@@ -1942,6 +1944,7 @@ class PiRuntime(AgentRuntime):
                     if isinstance(raw.get("description"), str)
                     else None,
                     scope="session",
+                    accepts_args=True,
                     metadata=metadata,
                 )
             )

@@ -1146,6 +1146,39 @@ async def test_list_commands_maps_pi_names_to_platform_safe_ids(
         await runtime.stop()
 
 
+async def test_command_catalog_declares_argument_support(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """The platform needs ``accepts_args`` to allow ``/command args``.
+
+    compact/name/export proxy argument text, stats ignores it, and pi's own
+    prompt/skill/extension commands take argument text.
+    """
+
+    async def fake_command(_payload):
+        return {
+            "data": {
+                "commands": [{"name": "skill:pdf-tools", "description": "PDF", "source": "skill"}]
+            }
+        }
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        runtime._utility_command = fake_command  # type: ignore[method-assign]
+        commands = await runtime.list_commands("sess-none")
+        by_id = {command.id: command for command in commands}
+        assert by_id["compact"].accepts_args is True
+        assert by_id["name"].accepts_args is True
+        assert by_id["export"].accepts_args is True
+        assert by_id["stats"].accepts_args is False
+        assert by_id["skill-pdf-tools"].accepts_args is True
+    finally:
+        await runtime.stop()
+
+
 async def test_context_usage_warning_opens_on_settle_and_resolves(
     fake_pi: Path,
     tmp_path: Path,
