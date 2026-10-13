@@ -2439,6 +2439,28 @@ async def test_settle_clears_the_interrupt_queue_receipt(
     assert all("clearedQueue" not in state.get("metadata", {}) for state in fake_host.states)
 
 
+async def test_live_exit_clears_the_interrupt_queue_receipt(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """A dead process's receipt must not survive to its replacement.
+
+    The queue text was only handed to the client through the state push that
+    carried the interrupt; a process exit in between must drop the receipt so
+    the session's later state pushes stay clean.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-exit-cleared", cwd=str(tmp_path))
+    live.cleared_queue = {"steering": [], "followUp": ["queued idea"]}
+    runtime._live["sess-exit-cleared"] = live
+
+    await runtime.handle_live_exit(live, 0)
+
+    assert live.cleared_queue is None
+
+
 def _upserts_by_id(host: FakeHost, item_type: str) -> dict[str, list]:
     grouped: dict[str, list] = {}
     for item in host.timeline_items:
@@ -2867,10 +2889,15 @@ async def test_interrupt_aborts_when_clear_queue_fails(
         await runtime.start_turn("sess-queue-clear-fail", None, "first question")
         live = runtime._live["sess-queue-clear-fail"]
         await wait_for(lambda: live.is_streaming)
+        # A receipt left by an earlier interrupt must not be returned as this
+        # call's result when the new clear fails.
+        live.cleared_queue = {"steering": ["stale text"], "followUp": []}
 
         result = await runtime.interrupt_session("sess-queue-clear-fail")
         assert result.ok is True
         assert "clearedQueue" not in result.result
+        assert live.cleared_queue is None
+        assert all("clearedQueue" not in state.get("metadata", {}) for state in fake_host.states)
         await wait_for(lambda: commands_file.is_file())
         commands = [
             json.loads(line)["type"]

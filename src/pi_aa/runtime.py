@@ -2286,6 +2286,10 @@ class PiRuntime(AgentRuntime):
         live = self._live.get(session_id)
         if live is None or not live.alive:
             return RuntimeOperationResult(result={"sessionId": session_id, "noop": True})
+        # A receipt from a previous interrupt belongs to that state push, not
+        # to this call; dropping it keeps a failed clear below from returning
+        # the stale queue as if it were the result of this interrupt.
+        live.cleared_queue = None
         if not (live.is_streaming or live.is_compacting):
             return RuntimeOperationResult(result={"sessionId": session_id, "noop": True})
         # Mirror the TUI's Esc (docs/rpc-commands.md): drain the queue first so
@@ -2522,6 +2526,9 @@ class PiRuntime(AgentRuntime):
     async def handle_live_exit(self, live: PiLiveSession, code: int | None) -> None:
         logger.info("pi session %s process exited code=%s", live.platform_id, code)
         await live.settle_stream()
+        # The process that could have produced a cleared-queue receipt is gone;
+        # a later state push from a replacement must not replay it.
+        live.cleared_queue = None
         if self._stopping:
             return
         live.is_streaming = False
