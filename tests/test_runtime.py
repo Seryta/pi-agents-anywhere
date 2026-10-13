@@ -289,6 +289,30 @@ async def test_timed_out_ui_request_is_expired_on_settle(
     assert expired.blocking is None
 
 
+async def test_agent_settled_aborted_reports_interrupted_turn(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """An aborted agent turn must be reported as ``interrupted``.
+
+    pi's ``agent_settled`` event carries an ``aborted`` boolean; ignoring it
+    labels an interrupted turn as ``completed``, which misrepresents turn ends
+    to the platform (alerts, turn-counting, timeline markers).
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-abort-1", cwd=str(tmp_path))
+    runtime._live["sess-abort-1"] = live
+
+    await runtime.handle_live_event(live, {"type": "agent_settled", "aborted": True})
+    assert fake_host.turn_ends[-1]["outcome"] == "interrupted"
+
+    # A normal (non-aborted) settle keeps reporting ``completed``.
+    await runtime.handle_live_event(live, {"type": "agent_settled", "aborted": False})
+    assert fake_host.turn_ends[-1]["outcome"] == "completed"
+
+
 async def test_reclaim_clears_timed_out_pending_interaction(
     fake_pi: Path,
     tmp_path: Path,

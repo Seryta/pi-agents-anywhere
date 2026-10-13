@@ -1388,12 +1388,16 @@ class PiRuntime(AgentRuntime):
             await self._push_state(live, force=True)
             await self._publish_timeline(live)
             await self._push_meta(live)
+            # pi marks an aborted run in the event payload; the server-side
+            # turn outcome whitelist is {completed, interrupted, cancelled,
+            # failed}, so map it explicitly.
+            outcome = "interrupted" if record.get("aborted") else "completed"
             try:
                 await self.host.session_turn_ended(
                     session_id=live.platform_id,
                     runtime=RUNTIME,
                     external_session_id=live.external_id,
-                    outcome="completed",
+                    outcome=outcome,
                 )
             except Exception:
                 logger.exception("failed to publish turn end for %s", live.platform_id)
