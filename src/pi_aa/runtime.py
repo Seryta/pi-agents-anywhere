@@ -99,6 +99,19 @@ PI_IMAGE_MIME_TYPES: tuple[str, ...] = (
 )
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
 
+# Notice.interactionType is validated against the server's ``InteractionType``
+# literal (server ``agent_server/core/models.py``; identical in 2.0.0 and
+# 2.0.3), which rejects pi's private ``pi.<method>`` values outright. Collapse
+# pi's extension UI methods onto that enum; the exact pi method stays available
+# in the notice context under "method".
+SERVER_INTERACTION_TYPE_BY_METHOD: dict[str, str] = {
+    "confirm": "confirmation",
+    "select": "input_request",
+    "input": "input_request",
+    "editor": "input_request",
+}
+SERVER_INTERACTION_TYPE_UNKNOWN = "unknown"
+
 
 def _merge_client_message_pairs(
     *groups: Sequence[tuple[str, str]],
@@ -234,7 +247,9 @@ class PendingInteraction:
             session_id=session_id,
             runtime=RUNTIME,
             type="interaction",
-            interaction_type=f"pi.{self.method}",
+            interaction_type=SERVER_INTERACTION_TYPE_BY_METHOD.get(
+                self.method, SERVER_INTERACTION_TYPE_UNKNOWN
+            ),
             title=self.title,
             message=self.message,
             severity="warning",

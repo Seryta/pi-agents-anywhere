@@ -14,7 +14,12 @@ from connector.runtime_protocol import (
     RuntimeConfig,
 )
 
-from pi_aa.runtime import REANNOUNCE_MIN_INTERVAL_SECONDS, PiRuntime, platform_session_id
+from pi_aa.runtime import (
+    REANNOUNCE_MIN_INTERVAL_SECONDS,
+    PendingInteraction,
+    PiRuntime,
+    platform_session_id,
+)
 from tests.conftest import FAKE_PNG_BYTES, FakeHost, wait_for
 
 
@@ -166,6 +171,8 @@ async def test_extension_ui_interaction_flow(
         assert len(notices) == 1
         notice = notices[0]
         assert notice.response_required is True
+        assert notice.interaction_type == "confirmation"
+        assert notice.context["method"] == "confirm"
         assert any(action["actionId"] == "confirm" for action in notice.actions)
 
         result = await runtime.respond_interaction("sess-ui", notice.notice_id, "confirm")
@@ -176,6 +183,39 @@ async def test_extension_ui_interaction_flow(
         assert resolved, "interaction notice should be resolved"
     finally:
         await runtime.stop()
+
+
+@pytest.mark.parametrize(
+    ("method", "expected"),
+    [
+        ("confirm", "confirmation"),
+        ("select", "input_request"),
+        ("input", "input_request"),
+        ("editor", "input_request"),
+        ("unsupported", "unknown"),
+    ],
+)
+def test_pending_interaction_maps_method_to_server_type(method: str, expected: str) -> None:
+    """Pi dialog methods must map onto the server's InteractionType literal.
+
+    The server validates interactionType with pydantic and rejects anything
+    outside the literal, so a private ``pi.<method>`` value makes the notice
+    undeliverable. This mirrors ``InteractionType`` in server core/models.py
+    (verified against server 2.0.3); the original method must stay in the
+    notice context.
+    """
+
+    interaction = PendingInteraction({"id": "req-1", "method": method, "title": "t"})
+    notice = interaction.as_notice("sess-1")
+    assert notice.interaction_type == expected
+    assert notice.context["method"] == method
+    assert notice.interaction_type in {
+        "approval",
+        "execution_error",
+        "confirmation",
+        "input_request",
+        "unknown",
+    }
 
 
 async def test_model_catalog_and_selections(
