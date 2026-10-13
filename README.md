@@ -23,7 +23,7 @@ pi --mode rpc （每个活跃会话一个子进程）
 
 - **PiProvider**：发现本机 pi（`pi --version`）、配置校验、按配置创建 Runtime 实例。
 - **PiRuntime**：会话清单（扫描 `~/.pi/agent/sessions`）、会话快照、状态、发送/打断/转向、图片附件、模型目录、命令、扩展 UI 交互。
-- **Timeline 投影**：把 pi 会话文件里的消息、工具调用、轮次翻译成 AA 的 `RuntimeTimelineItem`（同样的投影同时用于历史会话与实时推送）。
+- **Timeline 投影**：把 pi 会话文件里的消息、工具调用、轮次翻译成 AA 的 `RuntimeTimelineItem`（同样的投影同时用于历史会话与实时推送）。注意：pi 投影生成的 `turn.start`/`turn.end` 分界项与 `turnId` 会被官方 Connector/Server 2.0.x 的边界主动过滤，工作台时间线不显示轮次分界（属官方 2.0.x 的 session-only boundary 设计，非缺陷）。
 
 注入点来自官方代码：`BackendRpcClient(config, agent_runtime_providers=(...))`（`connector/server/client.py`）。
 
@@ -146,10 +146,18 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 pi 的内置 slash 命令（`/reload`、`/settings` 等）只存在于 TUI；RPC 客户端只能执行
 `get_commands` 报告的命令（扩展 / 模板 / skill）。要让 AA 里也能用某个内置命令，
 把它注册为一个扩展命令即可——例如 `examples/extensions/reload.ts` 把 `/reload`
-带入 `get_commands`：
+带入 `get_commands`。注意 PyPI 的 wheel 只包含运行时包（`pi_aa/`），不包含
+`examples/`，需要从源码仓库获取该文件（源码 checkout 或直接下载）：
 
 ```bash
-cp examples/extensions/reload.ts ~/.pi/agent/extensions/
+# 方式一：源码 checkout 后复制
+git clone --depth 1 https://github.com/Seryta/pi-agents-anywhere /tmp/pi-aa \
+  && cp /tmp/pi-aa/examples/extensions/reload.ts ~/.pi/agent/extensions/
+
+# 方式二：直接下载该文件
+mkdir -p ~/.pi/agent/extensions
+curl -fsSL -o ~/.pi/agent/extensions/reload.ts \
+  https://raw.githubusercontent.com/Seryta/pi-agents-anywhere/main/examples/extensions/reload.ts
 ```
 
 之后在 AA 的输入框里输入 `/reload`，pi 会像 TUI 一样重载配置、扩展、指令与资源
@@ -162,6 +170,7 @@ cp examples/extensions/reload.ts ~/.pi/agent/extensions/
 - **无权限目录**：pi 没有运行时工具审批概念（工具权限由启动配置决定），因此没有 permission catalog。
 - **非逐 token 流式**：Timeline 在轮次结束（`agent_settled`）时推送，不推送 delta 级文本。
 - **`notify` 通知不会被自动清除**：映射为 `open` 状态的 notification notice。
+- **超过 64 MiB 的会话文件会被跳过**：超过 `MAX_SESSION_FILE_BYTES`（`src/pi_aa/sessions.py`，64 MiB）的会话文件不参与投影，会从会话列表消失且无提示（仅超大单文件场景；正常会话远小于此）。
 - **时间线跟随 pi 的活跃分支**：在 pi 中切换分支（`/tree`）后，旧分支的远端时间线项会被移除；切回该分支后会重新投影恢复。pi 的会话文件始终保留全部分支，此行为可逆。
 - 仅覆盖 `select/confirm/input/editor` 四种对话框交互；`setStatus`/`setWidget` 等无副作用调用被忽略。
 
