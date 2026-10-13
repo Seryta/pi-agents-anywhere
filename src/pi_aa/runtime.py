@@ -1968,22 +1968,27 @@ class PiRuntime(AgentRuntime):
             for name, description in BUILTIN_COMMANDS
             if not needle or needle in name.lower()
         ]
+        pi_commands: list[RuntimeCommand] = []
         for raw in _as_list(response_data(data).get("commands")):
             if not isinstance(raw, Mapping):
                 continue
             name = raw.get("name")
             if not isinstance(name, str) or not name:
                 continue
-            if needle and needle not in name.lower():
-                continue
+            # Ids are assigned over the full pi catalog before the query
+            # filter, so a command keeps the same id in every listing and a
+            # narrowed or truncated call cannot renumber it or overwrite the
+            # id-to-name map that dispatch relies on.
             command_id = _platform_command_id(name, taken)
             taken.add(command_id)
             self._command_native_names[command_id] = name
+            if needle and needle not in name.lower():
+                continue
             metadata: dict[str, Any] = {"source": raw.get("source")}
             source_info = _command_source_info(raw)
             if source_info is not None:
                 metadata["sourceInfo"] = source_info
-            commands.append(
+            pi_commands.append(
                 RuntimeCommand(
                     id=command_id,
                     title=name,
@@ -1995,6 +2000,7 @@ class PiRuntime(AgentRuntime):
                     metadata=metadata,
                 )
             )
+        commands.extend(pi_commands)
         if limit > 0:
             commands = commands[:limit]
         return tuple(commands)

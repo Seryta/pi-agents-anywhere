@@ -1146,6 +1146,55 @@ async def test_list_commands_maps_pi_names_to_platform_safe_ids(
         await runtime.stop()
 
 
+async def test_list_commands_assigns_ids_from_full_catalog_before_filtering(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """Ids must not depend on the query filter or the output limit.
+
+    Two pi commands can sanitize to the same platform id (``a:b``/``a.b``);
+    assignment walks the full catalog so both keep one stable id, and a
+    narrowed or truncated listing cannot renumber the survivor or rewrite the
+    id-to-name map that dispatch uses.
+    """
+
+    async def fake_command(_payload):
+        return {
+            "data": {
+                "commands": [
+                    {"name": "a:b", "description": "first collision", "source": "prompt"},
+                    {"name": "a.b", "description": "second collision", "source": "prompt"},
+                ]
+            }
+        }
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        runtime._utility_command = fake_command  # type: ignore[method-assign]
+        full = await runtime.list_commands("sess-none")
+        pi_ids = {
+            command.title: command.id
+            for command in full
+            if command.metadata.get("source") != "pi-builtin"
+        }
+        assert pi_ids == {"a:b": "a-b", "a.b": "a-b-2"}
+        assert runtime._command_native_names["a-b"] == "a:b"
+
+        # A query listing only the second command keeps its full-catalog id
+        # and must not rebind "a-b" to "a.b".
+        narrowed = await runtime.list_commands("sess-none", query="a.b")
+        assert [command.id for command in narrowed] == ["a-b-2"]
+        assert runtime._command_native_names["a-b"] == "a:b"
+
+        # A truncated listing only trims the output; the id map stays full.
+        await runtime.list_commands("sess-none", limit=1)
+        assert runtime._command_native_names["a-b-2"] == "a.b"
+    finally:
+        await runtime.stop()
+
+
 async def test_command_catalog_declares_argument_support(
     fake_pi: Path,
     tmp_path: Path,
