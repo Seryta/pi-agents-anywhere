@@ -14,6 +14,7 @@ from connector.runtime_protocol import (
     RuntimeConfig,
 )
 
+from pi_aa.rpc import PiRpcProcess, PiRpcTimeout
 from pi_aa.runtime import (
     REANNOUNCE_MIN_INTERVAL_SECONDS,
     PendingInteraction,
@@ -311,6 +312,39 @@ async def test_reclaim_clears_timed_out_pending_interaction(
     assert "sess-timeout-reclaim" not in runtime._live
     assert [notice.status for notice in fake_host.notices] == ["expired"]
     assert fake_host.notices[0].notice_id == pending.notice_id
+
+
+async def test_ensure_started_tolerates_get_state_timeout(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A get_state timeout must degrade to a warning, not fail the start.
+
+    ``request`` raises ``PiRpcTimeout``, which is not a ``TimeoutError``
+    subclass (PiRpcTimeout -> PiRpcError -> Exception), so the original
+    capture tuple let it escape through ``create_and_start_session`` and the
+    first ``start_turn`` instead of continuing with a usable process.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-timeout-start", cwd=str(tmp_path))
+    runtime._live["sess-timeout-start"] = live
+
+    async def timing_out(self: PiRpcProcess, command, **kwargs) -> None:
+        raise PiRpcTimeout(f"no answer for {command.get('type')!r}")
+
+    monkeypatch.setattr(PiRpcProcess, "request", timing_out)
+    try:
+        await live.ensure_started()
+        assert live.alive is True
+        # The degraded start is not retried from scratch by the next call.
+        await live.ensure_started()
+        assert live.alive is True
+    finally:
+        runtime._live.pop("sess-timeout-start", None)
+        await live.stop()
 
 
 async def test_model_catalog_and_selections(

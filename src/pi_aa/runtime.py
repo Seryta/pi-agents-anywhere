@@ -57,6 +57,7 @@ from pi_aa.rpc import (
     PiRpcProcess,
     PiRpcProcessExited,
     PiRpcRequestFailed,
+    PiRpcTimeout,
     response_data,
 )
 from pi_aa.sessions import (
@@ -410,7 +411,7 @@ class PiLiveSession:
             self.process = process
             try:
                 await self.refresh_state()
-            except (PiRpcProcessExited, PiRpcRequestFailed, TimeoutError) as exc:
+            except (PiRpcProcessExited, PiRpcRequestFailed, PiRpcTimeout, TimeoutError) as exc:
                 logger.warning(
                     "pi session %s started but get_state failed: %s",
                     self.platform_id,
