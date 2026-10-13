@@ -12,6 +12,7 @@ from connector.runtime_protocol import (
     CAPABILITY_RUNTIME_ATTACHMENT,
     CAPABILITY_SESSION_SEND_MESSAGE,
     RuntimeAttachment,
+    RuntimeAttachmentContent,
     RuntimeConfig,
     attachments_root,
     session_attachments_dir,
@@ -1481,6 +1482,46 @@ async def test_attachment_download_failure_keeps_the_turn(
         (f"继续\n\n用户上传了以下文件附件，已保存到本机，可用工具读取：\n- notes.txt: {saved}")
     ]
     assert sorted(path.name for path in saved.parent.iterdir()) == ["text-1-notes.txt"]
+
+
+async def test_attachment_without_name_falls_back_to_file_id(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An attachment with no usable name must not note ``None`` to pi."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+
+    async def download_unnamed(session_id: str, file_id: str) -> RuntimeAttachmentContent:
+        _ = session_id
+        return RuntimeAttachmentContent(
+            file_id=file_id,
+            name=None,  # the platform can omit the original name
+            media_type="application/octet-stream",
+            content=FAKE_TEXT_BYTES,
+        )
+
+    monkeypatch.setattr(fake_host, "attachment_download", download_unnamed)
+    await runtime.start()
+    try:
+        attachment = RuntimeAttachment(file_id="blob-1", media_type="application/octet-stream")
+        result = await runtime.start_turn("sess-unnamed", None, "继续", attachments=(attachment,))
+        assert result.ok is True
+        await wait_for(
+            lambda: session_file.is_file() and "继续" in session_file.read_text(encoding="utf-8")
+        )
+    finally:
+        await runtime.stop()
+
+    saved = tmp_path / "attachments" / "sess-unnamed" / "blob-1-blob-1"
+    assert saved.read_bytes() == FAKE_TEXT_BYTES
+    assert session_user_contents(session_file) == [
+        f"继续\n\n用户上传了以下文件附件，已保存到本机，可用工具读取：\n- blob-1: {saved}"
+    ]
 
 
 async def test_oversized_attachment_is_skipped(

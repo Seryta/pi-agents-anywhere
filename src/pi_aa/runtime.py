@@ -2612,7 +2612,7 @@ class PiRuntime(AgentRuntime):
                     }
                 )
                 continue
-            name = attachment.name or downloaded.name
+            name = attachment.name or downloaded.name or attachment.file_id
             target = attachment_target(session_id, attachment.file_id, name)
             try:
                 target.parent.mkdir(parents=True, exist_ok=True)
