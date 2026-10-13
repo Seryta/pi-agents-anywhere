@@ -22,6 +22,7 @@ from connector.runtime_protocol import RuntimeAttachmentContent
 from connector.runtime_protocol.host import RuntimeHostClient
 
 FAKE_PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-image-bytes"
+FAKE_TEXT_BYTES = b"hello attachment"
 
 
 class FakeHost(RuntimeHostClient):
@@ -81,6 +82,15 @@ class FakeHost(RuntimeHostClient):
 
     async def attachment_download(self, session_id: str, file_id: str) -> RuntimeAttachmentContent:
         self.attachment_downloads.append({"session_id": session_id, "file_id": file_id})
+        if file_id.startswith("fail-"):
+            raise RuntimeError(f"attachment download failed: {file_id}")
+        if file_id.startswith("text-"):
+            return RuntimeAttachmentContent(
+                file_id=file_id,
+                name="notes.txt",
+                media_type="text/plain",
+                content=FAKE_TEXT_BYTES,
+            )
         return RuntimeAttachmentContent(
             file_id=file_id,
             name="test.png",

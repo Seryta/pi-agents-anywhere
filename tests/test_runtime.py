@@ -22,7 +22,7 @@ from pi_aa.runtime import (
     PiRuntime,
     platform_session_id,
 )
-from tests.conftest import FAKE_PNG_BYTES, FakeHost, wait_for
+from tests.conftest import FAKE_PNG_BYTES, FAKE_TEXT_BYTES, FakeHost, wait_for
 
 
 def make_runtime(fake_pi: Path, tmp_path: Path, host: FakeHost) -> PiRuntime:
@@ -37,6 +37,21 @@ def make_runtime(fake_pi: Path, tmp_path: Path, host: FakeHost) -> PiRuntime:
         },
     )
     return PiRuntime(config=config, host=host)
+
+
+def session_user_contents(session_file: Path) -> list[object]:
+    """Content of every user message pi persisted, in order."""
+
+    records = [
+        json.loads(line)
+        for line in session_file.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return [
+        record["message"]["content"]
+        for record in records
+        if record.get("type") == "message" and (record.get("message") or {}).get("role") == "user"
+    ]
 
 
 async def test_start_stop(fake_pi: Path, tmp_path: Path, fake_host: FakeHost) -> None:
@@ -1191,6 +1206,230 @@ async def test_start_turn_forwards_image_attachments(
     assert image["data"] == base64.b64encode(FAKE_PNG_BYTES).decode("ascii")
 
 
+async def test_start_turn_saves_non_image_attachments(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Non-image attachments reach pi as a path note instead of being skipped."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        image_attachment = RuntimeAttachment(
+            file_id="file-1",
+            name="shot.png",
+            media_type="image/png",
+            size=len(FAKE_PNG_BYTES),
+            sha256="0" * 64,
+        )
+        text_attachment = RuntimeAttachment(
+            file_id="text-1",
+            name="notes.txt",
+            media_type="text/plain",
+            size=len(FAKE_TEXT_BYTES),
+            sha256="0" * 64,
+        )
+        result = await runtime.start_turn(
+            "sess-mixed",
+            None,
+            "看看这些附件",
+            attachments=(image_attachment, text_attachment),
+        )
+        assert result.ok is True
+        await wait_for(
+            lambda: (
+                session_file.is_file()
+                and "看看这些附件" in session_file.read_text(encoding="utf-8")
+            )
+        )
+    finally:
+        await runtime.stop()
+
+    saved = tmp_path / "attachments" / "sess-mixed" / "text-1-notes.txt"
+    assert saved.read_bytes() == FAKE_TEXT_BYTES
+    # Images stay out of the attachments directory.
+    assert sorted(path.name for path in saved.parent.iterdir()) == ["text-1-notes.txt"]
+    assert fake_host.attachment_downloads == [
+        {"session_id": "sess-mixed", "file_id": "file-1"},
+        {"session_id": "sess-mixed", "file_id": "text-1"},
+    ]
+
+    contents = session_user_contents(session_file)
+    assert len(contents) == 1
+    blocks = contents[0]
+    assert isinstance(blocks, list)
+    text = next(block for block in blocks if block.get("type") == "text")
+    assert text["text"] == (
+        "看看这些附件\n\n"
+        "用户上传了以下文件附件，已保存到本机，可用工具读取：\n"
+        f"- notes.txt: {saved}"
+    )
+    image = next(block for block in blocks if block.get("type") == "image")
+    assert image["mimeType"] == "image/png"
+    assert image["data"] == base64.b64encode(FAKE_PNG_BYTES).decode("ascii")
+
+
+async def test_create_session_appends_attachment_notes_without_images(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-image-only send stays plain text and carries the saved path."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        attachment = RuntimeAttachment(
+            file_id="text-1",
+            name="notes.txt",
+            media_type="text/plain",
+            size=len(FAKE_TEXT_BYTES),
+        )
+        result = await runtime.create_and_start_session(
+            "sess-create",
+            "读一下附件",
+            cwd=str(tmp_path),
+            attachments=(attachment,),
+        )
+        assert result.ok is True
+        await wait_for(
+            lambda: (
+                session_file.is_file() and "读一下附件" in session_file.read_text(encoding="utf-8")
+            )
+        )
+    finally:
+        await runtime.stop()
+
+    saved = tmp_path / "attachments" / "sess-create" / "text-1-notes.txt"
+    assert saved.read_bytes() == FAKE_TEXT_BYTES
+    contents = session_user_contents(session_file)
+    assert len(contents) == 1
+    # No images means pi persists the prompt as a plain string.
+    assert contents[0] == (
+        f"读一下附件\n\n用户上传了以下文件附件，已保存到本机，可用工具读取：\n- notes.txt: {saved}"
+    )
+
+
+async def test_attachment_download_failure_keeps_the_turn(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One failing download must not drop the turn or the other attachments."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        broken = RuntimeAttachment(
+            file_id="fail-1",
+            name="broken.bin",
+            media_type="application/octet-stream",
+        )
+        good = RuntimeAttachment(
+            file_id="text-1",
+            name="notes.txt",
+            media_type="text/plain",
+        )
+        result = await runtime.start_turn("sess-fail", None, "继续", attachments=(broken, good))
+        assert result.ok is True
+        await wait_for(
+            lambda: session_file.is_file() and "继续" in session_file.read_text(encoding="utf-8")
+        )
+    finally:
+        await runtime.stop()
+
+    saved = tmp_path / "attachments" / "sess-fail" / "text-1-notes.txt"
+    assert saved.read_bytes() == FAKE_TEXT_BYTES
+    assert session_user_contents(session_file) == [
+        (f"继续\n\n用户上传了以下文件附件，已保存到本机，可用工具读取：\n- notes.txt: {saved}")
+    ]
+    assert sorted(path.name for path in saved.parent.iterdir()) == ["text-1-notes.txt"]
+
+
+async def test_oversized_attachment_is_skipped(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Files over the size cap stay out of the prompt and off the disk."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    monkeypatch.setattr("pi_aa.runtime.MAX_ATTACHMENT_BYTES", 4)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        attachment = RuntimeAttachment(
+            file_id="text-1",
+            name="notes.txt",
+            media_type="text/plain",
+        )
+        result = await runtime.start_turn("sess-big", None, "大文件", attachments=(attachment,))
+        assert result.ok is True
+        await wait_for(
+            lambda: session_file.is_file() and "大文件" in session_file.read_text(encoding="utf-8")
+        )
+    finally:
+        await runtime.stop()
+
+    assert session_user_contents(session_file) == ["大文件"]
+    assert not (tmp_path / "attachments" / "sess-big").exists()
+    # The runtime learns the real size only after downloading.
+    assert fake_host.attachment_downloads == [{"session_id": "sess-big", "file_id": "text-1"}]
+
+
+async def test_steer_turn_saves_non_image_attachments(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """steer_turn appends the same saved-file note as start_turn."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        attachment = RuntimeAttachment(
+            file_id="text-1",
+            name="notes.txt",
+            media_type="text/plain",
+        )
+        result = await runtime.steer_turn(
+            "sess-steer",
+            None,
+            "先看这个",
+            attachments=(attachment,),
+        )
+        assert result.ok is True
+        assert result.result == {"sessionId": "sess-steer", "steered": False}
+        await wait_for(
+            lambda: (
+                session_file.is_file() and "先看这个" in session_file.read_text(encoding="utf-8")
+            )
+        )
+    finally:
+        await runtime.stop()
+
+    saved = tmp_path / "attachments" / "sess-steer" / "text-1-notes.txt"
+    assert saved.read_bytes() == FAKE_TEXT_BYTES
+    assert session_user_contents(session_file) == [
+        (f"先看这个\n\n用户上传了以下文件附件，已保存到本机，可用工具读取：\n- notes.txt: {saved}")
+    ]
+
+
 async def test_start_resets_stale_running_states(
     fake_pi: Path,
     tmp_path: Path,
@@ -1352,6 +1591,97 @@ async def test_start_turn_attaches_client_message_id(
         )
     finally:
         await runtime.stop()
+
+
+async def test_start_turn_client_message_id_covers_attachment_note(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The optimistic-send id must match the prompt pi actually persisted.
+
+    pi saves the prompt with the attachment note appended, so binding only
+    the raw content leaves the platform unable to reconcile the echo and the
+    message renders twice (optimistic copy plus transcript copy).
+    """
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        attachment = RuntimeAttachment(
+            file_id="text-1",
+            name="notes.txt",
+            media_type="text/plain",
+        )
+        result = await runtime.start_turn(
+            "sess-cm-attach",
+            None,
+            "看看附件",
+            attachments=(attachment,),
+            client_message_id="cm-attach",
+        )
+        assert result.ok is True
+        await wait_for(lambda: len(fake_host.turn_ends) >= 1)
+        snapshot = await runtime.get_session_snapshot(
+            "sess-cm-attach",
+            external_session_id=str(session_file),
+        )
+    finally:
+        await runtime.stop()
+
+    user_items = [
+        item
+        for item in snapshot.items
+        if item.type == "message" and getattr(item, "role", None) == "user"
+    ]
+    assert user_items, "expected the projected user message"
+    assert user_items[-1].source["clientMessageId"] == "cm-attach"
+
+
+async def test_create_session_client_message_id_covers_attachment_note(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """create_and_start_session binds the same prompt text it sends to pi."""
+
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        attachment = RuntimeAttachment(
+            file_id="text-1",
+            name="notes.txt",
+            media_type="text/plain",
+        )
+        result = await runtime.create_and_start_session(
+            "sess-cm-create",
+            "读一下附件",
+            cwd=str(tmp_path),
+            attachments=(attachment,),
+            client_message_id="cm-create",
+        )
+        assert result.ok is True
+        await wait_for(lambda: len(fake_host.turn_ends) >= 1)
+        snapshot = await runtime.get_session_snapshot(
+            "sess-cm-create",
+            external_session_id=str(session_file),
+        )
+    finally:
+        await runtime.stop()
+
+    user_items = [
+        item
+        for item in snapshot.items
+        if item.type == "message" and getattr(item, "role", None) == "user"
+    ]
+    assert user_items, "expected the projected user message"
+    assert user_items[-1].source["clientMessageId"] == "cm-create"
 
 
 async def test_reclaims_idle_sessions(

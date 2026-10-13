@@ -49,6 +49,7 @@ from connector.runtime_protocol import (
     SessionNotice,
     SessionSourceState,
     SessionState,
+    attachment_target,
 )
 from connector.runtime_protocol.host import RuntimeHostClient
 from connector.runtime_protocol.timeline import TimelineSource, timeline_content_hash
@@ -105,6 +106,12 @@ PI_IMAGE_MIME_TYPES: tuple[str, ...] = (
     "image/gif",
     "image/webp",
 )
+
+# Non-image attachments are copied into the connector's per-session attachment
+# directory and referenced by path in the prompt. Anything larger is skipped
+# so a single upload cannot exhaust connector memory or disk.
+MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
+
 DIALOG_METHODS = frozenset({"select", "confirm", "input", "editor"})
 
 # Pi's TUI-only slash commands never show up in the ``get_commands`` RPC
@@ -228,6 +235,19 @@ def _model_group_item(provider: str) -> RuntimeModelItem:
         enabled=False,
         metadata={"provider": provider, "group": True},
     )
+
+
+def _prompt_with_attachment_notes(
+    content: str,
+    notes: Sequence[tuple[str, str]],
+) -> str:
+    """Append saved non-image attachment references to the prompt text."""
+
+    if not notes:
+        return content
+    lines = ["用户上传了以下文件附件，已保存到本机，可用工具读取："]
+    lines.extend(f"- {name}: {path}" for name, path in notes)
+    return content + "\n\n" + "\n".join(lines)
 
 
 class PendingInteraction:
@@ -1910,18 +1930,21 @@ class PiRuntime(AgentRuntime):
         runtime_options: Mapping[str, Any] | None = None,
     ) -> RuntimeOperationResult:
         _ = runtime_options
-        images = await self._attachment_images(session_id, attachments)
+        images, notes = await self._prepare_attachments(session_id, attachments)
         workdir = self._resolve_cwd(cwd)
         live = PiLiveSession(self, session_id, cwd=workdir)
+        # Bind the exact text pi will persist: the projection pairs optimistic
+        # sends by comparing this text with the transcript's user message.
+        prompt = _prompt_with_attachment_notes(content, notes)
         if client_message_id:
-            live.client_messages.append((content, client_message_id))
+            live.client_messages.append((prompt, client_message_id))
         self._live[session_id] = live
         await live.ensure_started()
         if is_meaningful_title(title):
             await live.command({"type": "set_session_name", "name": title})
         if selections:
             await self._apply_selections(live, selections)
-        await live.send_prompt(content, images=images)
+        await live.send_prompt(prompt, images=images)
         if client_message_id:
             await self._persist_client_bindings(live)
         await self._push_meta(live)
@@ -1940,20 +1963,25 @@ class PiRuntime(AgentRuntime):
         client_message_id: str | None = None,
         cwd: str | None = None,
     ) -> RuntimeOperationResult:
-        images = await self._attachment_images(session_id, attachments)
+        images, notes = await self._prepare_attachments(session_id, attachments)
         live = await self._ensure_live(session_id, external_session_id, cwd)
+        prompt = _prompt_with_attachment_notes(content, notes)
         logger.info(
             "pi turn start session_id=%s client_message_id=%s",
             session_id,
             client_message_id,
         )
         if client_message_id:
-            live.client_messages.append((content, client_message_id))
+            live.client_messages.append((prompt, client_message_id))
             await self._persist_client_bindings(live)
         if selections:
             await self._apply_selections(live, selections)
         behavior = "followUp" if (live.is_streaming or live.is_compacting) else None
-        await live.send_prompt(content, streaming_behavior=behavior, images=images)
+        await live.send_prompt(
+            prompt,
+            streaming_behavior=behavior,
+            images=images,
+        )
         return RuntimeOperationResult(
             result={"sessionId": session_id, "queued": behavior is not None}
         )
@@ -1966,15 +1994,16 @@ class PiRuntime(AgentRuntime):
         attachments: tuple[RuntimeAttachment, ...] = (),
         client_message_id: str | None = None,
     ) -> RuntimeOperationResult:
-        images = await self._attachment_images(session_id, attachments)
+        images, notes = await self._prepare_attachments(session_id, attachments)
         live = await self._ensure_live(session_id, external_session_id, None)
+        prompt = _prompt_with_attachment_notes(content, notes)
         if client_message_id:
-            live.client_messages.append((content, client_message_id))
+            live.client_messages.append((prompt, client_message_id))
             await self._persist_client_bindings(live)
         if live.is_streaming:
-            await live.send_prompt(content, streaming_behavior="steer", images=images)
+            await live.send_prompt(prompt, streaming_behavior="steer", images=images)
             return RuntimeOperationResult(result={"sessionId": session_id, "steered": True})
-        await live.send_prompt(content, images=images)
+        await live.send_prompt(prompt, images=images)
         return RuntimeOperationResult(result={"sessionId": session_id, "steered": False})
 
     async def interrupt_session(
@@ -2426,30 +2455,27 @@ class PiRuntime(AgentRuntime):
             return False
         return True
 
-    async def _attachment_images(
+    async def _prepare_attachments(
         self,
         session_id: str,
         attachments: tuple[RuntimeAttachment, ...],
-    ) -> tuple[Mapping[str, Any], ...]:
-        """Download image attachments and reshape them into Pi RPC image content.
+    ) -> tuple[tuple[Mapping[str, Any], ...], tuple[tuple[str, str], ...]]:
+        """Turn attachments into Pi image content and saved-file notes.
 
         Pi accepts images as base64 ``ImageContent`` entries on ``prompt`` and
-        ``steer`` commands. Non-image attachments are skipped so a mixed
-        selection still delivers the images Pi can consume.
+        ``steer`` commands, so those are passed through and never written to
+        disk. Other attachments are downloaded into the connector's per-session
+        attachment directory and returned as ``(name, absolute path)`` notes so
+        the prompt can point Pi at them. A failing or oversized attachment is
+        skipped on its own and never blocks the rest of the turn.
         """
 
         if not attachments:
-            return ()
+            return (), ()
         images: list[Mapping[str, Any]] = []
+        notes: list[tuple[str, str]] = []
         for attachment in attachments:
             media_type = (attachment.media_type or "").strip().lower()
-            if not media_type.startswith("image/"):
-                logger.warning(
-                    "pi runtime skipped non-image attachment file_id=%s media_type=%s",
-                    attachment.file_id,
-                    attachment.media_type,
-                )
-                continue
             try:
                 downloaded = await self.host.attachment_download(session_id, attachment.file_id)
             except Exception:  # skipped attachments must not block the turn
@@ -2458,15 +2484,37 @@ class PiRuntime(AgentRuntime):
                     attachment.file_id,
                 )
                 continue
-            resolved_media_type = (downloaded.media_type or media_type).strip().lower()
-            images.append(
-                {
-                    "type": "image",
-                    "data": base64.b64encode(downloaded.content).decode("ascii"),
-                    "mimeType": resolved_media_type,
-                }
-            )
-        return tuple(images)
+            if media_type.startswith("image/"):
+                resolved_media_type = (downloaded.media_type or media_type).strip().lower()
+                images.append(
+                    {
+                        "type": "image",
+                        "data": base64.b64encode(downloaded.content).decode("ascii"),
+                        "mimeType": resolved_media_type,
+                    }
+                )
+                continue
+            if len(downloaded.content) > MAX_ATTACHMENT_BYTES:
+                logger.warning(
+                    "pi runtime skipped oversized attachment file_id=%s size=%d",
+                    attachment.file_id,
+                    len(downloaded.content),
+                )
+                continue
+            name = attachment.name or downloaded.name
+            target = attachment_target(session_id, attachment.file_id, name)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(downloaded.content)
+            except OSError:
+                logger.exception(
+                    "pi attachment save failed file_id=%s path=%s",
+                    attachment.file_id,
+                    target,
+                )
+                continue
+            notes.append((name, str(target)))
+        return tuple(images), tuple(notes)
 
     async def _apply_selections(
         self,
