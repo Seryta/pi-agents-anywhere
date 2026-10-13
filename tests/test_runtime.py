@@ -347,6 +347,38 @@ async def test_ensure_started_tolerates_get_state_timeout(
         await live.stop()
 
 
+async def test_superseded_live_exit_does_not_push_idle(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """An exited process must not overwrite the state of its replacement.
+
+    Reclaim pops the live entry before stopping the process; if the user
+    sends a new message right away, the replacement already pushed running
+    and the old process's exit callback must not push idle over it.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    old = PiLiveSession(runtime, "sess-superseded", cwd=str(tmp_path))
+    pending = PendingInteraction({"id": "ui-old", "method": "confirm", "title": "t"})
+    old.pending_ui[pending.request_id] = pending
+    replacement = PiLiveSession(runtime, "sess-superseded", cwd=str(tmp_path))
+    runtime._live["sess-superseded"] = replacement
+
+    await runtime.handle_live_exit(old, 0)
+
+    # The dead process's dialog can never be answered, so its notice still
+    # closes; only the stale idle state push is skipped.
+    assert [notice.status for notice in fake_host.notices] == ["resolved"]
+    assert fake_host.states == []
+
+    # A live session that is still current keeps the original behaviour.
+    await runtime.handle_live_exit(replacement, 0)
+    assert len(fake_host.states) == 1
+    assert fake_host.states[0]["status"] == "idle"
+
+
 async def test_model_catalog_and_selections(
     fake_pi: Path,
     tmp_path: Path,

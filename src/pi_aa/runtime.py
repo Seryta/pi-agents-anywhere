@@ -1439,6 +1439,13 @@ class PiRuntime(AgentRuntime):
         for pending in list(live.pending_ui.values()):
             await self.host.notice_upsert(pending.as_notice(live.platform_id, status="resolved"))
         live.pending_ui.clear()
+        if self._live.get(live.platform_id) is not live:
+            # The session was reclaimed or replaced while this process was
+            # shutting down; a new live may already have pushed "running", and
+            # an idle update from this dead process would overwrite it until
+            # that session's next state push.
+            logger.info("ignoring exit state for superseded pi session %s", live.platform_id)
+            return
         try:
             await self.host.session_state_update(
                 session_id=live.platform_id,
