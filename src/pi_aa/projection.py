@@ -102,7 +102,7 @@ def tool_content(name: str, arguments: Any) -> dict[str, Any]:
     return content
 
 
-def _tool_exit_code(details: Any) -> int | None:
+def tool_exit_code(details: Any) -> int | None:
     if isinstance(details, Mapping):
         value = details.get("exitCode")
         if isinstance(value, int) and not isinstance(value, bool):
@@ -357,7 +357,7 @@ class TranscriptProjector:
         completed_content["isError"] = is_error
         if is_error and output:
             completed_content.setdefault("error", output)
-        exit_code = _tool_exit_code(message.get("details"))
+        exit_code = tool_exit_code(message.get("details"))
         if exit_code is not None:
             completed_content["exitCode"] = exit_code
         if completed_content.get("kind") == "file_change":

@@ -1204,6 +1204,248 @@ async def test_interrupt_clears_queue_before_abort(
         await runtime.stop()
 
 
+def _upserts_by_id(host: FakeHost, item_type: str) -> dict[str, list]:
+    grouped: dict[str, list] = {}
+    for item in host.timeline_items:
+        if item.type == item_type:
+            grouped.setdefault(item.id, []).append(item)
+    return grouped
+
+
+async def test_stream_pushes_running_then_done_assistant_text(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deltas must surface a running message that settles on the full reply."""
+
+    monkeypatch.setenv("PI_FAKE_STREAM", "1")
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.start_turn("sess-stream-text", None, "hello")
+        await wait_for(
+            lambda: any(
+                item.type == "message" and item.status == "done"
+                for item in fake_host.timeline_items
+            )
+        )
+    finally:
+        await runtime.stop()
+
+    streamed = [
+        entries
+        for entries in _upserts_by_id(fake_host, "message").values()
+        if entries[-1].content.get("text") == "reply to hello"
+    ]
+    assert streamed, "expected streamed assistant message upserts"
+    entries = streamed[0]
+    assert entries[0].status == "running"
+    assert entries[-1].status == "done"
+    assert all(item.metadata.get("stream") is True for item in entries)
+
+    reasoning = [
+        item
+        for item in fake_host.timeline_items
+        if item.type == "system" and item.content.get("kind") == "reasoning"
+    ]
+    assert reasoning, "expected a streamed reasoning item"
+    assert reasoning[-1].content["text"] == "check the question"
+
+
+async def test_stream_deltas_are_coalesced_into_few_upserts(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A burst of deltas must not turn into an upsert per delta."""
+
+    monkeypatch.setenv("PI_FAKE_STREAM", "1")
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.start_turn("sess-stream-throttle", None, "hello")
+        await wait_for(
+            lambda: any(
+                item.type == "message" and item.status == "done"
+                for item in fake_host.timeline_items
+            )
+        )
+    finally:
+        await runtime.stop()
+
+    # The fake sends 3 text deltas and 2 thinking deltas = 5 streaming events;
+    # the text item must cost far fewer upserts than that.
+    counts: dict[str, int] = {}
+    for item in fake_host.timeline_items:
+        if item.type == "message" and item.metadata.get("stream") is True:
+            counts[item.id] = counts.get(item.id, 0) + 1
+    assert counts, "expected streamed upserts"
+    assert max(counts.values()) <= 4
+    assert sum(counts.values()) < 5
+
+
+async def test_tool_execution_upserts_running_and_terminal_cards(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tool cards stream partial output and settle with exit code and diffs."""
+
+    monkeypatch.setenv("PI_FAKE_STREAM", "1")
+    monkeypatch.setenv("PI_FAKE_TOOLS", "1")
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.start_turn("sess-stream-tools", None, "run tools")
+        await wait_for(
+            lambda: any(
+                item.type == "tool"
+                and item.content.get("callId") == "call-edit"
+                and item.status == "done"
+                for item in fake_host.timeline_items
+            )
+        )
+    finally:
+        await runtime.stop()
+
+    def tool_items(call_id: str) -> list:
+        return [
+            item
+            for item in fake_host.timeline_items
+            if item.type == "tool" and item.content.get("callId") == call_id
+        ]
+
+    bash = tool_items("call-bash")
+    assert bash, "expected bash tool upserts"
+    assert bash[0].status == "running"
+    assert bash[-1].status == "done"
+    assert any(item.content.get("output") in ("partial output", "final output") for item in bash)
+    assert bash[-1].content["output"] == "final output"
+    assert bash[-1].content["exitCode"] == 0
+
+    edit = tool_items("call-edit")
+    assert edit, "expected edit tool upserts"
+    assert edit[0].status == "running"
+    assert edit[-1].status == "done"
+    assert edit[-1].content["changes"][0]["diff"] == "-old\n+new"
+    assert edit[-1].content["changes"][0]["path"] == "/tmp/example.txt"
+
+
+async def test_tool_execution_update_pushes_partial_output(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """A partial result must reach the platform through the throttled flush."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-tool-partial", cwd=str(tmp_path))
+    runtime._live["sess-tool-partial"] = live
+    try:
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "tool_execution_start",
+                "toolCallId": "call-partial",
+                "toolName": "bash",
+                "args": {"command": "long-running"},
+            },
+        )
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "tool_execution_update",
+                "toolCallId": "call-partial",
+                "toolName": "bash",
+                "args": {"command": "long-running"},
+                "partialResult": {
+                    "content": [{"type": "text", "text": "partial output"}],
+                    "details": {},
+                },
+            },
+        )
+        await wait_for(
+            lambda: any(
+                item.type == "tool"
+                and item.content.get("callId") == "call-partial"
+                and item.content.get("output") == "partial output"
+                for item in fake_host.timeline_items
+            )
+        )
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "tool_execution_end",
+                "toolCallId": "call-partial",
+                "toolName": "bash",
+                "result": {
+                    "content": [{"type": "text", "text": "final output"}],
+                    "details": {"exitCode": 0},
+                },
+                "isError": False,
+            },
+        )
+        terminal = [
+            item
+            for item in fake_host.timeline_items
+            if item.type == "tool" and item.content.get("callId") == "call-partial"
+        ][-1]
+        assert terminal.status == "done"
+        assert terminal.content["output"] == "final output"
+        assert terminal.content["exitCode"] == 0
+    finally:
+        await runtime.stop()
+
+
+async def test_streaming_keeps_full_timeline_sync_on_settle(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    session_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Streamed temp items must still be replaced by the complete projection."""
+
+    monkeypatch.setenv("PI_FAKE_STREAM", "1")
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        await runtime.start_turn("sess-stream-settle", None, "hello")
+        await wait_for(lambda: len(fake_host.timeline_syncs) >= 1)
+        await wait_for(lambda: runtime._live["sess-stream-settle"].status == "idle")
+    finally:
+        await runtime.stop()
+
+    assert fake_host.timeline_syncs[-1]["complete"] is True
+    assert fake_host.timeline_syncs[-1]["items"]
+
+
+async def test_stop_cancels_pending_stream_flush(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """Stopping the runtime must not leak the per-session flush task."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-stream-stop", cwd=str(tmp_path))
+    runtime._live["sess-stream-stop"] = live
+    live.begin_stream_message()
+    live.apply_stream_delta({"type": "text_delta", "contentIndex": 0, "delta": "hello"})
+    assert live.stream_task is not None
+
+    await runtime.stop()
+
+    assert live.stream_task is None or live.stream_task.done()
+
+
 async def test_interrupt_aborts_when_clear_queue_fails(
     fake_pi: Path,
     tmp_path: Path,

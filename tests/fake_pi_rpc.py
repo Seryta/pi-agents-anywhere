@@ -21,6 +21,12 @@ Behaviour is controlled by environment variables:
   ``success: false``.
 - ``PI_FAKE_COMMANDS_FILE``: when set, every received command is appended as
   one JSON line, in arrival order (used to assert command sequences).
+- ``PI_FAKE_STREAM``: when ``1``, the assistant reply streams as several
+  thinking/text deltas with tiny pauses (so the throttled flush can push a
+  running snapshot) before the final ``message_end``.
+- ``PI_FAKE_TOOLS``: when ``1``, a bash execution (start/update/end with
+  ``details.exitCode``) and an edit execution (``details.patch``) are emitted
+  after the streamed reply.
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -37,6 +44,12 @@ VERSION = os.environ.get("PI_FAKE_VERSION", "9.9.9-fake")
 # complete queues, so callers replace these wholesale.
 QUEUE: dict[str, list[str]] = {"steering": [], "followUp": []}
 _BUSY_FIRST_PROMPT = os.environ.get("PI_FAKE_BUSY_FIRST_PROMPT") == "1"
+_STREAM = os.environ.get("PI_FAKE_STREAM") == "1"
+_TOOLS = os.environ.get("PI_FAKE_TOOLS") == "1"
+# Small enough to keep the suite fast, large enough for the runtime's 300ms
+# flush loop to observe the running snapshot before the terminal event.
+_STREAM_PAUSE_SECONDS = 0.05
+_THINKING_TEXT = "check the question"
 
 STATE: dict[str, object] = {
     "model": {
@@ -203,6 +216,78 @@ def issue_ui_if_needed() -> bool:
     return True
 
 
+def _reply_chunks(reply: str) -> list[str]:
+    """Split a reply into three deltas for streaming mode."""
+
+    size = max(1, len(reply) // 3)
+    chunks = [reply[:size], reply[size : 2 * size], reply[2 * size :]]
+    return [chunk for chunk in chunks if chunk]
+
+
+def emit_tool_activity() -> None:
+    """Emit one bash and one edit execution through their full lifecycle."""
+
+    bash_args = {"command": "echo hi"}
+    emit(
+        {
+            "type": "tool_execution_start",
+            "toolCallId": "call-bash",
+            "toolName": "bash",
+            "args": bash_args,
+        }
+    )
+    time.sleep(_STREAM_PAUSE_SECONDS)
+    emit(
+        {
+            "type": "tool_execution_update",
+            "toolCallId": "call-bash",
+            "toolName": "bash",
+            "args": bash_args,
+            "partialResult": {
+                "content": [{"type": "text", "text": "partial output"}],
+                "details": {},
+            },
+        }
+    )
+    time.sleep(_STREAM_PAUSE_SECONDS)
+    emit(
+        {
+            "type": "tool_execution_end",
+            "toolCallId": "call-bash",
+            "toolName": "bash",
+            "result": {
+                "content": [{"type": "text", "text": "final output"}],
+                "details": {"exitCode": 0},
+            },
+            "isError": False,
+            "durationMs": 12,
+        }
+    )
+    edit_args = {"path": "/tmp/example.txt"}
+    emit(
+        {
+            "type": "tool_execution_start",
+            "toolCallId": "call-edit",
+            "toolName": "edit",
+            "args": edit_args,
+        }
+    )
+    time.sleep(_STREAM_PAUSE_SECONDS)
+    emit(
+        {
+            "type": "tool_execution_end",
+            "toolCallId": "call-edit",
+            "toolName": "edit",
+            "result": {
+                "content": [{"type": "text", "text": "File updated"}],
+                "details": {"patch": "-old\n+new", "exitCode": 0},
+            },
+            "isError": False,
+            "durationMs": 3,
+        }
+    )
+
+
 def handle_prompt_command(command: dict) -> None:
     """Queue follow-up/steering texts, or run a plain prompt as a turn."""
 
@@ -251,16 +336,81 @@ def handle_prompt(command: dict) -> None:
             "message": {"role": "assistant", "content": [], "stopReason": "pending"},
         }
     )
-    emit(
-        {
-            "type": "message_update",
-            "assistantMessageEvent": {
-                "type": "text_delta",
-                "contentIndex": 0,
-                "delta": reply,
-            },
-        }
-    )
+    if _STREAM:
+        # Text first, then thinking: the first delta must open the text item so
+        # the flush loop can push a running snapshot of it before message_end.
+        emit(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_start", "contentIndex": 0},
+            }
+        )
+        for chunk in _reply_chunks(reply):
+            time.sleep(_STREAM_PAUSE_SECONDS)
+            emit(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_delta",
+                        "contentIndex": 0,
+                        "delta": chunk,
+                    },
+                }
+            )
+        emit(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "text_end",
+                    "contentIndex": 0,
+                    "content": reply,
+                },
+            }
+        )
+        emit(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 1},
+            }
+        )
+        for chunk in _THINKING_TEXT.split(" "):
+            time.sleep(_STREAM_PAUSE_SECONDS)
+            emit(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "thinking_delta",
+                        "contentIndex": 1,
+                        "delta": chunk + " ",
+                    },
+                }
+            )
+        emit(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "thinking_end",
+                    "contentIndex": 1,
+                    "content": _THINKING_TEXT,
+                },
+            }
+        )
+        content_blocks: list[dict] = [
+            {"type": "thinking", "thinking": _THINKING_TEXT},
+            {"type": "text", "text": reply},
+        ]
+    else:
+        emit(
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "contentIndex": 0,
+                    "delta": reply,
+                },
+            }
+        )
+        content_blocks = [{"type": "text", "text": reply}]
     assistant_id = uuid.uuid4().hex[:8]
     append(
         {
@@ -270,7 +420,7 @@ def handle_prompt(command: dict) -> None:
             "timestamp": "2026-01-01T00:00:02.000Z",
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": reply}],
+                "content": content_blocks,
                 "provider": "test",
                 "model": "test-model",
                 "stopReason": "stop",
@@ -298,11 +448,13 @@ def handle_prompt(command: dict) -> None:
             "type": "message_end",
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": reply}],
+                "content": content_blocks,
                 "stopReason": "stop",
             },
         }
     )
+    if _TOOLS:
+        emit_tool_activity()
     emit({"type": "turn_end", "message": {"role": "assistant"}, "toolResults": []})
     busy = first_prompt_stays_busy()
     if not issue_ui_if_needed() and not busy:

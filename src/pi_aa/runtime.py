@@ -15,7 +15,7 @@ import json
 import logging
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ from connector.runtime_protocol import (
     RuntimeModelItem,
     RuntimeOperationResult,
     RuntimePermissionCatalog,
+    RuntimeTimelineItem,
     RuntimeTimelineSnapshot,
     RuntimeUnavailableError,
     SessionMeta,
@@ -50,6 +51,7 @@ from connector.runtime_protocol import (
     SessionState,
 )
 from connector.runtime_protocol.host import RuntimeHostClient
+from connector.runtime_protocol.timeline import TimelineSource, timeline_content_hash
 
 from pi_aa import projection
 from pi_aa.config import normalized_config_values, probe_pi_version
@@ -68,6 +70,11 @@ from pi_aa.sessions import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Assistant output and tool activity are coalesced per live session: one flush
+# loop pushes the current snapshot immediately and then at most once per
+# interval, so a burst of deltas cannot turn into a burst of platform upserts.
+STREAM_FLUSH_INTERVAL_SECONDS = 0.3
 
 # Optimistic sends are reconciled by client message id; the pairs live in the
 # session transcript projection. Keep the most recent ones persisted per
@@ -316,6 +323,32 @@ class PendingInteraction:
         }
 
 
+@dataclass(slots=True)
+class _StreamMessage:
+    """Buffers for the assistant message currently being streamed."""
+
+    index: int
+    text: dict[int, str] = field(default_factory=dict)
+    thinking: dict[int, str] = field(default_factory=dict)
+
+    def text_value(self) -> str:
+        return "\n\n".join(self.text[key] for key in sorted(self.text))
+
+    def thinking_value(self) -> str:
+        return "\n\n".join(self.thinking[key] for key in sorted(self.thinking))
+
+
+@dataclass(slots=True)
+class _StreamTool:
+    """Live state of one tool call between start and end."""
+
+    call_id: str
+    name: str
+    content: dict[str, Any]
+    output: str = ""
+    status: str = "running"
+
+
 class PiLiveSession:
     """A platform session backed by one running Pi RPC process."""
 
@@ -351,6 +384,13 @@ class PiLiveSession:
         self.pending_message_count = 0
         # Steering/follow-up texts pi returned from the last ``clear_queue``.
         self.cleared_queue: dict[str, list[str]] | None = None
+        # Streaming assistant/tool state. ``stream_task`` is the single flush
+        # loop per session; deltas themselves never upsert an item.
+        self.stream_index = 0
+        self.stream_message: _StreamMessage | None = None
+        self.stream_tools: dict[str, _StreamTool] = {}
+        self.stream_task: asyncio.Task[None] | None = None
+        self.stream_dirty = False
         self.last_activity = time.monotonic()
         self._start_lock = asyncio.Lock()
         self.last_state_key: tuple[Any, ...] | None = None
@@ -462,6 +502,263 @@ class PiLiveSession:
         if isinstance(pending, int) and not isinstance(pending, bool):
             self.pending_message_count = pending
 
+    # -- streaming projection -----------------------------------------------
+
+    def begin_stream_message(self) -> None:
+        """Start buffering a new assistant message under a fresh stream id."""
+
+        self.stream_index += 1
+        self.stream_message = _StreamMessage(index=self.stream_index)
+
+    def apply_stream_delta(self, event: Mapping[str, Any]) -> None:
+        """Fold one ``assistantMessageEvent`` into the active message buffers.
+
+        Tool call events are ignored here: ``tool_execution_*`` owns tool
+        cards, and creating them from both sources would duplicate them.
+        """
+
+        event_type = event.get("type")
+        if event_type not in ("text_delta", "text_end", "thinking_delta", "thinking_end"):
+            return
+        message = self.stream_message
+        if message is None:
+            self.begin_stream_message()
+            message = self.stream_message
+        assert message is not None
+        index = event.get("contentIndex")
+        content_index = index if isinstance(index, int) and not isinstance(index, bool) else 0
+        buffer = message.thinking if event_type.startswith("thinking") else message.text
+        if event_type.endswith("_delta"):
+            delta = event.get("delta")
+            if not isinstance(delta, str) or not delta:
+                return
+            buffer[content_index] = buffer.get(content_index, "") + delta
+        else:
+            content = event.get("content")
+            if isinstance(content, str):
+                buffer[content_index] = content
+        self.notify_stream_change()
+
+    async def finish_stream_message(self, message: Mapping[str, Any]) -> None:
+        """Rebuild the message from its final content and push it immediately."""
+
+        stream = self.stream_message
+        if stream is None:
+            self.begin_stream_message()
+            stream = self.stream_message
+        assert stream is not None
+        text: dict[int, str] = {}
+        thinking: dict[int, str] = {}
+        blocks = message.get("content")
+        if isinstance(blocks, list):
+            for block in blocks:
+                if not isinstance(block, Mapping):
+                    continue
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    text[len(text)] = block["text"]
+                elif block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
+                    thinking[len(thinking)] = block["thinking"]
+        stream.text = text
+        stream.thinking = thinking
+        items = self._stream_message_items(stream, "done")
+        self.stream_message = None
+        await self.cancel_stream_flush()
+        await self.publish_stream_items(items)
+
+    def start_tool_call(self, call_id: str, name: str, arguments: Any) -> None:
+        self._ensure_stream_tool(call_id, name, arguments)
+        self.notify_stream_change()
+
+    def update_tool_call(
+        self,
+        call_id: str,
+        name: str,
+        arguments: Any,
+        partial_result: Any,
+    ) -> None:
+        tool = self._ensure_stream_tool(call_id, name, arguments)
+        content = partial_result.get("content") if isinstance(partial_result, Mapping) else None
+        tool.output = projection.content_text(content)
+        self.notify_stream_change()
+
+    async def finish_tool_call(
+        self,
+        call_id: str,
+        name: str,
+        result: Any,
+        is_error: bool,
+    ) -> None:
+        tool = self.stream_tools.pop(call_id, None)
+        if tool is None:
+            # A result without a recorded start (connector restarted mid-call):
+            # still surface the terminal card instead of dropping the activity.
+            tool = self._make_stream_tool(call_id, name, {})
+        details = result.get("details") if isinstance(result, Mapping) else None
+        output = result.get("content") if isinstance(result, Mapping) else None
+        tool.output = projection.content_text(output)
+        tool.status = "failed" if is_error else "done"
+        exit_code = projection.tool_exit_code(details)
+        if exit_code is not None:
+            tool.content["exitCode"] = exit_code
+        if tool.content.get("kind") == "file_change":
+            changes = projection.tool_result_changes(tool.content, details)
+            if changes is not None:
+                tool.content["changes"] = changes
+        await self.cancel_stream_flush()
+        await self.publish_stream_items([self._stream_tool_item(tool)])
+
+    def clear_stream_state(self) -> None:
+        """Drop temporary stream buffers after the full projection replaced them."""
+
+        self.stream_message = None
+        self.stream_tools.clear()
+
+    def notify_stream_change(self) -> None:
+        """Mark the session dirty and make sure one flush loop is running."""
+
+        self.stream_dirty = True
+        task = self.stream_task
+        if task is None or task.done():
+            self.stream_task = asyncio.create_task(self._flush_stream_loop())
+
+    async def _flush_stream_loop(self) -> None:
+        """Push snapshots immediately, then at most once per interval.
+
+        The loop must wait out the interval before deciding it is done:
+        exiting as soon as nothing is dirty would let the next delta create a
+        fresh task and push immediately, defeating the coalescing exactly
+        when the deltas arrive just slower than one loop iteration.
+        """
+
+        while True:
+            self.stream_dirty = False
+            await self.publish_stream_items()
+            await asyncio.sleep(STREAM_FLUSH_INTERVAL_SECONDS)
+            if not self.stream_dirty:
+                self.stream_task = None
+                return
+
+    async def cancel_stream_flush(self) -> None:
+        """Stop the pending flush loop; the caller pushes terminal items itself."""
+
+        task = self.stream_task
+        self.stream_task = None
+        self.stream_dirty = False
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+
+    async def publish_stream_items(
+        self,
+        terminal: Sequence[RuntimeTimelineItem] = (),
+    ) -> None:
+        """Upsert the current stream snapshot through the host."""
+
+        pending = list(terminal)
+        if self.stream_message is not None:
+            pending.extend(self._stream_message_items(self.stream_message, "running"))
+        pending.extend(self._stream_tool_item(tool) for tool in self.stream_tools.values())
+        for item in pending:
+            try:
+                await self.runtime.host.timeline_item_upsert(item)
+            except Exception:  # a stream push must never kill the event loop
+                logger.exception("failed to upsert pi stream item for %s", self.platform_id)
+
+    @staticmethod
+    def _make_stream_tool(call_id: str, name: str, arguments: Any) -> _StreamTool:
+        content = projection.tool_content(name, arguments)
+        content["callId"] = call_id
+        return _StreamTool(call_id=call_id, name=name, content=content)
+
+    def _ensure_stream_tool(self, call_id: str, name: str, arguments: Any) -> _StreamTool:
+        tool = self.stream_tools.get(call_id)
+        if tool is None:
+            tool = self._make_stream_tool(call_id, name, arguments)
+            self.stream_tools[call_id] = tool
+        return tool
+
+    def _stream_message_items(
+        self,
+        message: _StreamMessage,
+        status: str,
+    ) -> list[RuntimeTimelineItem]:
+        items: list[RuntimeTimelineItem] = []
+        text = message.text_value()
+        if text:
+            items.append(
+                self._stream_item(
+                    item_type="message",
+                    key=f"stream:{message.index}",
+                    status=status,
+                    role="assistant",
+                    content={"kind": "markdown", "format": "markdown", "text": text},
+                )
+            )
+        thinking = message.thinking_value()
+        if thinking:
+            items.append(
+                self._stream_item(
+                    item_type="system",
+                    key=f"stream:{message.index}:thinking",
+                    status=status,
+                    role="assistant",
+                    content={"kind": "reasoning", "text": thinking},
+                )
+            )
+        return items
+
+    def _stream_tool_item(self, tool: _StreamTool) -> RuntimeTimelineItem:
+        content = dict(tool.content)
+        if tool.output:
+            content["output"] = tool.output
+        return self._stream_item(
+            item_type="tool",
+            key=f"stream-tool:{tool.call_id}",
+            status=tool.status,
+            role="assistant",
+            content=content,
+        )
+
+    def _stream_item(
+        self,
+        *,
+        item_type: str,
+        key: str,
+        status: str,
+        role: str,
+        content: Mapping[str, Any],
+    ) -> RuntimeTimelineItem:
+        external = self.external_id or self.platform_id
+        return RuntimeTimelineItem(
+            id=projection.item_id(external, item_type, key),
+            session_id=self.platform_id,
+            type=item_type,
+            status=status,
+            order_seq=0,
+            content_hash=timeline_content_hash(
+                item_type=item_type,  # type: ignore[arg-type]
+                status=status,  # type: ignore[arg-type]
+                role=role,  # type: ignore[arg-type]
+                content=dict(content),
+            ),
+            role=role,
+            content=dict(content),
+            source=TimelineSource(
+                runtime=RUNTIME,
+                external_session_id=external,
+                native_item_id=key,
+                native_item_type="stream",
+            ).to_mapping(),
+            revision=1,
+            metadata={"stream": True},
+        )
+
     async def command(
         self,
         payload: Mapping[str, Any],
@@ -496,6 +793,8 @@ class PiLiveSession:
         await self.command(payload)
 
     async def stop(self) -> None:
+        await self.cancel_stream_flush()
+        self.clear_stream_state()
         process = self.process
         self.process = None
         if process is not None:
@@ -1419,10 +1718,48 @@ class PiRuntime(AgentRuntime):
         if event_type == "extension_ui_request":
             await self._handle_ui_request(live, record)
             return
+        if event_type == "message_start":
+            message = record.get("message")
+            if isinstance(message, Mapping) and message.get("role") == "assistant":
+                live.begin_stream_message()
+            return
+        if event_type == "message_update":
+            # Only text/thinking deltas matter here; tool calls are owned by
+            # the tool_execution_* events.
+            assistant_event = record.get("assistantMessageEvent")
+            if isinstance(assistant_event, Mapping):
+                live.apply_stream_delta(assistant_event)
+            return
         if event_type == "message_end":
             message = record.get("message")
             if isinstance(message, Mapping) and message.get("role") == "assistant":
                 live.message_count += 1
+                await live.finish_stream_message(message)
+            return
+        if event_type == "tool_execution_start":
+            call_id = record.get("toolCallId")
+            name = record.get("toolName")
+            if isinstance(call_id, str) and isinstance(name, str):
+                live.start_tool_call(call_id, name, record.get("args"))
+            return
+        if event_type == "tool_execution_update":
+            call_id = record.get("toolCallId")
+            name = record.get("toolName")
+            if isinstance(call_id, str) and isinstance(name, str):
+                live.update_tool_call(
+                    call_id, name, record.get("args"), record.get("partialResult")
+                )
+            return
+        if event_type == "tool_execution_end":
+            call_id = record.get("toolCallId")
+            name = record.get("toolName")
+            if isinstance(call_id, str) and isinstance(name, str):
+                await live.finish_tool_call(
+                    call_id,
+                    name,
+                    record.get("result"),
+                    record.get("isError") is True,
+                )
             return
         if event_type == "agent_start":
             live.status_reason = None
@@ -1436,6 +1773,10 @@ class PiRuntime(AgentRuntime):
             live.is_streaming = False
             live.is_compacting = False
             live.status_reason = None
+            # The full sync below replaces every temporary stream item; stop
+            # the coalescing loop first so a late push cannot resurrect one.
+            await live.cancel_stream_flush()
+            live.clear_stream_state()
             await self._push_state(live, force=True)
             await self._publish_timeline(live)
             await self._push_meta(live)
@@ -1503,6 +1844,8 @@ class PiRuntime(AgentRuntime):
 
     async def handle_live_exit(self, live: PiLiveSession, code: int | None) -> None:
         logger.info("pi session %s process exited code=%s", live.platform_id, code)
+        await live.cancel_stream_flush()
+        live.clear_stream_state()
         if self._stopping:
             return
         live.is_streaming = False
@@ -1530,6 +1873,9 @@ class PiRuntime(AgentRuntime):
             )
         except Exception:
             logger.exception("failed to publish exit state for %s", live.platform_id)
+        # Best effort: a full projection drops any temporary stream item the
+        # exited process left behind (the session file may not exist yet).
+        await self._publish_timeline(live)
 
     async def _handle_ui_request(self, live: PiLiveSession, record: Mapping[str, Any]) -> None:
         method = record.get("method")
