@@ -215,7 +215,25 @@ class PendingInteraction:
             else []
         )
         timeout = request.get("timeout")
-        self.timeout_ms = timeout if isinstance(timeout, int) else None
+        self.timeout_ms: float | None = (
+            float(timeout)
+            if isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+            else None
+        )
+        # pi auto-resolves a dialog that carries a timeout and emits no event
+        # when it fires (docs/rpc-extension-ui.md), so the runtime records the
+        # deadline itself to clear the pending entry later. A zero timeout
+        # means "no timeout" on the pi side (its ``if (opts?.timeout)``).
+        self.deadline: float | None = (
+            time.monotonic() + self.timeout_ms / 1000.0 if self.timeout_ms else None
+        )
+
+    def expired(self, now: float | None = None) -> bool:
+        """Whether pi has already auto-resolved this dialog on its side."""
+
+        if self.deadline is None:
+            return False
+        return (time.monotonic() if now is None else now) >= self.deadline
 
     @property
     def notice_id(self) -> str:
@@ -337,9 +355,29 @@ class PiLiveSession:
     def alive(self) -> bool:
         return self.process is not None and self.process.alive
 
+    def active_pending_ui(self) -> list[PendingInteraction]:
+        """Open dialogs pi has not auto-resolved yet.
+
+        A timed-out dialog can still sit in ``pending_ui`` until a lifecycle
+        path clears it; reads filter it out here instead of mutating state or
+        pushing notices, so they never report a dialog pi already resolved.
+        """
+
+        now = time.monotonic()
+        return [pending for pending in self.pending_ui.values() if not pending.expired(now)]
+
+    def expire_pending_ui(self, now: float | None = None) -> list[PendingInteraction]:
+        """Remove and return the pending dialogs pi already auto-resolved."""
+
+        now = time.monotonic() if now is None else now
+        expired = [pending for pending in self.pending_ui.values() if pending.expired(now)]
+        for pending in expired:
+            self.pending_ui.pop(pending.request_id, None)
+        return expired
+
     @property
     def status(self) -> str:
-        if any(True for _ in self.pending_ui.values()):
+        if self.active_pending_ui():
             return "waiting_approval"
         if self.is_streaming or self.is_compacting:
             return "running"
@@ -661,6 +699,9 @@ class PiRuntime(AgentRuntime):
             live = self._live.get(session_id)
             if live is None:
                 continue
+            # A timed-out dialog must not pin the process forever; clear it
+            # even when the session is not idle yet so its notice closes.
+            await self._expire_pending_interactions(live)
             if now - live.last_activity < self._idle_timeout:
                 continue
             if live.is_streaming or live.is_compacting or live.pending_ui:
@@ -905,8 +946,9 @@ class PiRuntime(AgentRuntime):
             metadata["piSessionId"] = live.pi_session_id
         if live.session_name:
             metadata["sessionName"] = live.session_name
-        if live.pending_ui:
-            metadata["pendingInteractions"] = len(live.pending_ui)
+        active_pending = live.active_pending_ui()
+        if active_pending:
+            metadata["pendingInteractions"] = len(active_pending)
         return SessionState(
             session_id=live.platform_id,
             external_session_id=live.external_id,
@@ -927,7 +969,7 @@ class PiRuntime(AgentRuntime):
         live = self._live.get(session_id)
         if live is None:
             return ()
-        return tuple(pending.as_notice(session_id) for pending in live.pending_ui.values())
+        return tuple(pending.as_notice(session_id) for pending in live.active_pending_ui())
 
     async def get_runtime_capabilities(self) -> RuntimeCapabilitySet:
         """Runtime-scoped capability facts advertised to the platform.
@@ -1296,6 +1338,10 @@ class PiRuntime(AgentRuntime):
                 message="该交互已失效（会话进程不在运行）。",
             )
         request_id = notice_id.removeprefix("pi-ui-")
+        # The client may have raced pi's own timeout; drop the stale entry
+        # (and close its notice) before looking the requested one up.
+        if await self._expire_pending_interactions(live):
+            await self._push_state(live, force=True)
         pending = live.pending_ui.get(request_id)
         if pending is None:
             return RuntimeOperationResult(
@@ -1332,6 +1378,9 @@ class PiRuntime(AgentRuntime):
             await self._push_state(live)
             return
         if event_type == "agent_settled":
+            # pi applies a dialog's timeout on its own side without notifying
+            # the client, so expire those entries before publishing state.
+            await self._expire_pending_interactions(live)
             live.is_streaming = False
             live.is_compacting = False
             live.status_reason = None
@@ -1432,6 +1481,27 @@ class PiRuntime(AgentRuntime):
             )
             return
         logger.debug("ignoring pi extension UI method %r", method)
+
+    async def _expire_pending_interactions(self, live: PiLiveSession) -> bool:
+        """Close the notices of dialogs pi already auto-resolved.
+
+        pi enforces a dialog request's ``timeout`` itself and emits no event
+        when it fires (docs/rpc-extension-ui.md), so nothing else removes the
+        entry: without this the session stays in ``waiting_approval``, its
+        notice stays open, and the idle reclaim loop can never close the pi
+        process.
+        """
+
+        expired = live.expire_pending_ui()
+        for pending in expired:
+            try:
+                await self.host.notice_upsert(pending.as_notice(live.platform_id, status="expired"))
+            except Exception:  # a failed notice must not block the cleanup
+                logger.exception(
+                    "failed to publish expired interaction session=%s",
+                    live.platform_id,
+                )
+        return bool(expired)
 
     # -- internal helpers ---------------------------------------------------
 

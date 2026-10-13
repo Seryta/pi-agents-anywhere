@@ -17,6 +17,7 @@ from connector.runtime_protocol import (
 from pi_aa.runtime import (
     REANNOUNCE_MIN_INTERVAL_SECONDS,
     PendingInteraction,
+    PiLiveSession,
     PiRuntime,
     platform_session_id,
 )
@@ -216,6 +217,100 @@ def test_pending_interaction_maps_method_to_server_type(method: str, expected: s
         "input_request",
         "unknown",
     }
+
+
+def test_pending_interaction_without_timeout_never_expires() -> None:
+    """Requests without a pi-side timeout keep the old behavior.
+
+    pi only starts its auto-resolve timer for a truthy ``timeout`` (its
+    ``if (opts?.timeout)``), so both an absent field and zero mean the client
+    must still answer and the entry must never expire on its own.
+    """
+
+    absent = PendingInteraction({"id": "req-1", "method": "confirm", "title": "t"})
+    assert absent.timeout_ms is None
+    assert absent.deadline is None
+    assert absent.expired(time.monotonic() + 3600) is False
+    zero = PendingInteraction({"id": "req-2", "method": "input", "title": "t", "timeout": 0})
+    assert zero.deadline is None
+    assert zero.expired(time.monotonic() + 3600) is False
+
+
+async def test_timed_out_ui_request_is_expired_on_settle(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """A dialog pi auto-resolved must not keep the session waiting.
+
+    pi enforces a request's ``timeout`` itself and emits no event when it
+    fires (docs/rpc-extension-ui.md), so the runtime only learns about the
+    resolution by checking the deadline it recorded with the request. Without
+    that, the pending entry, its open notice, and ``waiting_approval`` survive
+    the whole run and the idle reclaim loop can never close the pi process.
+    """
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-timeout", cwd=str(tmp_path))
+    runtime._live["sess-timeout"] = live
+    await runtime.handle_live_event(
+        live,
+        {
+            "type": "extension_ui_request",
+            "id": "ui-timeout-1",
+            "method": "confirm",
+            "title": "Fake dialog",
+            "timeout": 5000,
+        },
+    )
+    pending = live.pending_ui["ui-timeout-1"]
+    assert pending.deadline is not None
+    assert [notice.status for notice in fake_host.notices] == ["open"]
+
+    # Simulate the pi-side timeout without sleeping: the deadline is now past.
+    pending.deadline = time.monotonic() - 0.001
+
+    # Reads must not report a dialog pi already resolved, and must not push.
+    state = await runtime.get_session_state("sess-timeout")
+    assert state is not None and state.status != "waiting_approval"
+    assert await runtime.get_session_notices("sess-timeout") == ()
+    assert [notice.status for notice in fake_host.notices] == ["open"]
+
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+
+    assert live.pending_ui == {}
+    state = await runtime.get_session_state("sess-timeout")
+    assert state is not None and state.status != "waiting_approval"
+    assert [notice.status for notice in fake_host.notices] == ["open", "expired"]
+    expired = fake_host.notices[-1]
+    assert expired.notice_id == pending.notice_id
+    assert expired.response_required is False
+    assert expired.blocking is None
+
+
+async def test_reclaim_clears_timed_out_pending_interaction(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """The reclaim pass expires timed-out dialogs and frees the process."""
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-timeout-reclaim", cwd=str(tmp_path))
+    runtime._live["sess-timeout-reclaim"] = live
+    pending = PendingInteraction(
+        {"id": "ui-timeout-2", "method": "select", "title": "t", "timeout": 5000}
+    )
+    live.pending_ui[pending.request_id] = pending
+    pending.deadline = time.monotonic() - 0.001
+
+    runtime._idle_timeout = 0.05
+    live.last_activity -= 1.0
+    await runtime._reclaim_idle_sessions()
+
+    assert "sess-timeout-reclaim" not in runtime._live
+    assert [notice.status for notice in fake_host.notices] == ["expired"]
+    assert fake_host.notices[0].notice_id == pending.notice_id
 
 
 async def test_model_catalog_and_selections(
