@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -1070,6 +1071,77 @@ async def test_non_builtin_command_still_sends_slash_prompt(
         ]
         prompts = [command for command in commands if command["type"] == "prompt"]
         assert any(command["message"] == "/fix-tests now" for command in prompts)
+    finally:
+        await runtime.stop()
+
+
+async def test_list_commands_maps_pi_names_to_platform_safe_ids(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """Skill and extension names become ids the AA server accepts.
+
+    The server validates ``command`` against ``^[A-Za-z][A-Za-z0-9_-]*$``, so
+    ``skill:pdf-tools`` cannot be used verbatim; the native name stays on the
+    title while the id is a unique, sanitized mapping.
+    """
+
+    long_name = "long:" + "x" * 80
+
+    async def fake_command(_payload):
+        return {
+            "data": {
+                "commands": [
+                    {"name": "skill:pdf-tools", "description": "PDF", "source": "skill"},
+                    {"name": "my.ext", "description": "dotted", "source": "extension"},
+                    {"name": "stats", "description": "shadow builtin", "source": "extension"},
+                    {"name": "2fa", "description": "leading digit", "source": "prompt"},
+                    {"name": "a:b", "description": "first collision", "source": "prompt"},
+                    {"name": "a.b", "description": "second collision", "source": "prompt"},
+                    {"name": long_name, "description": "truncated", "source": "prompt"},
+                ]
+            }
+        }
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        runtime._utility_command = fake_command  # type: ignore[method-assign]
+        commands = await runtime.list_commands("sess-none")
+        ids = [command.id for command in commands]
+        assert ids == [
+            "compact",
+            "name",
+            "stats",
+            "export",
+            "skill-pdf-tools",
+            "my-ext",
+            "stats-2",
+            "cmd-2fa",
+            "a-b",
+            "a-b-2",
+            "long-" + "x" * 59,
+        ]
+        assert len(ids) == len(set(ids))
+        assert all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", command_id) for command_id in ids)
+        assert all(len(command_id) <= 64 for command_id in ids)
+
+        by_id = {command.id: command for command in commands}
+        # Native names survive on the title; metadata stays untouched.
+        assert by_id["skill-pdf-tools"].title == "skill:pdf-tools"
+        assert by_id["skill-pdf-tools"].metadata == {"source": "skill"}
+        assert by_id["my-ext"].title == "my.ext"
+        assert by_id["stats-2"].title == "stats"
+        assert by_id["stats-2"].metadata == {"source": "extension"}
+        assert by_id["cmd-2fa"].title == "2fa"
+        assert by_id["a-b"].title == "a:b"
+        assert by_id["a-b-2"].title == "a.b"
+        assert by_id["long-" + "x" * 59].title == long_name
+
+        # A filtered listing keeps the same reserved ids (builtin first).
+        filtered = await runtime.list_commands("sess-none", query="stats")
+        assert [command.id for command in filtered] == ["stats", "stats-2"]
     finally:
         await runtime.stop()
 

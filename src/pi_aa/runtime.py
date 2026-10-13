@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -130,6 +131,41 @@ BUILTIN_COMMANDS: tuple[tuple[str, str], ...] = (
     ("export", "导出会话为 HTML 文件"),
 )
 BUILTIN_COMMAND_NAMES = frozenset(name for name, _ in BUILTIN_COMMANDS)
+
+# The AA server validates ``SessionCommandRequest.command`` against
+# ``^[A-Za-z][A-Za-z0-9_-]*$`` with a 64 character cap, while pi names skills
+# ``skill:<name>`` and disambiguates duplicate extensions with ``:<n>``.
+# Platform command ids are sanitized to that alphabet; the pi-native name stays
+# on the command title and in ``PiRuntime._command_native_names`` for dispatch.
+COMMAND_ID_UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+COMMAND_ID_MAX_LENGTH = 64
+COMMAND_ID_FALLBACK_PREFIX = "cmd-"
+
+
+def _platform_command_id(name: str, taken: set[str]) -> str:
+    """Return a unique, platform-safe command id for a pi command name.
+
+    Unsupported characters become ``-``; a name that would not start with a
+    letter gets the ``cmd-`` prefix; a collision with a builtin or an earlier
+    command gets a numeric suffix. The caller keeps the native name in the
+    command title and in the runtime's id-to-name map.
+    """
+
+    sanitized = COMMAND_ID_UNSAFE_CHARS.sub("-", name)
+    if not sanitized or not sanitized[0].isalpha():
+        sanitized = COMMAND_ID_FALLBACK_PREFIX + sanitized
+    sanitized = sanitized[:COMMAND_ID_MAX_LENGTH]
+    if sanitized not in taken:
+        return sanitized
+    base = sanitized
+    suffix = 2
+    while True:
+        tail = f"-{suffix}"
+        candidate = base[: COMMAND_ID_MAX_LENGTH - len(tail)] + tail
+        if candidate not in taken:
+            return candidate
+        suffix += 1
+
 
 # Fields of pi's per-command ``sourceInfo`` block that are stable metadata for
 # the platform; the rest (if pi ever adds any) is dropped, not forwarded.
@@ -1870,6 +1906,9 @@ class PiRuntime(AgentRuntime):
             else await self._utility_command({"type": "get_commands"})
         )
         needle = query.lower() if query else None
+        # Every builtin id stays reserved even when the needle filters the
+        # command out, so a colliding pi command keeps one id across listings.
+        taken = set(BUILTIN_COMMAND_NAMES)
         commands: list[RuntimeCommand] = [
             RuntimeCommand(
                 id=name,
@@ -1889,13 +1928,15 @@ class PiRuntime(AgentRuntime):
                 continue
             if needle and needle not in name.lower():
                 continue
+            command_id = _platform_command_id(name, taken)
+            taken.add(command_id)
             metadata: dict[str, Any] = {"source": raw.get("source")}
             source_info = _command_source_info(raw)
             if source_info is not None:
                 metadata["sourceInfo"] = source_info
             commands.append(
                 RuntimeCommand(
-                    id=name,
+                    id=command_id,
                     title=name,
                     description=raw.get("description")
                     if isinstance(raw.get("description"), str)
