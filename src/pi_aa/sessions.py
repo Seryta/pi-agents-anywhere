@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -105,37 +106,13 @@ def iter_session_lines(path: Path):
         logger.warning("cannot read pi session %s: %s", path, exc)
 
 
-def summarize_session(path: Path) -> PiSessionSummary | None:
-    """Read the header, display name, and first user message of one file."""
-
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
-    if stat.st_size > MAX_SESSION_FILE_BYTES:
-        logger.warning("skipping oversized pi session file %s", path)
-        return None
-
-    header: Mapping[str, Any] | None = None
-    title: str | None = None
-    first_user_text: str | None = None
-    for record in iter_session_lines(path):
-        if header is None:
-            if record.get("type") != "session":
-                return None
-            header = record
-            continue
-        if record.get("type") == "session_info":
-            name = record.get("name")
-            if is_meaningful_title(name):
-                title = name.strip()
-        elif first_user_text is None and record.get("type") == "message":
-            message = record.get("message")
-            if isinstance(message, Mapping) and message.get("role") == "user":
-                first_user_text = _extract_text(message.get("content"))
-
-    if header is None:
-        return None
+def _build_summary(
+    path: Path,
+    stat: os.stat_result,
+    header: Mapping[str, Any],
+    title: str | None,
+    first_user_text: str | None,
+) -> PiSessionSummary:
     session_id = header.get("id")
     if not isinstance(session_id, str) or not session_id:
         session_id = path.stem
@@ -154,6 +131,54 @@ def summarize_session(path: Path) -> PiSessionSummary | None:
         parent_session=parent if isinstance(parent, str) else None,
         size=stat.st_size,
     )
+
+
+def _read_session_file(
+    path: Path,
+    *,
+    collect_entries: bool,
+) -> tuple[PiSessionSummary | None, Mapping[str, Any] | None, list[Mapping[str, Any]]]:
+    """Read a session file in one pass: summary metadata and (optionally) entries."""
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return None, None, []
+    if stat.st_size > MAX_SESSION_FILE_BYTES:
+        logger.warning("skipping oversized pi session file %s", path)
+        return None, None, []
+
+    header: Mapping[str, Any] | None = None
+    title: str | None = None
+    first_user_text: str | None = None
+    entries: list[Mapping[str, Any]] = []
+    for record in iter_session_lines(path):
+        if header is None:
+            if record.get("type") != "session":
+                return None, None, []
+            header = record
+            continue
+        if record.get("type") == "session_info":
+            name = record.get("name")
+            if is_meaningful_title(name):
+                title = name.strip()
+        elif first_user_text is None and record.get("type") == "message":
+            message = record.get("message")
+            if isinstance(message, Mapping) and message.get("role") == "user":
+                first_user_text = _extract_text(message.get("content"))
+        if collect_entries:
+            entries.append(record)
+
+    if header is None:
+        return None, None, []
+    return _build_summary(path, stat, header, title, first_user_text), header, entries
+
+
+def summarize_session(path: Path) -> PiSessionSummary | None:
+    """Read the header, display name, and first user message of one file."""
+
+    summary, _, _ = _read_session_file(path, collect_entries=False)
+    return summary
 
 
 class SessionDirectory:
@@ -210,19 +235,10 @@ class SessionDirectory:
 
 
 def load_session_doc(path: Path) -> PiSessionDoc | None:
-    """Parse a session file and return the active branch of its entry tree."""
+    """Parse a session file once and return the active branch of its entry tree."""
 
-    summary = summarize_session(path)
-    if summary is None:
-        return None
-    entries: list[Mapping[str, Any]] = []
-    header: Mapping[str, Any] | None = None
-    for record in iter_session_lines(path):
-        if header is None and record.get("type") == "session":
-            header = record
-            continue
-        entries.append(record)
-    if header is None:
+    summary, header, entries = _read_session_file(path, collect_entries=True)
+    if summary is None or header is None:
         return None
     return PiSessionDoc(
         summary=summary,

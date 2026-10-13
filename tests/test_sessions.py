@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from pi_aa.sessions import SessionDirectory, load_session_doc
 
 
@@ -160,3 +162,53 @@ def test_load_active_branch_follows_parent_links(tmp_path: Path) -> None:
     ids = [entry["id"] for entry in doc.entries]
     # The active branch follows the last entry's parents, not file order of branches.
     assert ids == ["a1", "c1"]
+
+
+def test_title_uses_last_session_info(tmp_path: Path) -> None:
+    """A later rename must win over the first recorded name."""
+
+    session = tmp_path / "sessions" / "a" / "renamed.jsonl"
+    session.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        {"type": "session", "version": 3, "id": "s1", "timestamp": "t", "cwd": "/tmp"},
+        {"type": "session_info", "id": "i1", "parentId": None, "timestamp": "t", "name": "旧名字"},
+        {
+            "type": "message",
+            "id": "u1",
+            "parentId": "i1",
+            "timestamp": "t",
+            "message": {"role": "user", "content": "第一条", "timestamp": 1},
+        },
+        {"type": "session_info", "id": "i2", "parentId": "u1", "timestamp": "t", "name": "新名字"},
+    ]
+    session.write_text("\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n")
+    doc = load_session_doc(session)
+    assert doc is not None
+    assert doc.summary.title == "新名字"
+
+
+def test_load_session_doc_rejects_file_without_header(tmp_path: Path) -> None:
+    session = tmp_path / "sessions" / "a" / "broken.jsonl"
+    session.parent.mkdir(parents=True, exist_ok=True)
+    session.write_text(
+        json.dumps(
+            {
+                "type": "message",
+                "id": "u1",
+                "parentId": None,
+                "timestamp": "t",
+                "message": {"role": "user", "content": "没有头部", "timestamp": 1},
+            }
+        )
+        + "\n"
+    )
+    assert load_session_doc(session) is None
+
+
+def test_load_session_doc_skips_oversized_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = tmp_path / "sessions" / "a" / "big.jsonl"
+    write_session(session)
+    monkeypatch.setattr("pi_aa.sessions.MAX_SESSION_FILE_BYTES", 10)
+    assert load_session_doc(session) is None
