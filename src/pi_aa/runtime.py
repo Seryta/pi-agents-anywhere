@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -31,6 +32,7 @@ from connector.runtime_protocol import (
     CAPABILITY_SESSION_SEND_MESSAGE,
     CAPABILITY_SESSION_STEER,
     AgentRuntime,
+    PreparedSessionTimelineSync,
     RuntimeAttachment,
     RuntimeCapability,
     RuntimeCapabilitySet,
@@ -67,6 +69,7 @@ from pi_aa.rpc import (
     response_data,
 )
 from pi_aa.sessions import (
+    PiSessionDoc,
     PiSessionSummary,
     SessionDirectory,
     is_meaningful_title,
@@ -85,6 +88,18 @@ STREAM_FLUSH_INTERVAL_SECONDS = 0.3
 # session so a connector restart cannot orphan the echo of an in-flight send.
 CLIENT_MESSAGE_BINDINGS_VERSION = 1
 MAX_CLIENT_MESSAGE_BINDINGS_PER_SESSION = 200
+
+# Version of the per-session scanner checkpoint: the fingerprint of the item
+# prefix the platform already holds, so append-only session files sync their
+# new tail instead of re-publishing the whole history every scanner pass.
+TIMELINE_SYNC_CHECKPOINT_VERSION = 2
+
+# The last few projected items are not stable: a turn's message is finalized
+# (status, tool result, usage) only once its following entries land, so the
+# checkpoint hashes only the prefix before this tail and every delta re-pushes
+# the tail. A change deeper than the grace means the file was rewritten and
+# the pass falls back to a full replacement.
+TIMELINE_SYNC_TAIL_GRACE = 8
 
 # The platform may empty or stale its runtime-state caches when the backend
 # restarts (for example the server host rebooting) while this connector keeps
@@ -1121,6 +1136,10 @@ class PiRuntime(AgentRuntime):
         self._stale_reset_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
         self._client_bindings: dict[str, tuple[tuple[str, str], ...]] = {}
+        # Scanner checkpoints from a previous connector process cannot be
+        # trusted: a crash mid-turn leaves stream items the platform still
+        # holds, so the first changed pass after a restart replaces instead.
+        self._boot_id = uuid.uuid4().hex
         self._last_reannounce_at = -REANNOUNCE_MIN_INTERVAL_SECONDS
         self._reannounce_lock = asyncio.Lock()
         self._identity = RuntimeIdentity(
@@ -1545,6 +1564,34 @@ class PiRuntime(AgentRuntime):
                 complete=False,
                 metadata={"reason": "session file unreadable"},
             )
+        truncated = limit is not None and limit > 0
+        items = await self._project_session_items(session_id, doc, limit=limit)
+        self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
+        self._known_paths[session_id] = doc.summary.path
+        return RuntimeTimelineSnapshot(
+            session_id=session_id,
+            external_session_id=doc.summary.path,
+            runtime=RUNTIME,
+            runtime_id=self.config.runtime_id,
+            items=items,
+            # Only a full read is a Runtime-owned snapshot; a truncated tail must
+            # not let the platform replace (and delete) the stored history.
+            complete=not truncated,
+            metadata={
+                "itemCount": len(items),
+                "piSessionId": doc.summary.session_id,
+            },
+        )
+
+    async def _project_session_items(
+        self,
+        session_id: str,
+        doc: PiSessionDoc,
+        *,
+        limit: int | None = None,
+    ) -> tuple[RuntimeTimelineItem, ...]:
+        """Project one parsed session document for a caller."""
+
         live = self._live.get(session_id)
         client_messages = tuple(live.client_messages) if live is not None else ()
         client_messages = _merge_client_message_pairs(
@@ -1569,21 +1616,151 @@ class PiRuntime(AgentRuntime):
         )
         if truncated:
             items = items[-limit:]
-        self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
-        self._known_paths[session_id] = doc.summary.path
-        return RuntimeTimelineSnapshot(
+        return tuple(items)
+
+    # -- scanner sync checkpoint ---------------------------------------------
+
+    def _timeline_checkpoint_key(self, external_session_id: str) -> str:
+        return f"pi/timeline-sync/{self.host.connector_id}/{external_session_id}"
+
+    async def _read_timeline_checkpoint(
+        self,
+        external_session_id: str,
+    ) -> Mapping[str, Any] | None:
+        try:
+            value = await self.host.sync_state_read(
+                self._timeline_checkpoint_key(external_session_id)
+            )
+        except Exception:
+            logger.exception(
+                "failed to read pi timeline checkpoint session=%s",
+                external_session_id,
+            )
+            return None
+        return value if isinstance(value, Mapping) else None
+
+    async def _write_timeline_checkpoint(
+        self,
+        session_id: str,
+        external_session_id: str,
+        items: Sequence[RuntimeTimelineItem],
+    ) -> bool:
+        """Record the synced projection prefix; False lets the caller retry."""
+
+        stable = max(0, len(items) - TIMELINE_SYNC_TAIL_GRACE)
+        try:
+            await self.host.sync_state_write(
+                self._timeline_checkpoint_key(external_session_id),
+                {
+                    "version": TIMELINE_SYNC_CHECKPOINT_VERSION,
+                    "sessionId": session_id,
+                    "boot": self._boot_id,
+                    "count": stable,
+                    "pushed": len(items),
+                    "prefix": _timeline_prefix_hash(items, stable),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "failed to persist pi timeline checkpoint session=%s",
+                external_session_id,
+            )
+            return False
+        return True
+
+    async def prepare_session_timeline_sync(
+        self,
+        session_id: str,
+        external_session_id: str | None = None,
+    ) -> PreparedSessionTimelineSync | None:
+        """Publish one scanner pass incrementally when the file only grew.
+
+        Pi session files are append-only JSONL, so a scanner pass that
+        re-projects a long transcript would otherwise re-publish its whole
+        history on every cycle. The platform replaces stored timelines only
+        for complete snapshots, so the checkpoint below remembers the prefix
+        of the projection the platform already holds and the pass publishes
+        just its new tail with ``complete=False``. Any divergence -- a
+        rewrite, a deletion, or a checkpoint written before this process
+        started -- falls back to the full replacement.
+
+        Live sessions return ``None`` on purpose: their items stream in real
+        time and the settle sync performs the full replacement, so the
+        scanner must not interleave its own delta.
+        """
+
+        if session_id in self._live or not external_session_id:
+            return None
+        path = self._resolve_session_path(session_id, external_session_id)
+        if path is None:
+            return PreparedSessionTimelineSync(snapshot=None)
+        doc = await asyncio.to_thread(load_session_doc, path)
+        if doc is None:
+            return PreparedSessionTimelineSync(snapshot=None)
+        items = await self._project_session_items(session_id, doc)
+
+        async def commit() -> None:
+            if not await self._write_timeline_checkpoint(
+                session_id,
+                doc.summary.path,
+                items,
+            ):
+                return
+            self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
+            self._known_paths[session_id] = doc.summary.path
+
+        checkpoint = _timeline_checkpoint(
+            await self._read_timeline_checkpoint(external_session_id),
             session_id=session_id,
-            external_session_id=doc.summary.path,
-            runtime=RUNTIME,
-            runtime_id=self.config.runtime_id,
-            items=items,
-            # Only a full read is a Runtime-owned snapshot; a truncated tail must
-            # not let the platform replace (and delete) the stored history.
-            complete=not truncated,
-            metadata={
-                "itemCount": len(items),
-                "piSessionId": doc.summary.session_id,
-            },
+            boot_id=self._boot_id,
+        )
+        if checkpoint is not None:
+            stable, pushed, prefix = checkpoint
+            if (
+                stable <= len(items)
+                and _timeline_prefix_hash(items, stable) == prefix
+            ):
+                if len(items) == pushed:
+                    # Nothing new: refresh the checkpoint without publishing.
+                    return PreparedSessionTimelineSync(snapshot=None, commit=commit)
+                if len(items) > pushed:
+                    # Re-push the finalized tail alongside the new items so a
+                    # rewritten tail entry lands on the platform too.
+                    start = max(0, pushed - TIMELINE_SYNC_TAIL_GRACE)
+                    delta = items[start:]
+                    return PreparedSessionTimelineSync(
+                        snapshot=RuntimeTimelineSnapshot(
+                            session_id=session_id,
+                            external_session_id=doc.summary.path,
+                            runtime=RUNTIME,
+                            runtime_id=self.config.runtime_id,
+                            items=delta,
+                            complete=False,
+                            metadata={
+                                "itemCount": len(delta),
+                                "totalItemCount": len(items),
+                                "piSessionId": doc.summary.session_id,
+                                "sync": "delta",
+                            },
+                        ),
+                        commit=commit,
+                    )
+                # Fewer items than the last push: the file was rewritten.
+        return PreparedSessionTimelineSync(
+            snapshot=RuntimeTimelineSnapshot(
+                session_id=session_id,
+                external_session_id=doc.summary.path,
+                runtime=RUNTIME,
+                runtime_id=self.config.runtime_id,
+                items=items,
+                complete=True,
+                metadata={
+                    "itemCount": len(items),
+                    "piSessionId": doc.summary.session_id,
+                    "sync": "replace",
+                },
+            ),
+            commit=commit,
         )
 
     # -- state / notices ----------------------------------------------------
@@ -2935,6 +3112,15 @@ class PiRuntime(AgentRuntime):
             )
         except Exception:
             logger.exception("failed to push pi timeline for %s", live.platform_id)
+            return
+        if snapshot.external_session_id:
+            # The replacement cleared the platform timeline, so the scanner
+            # can extend it incrementally from this projection on.
+            await self._write_timeline_checkpoint(
+                live.platform_id,
+                snapshot.external_session_id,
+                snapshot.items,
+            )
 
     # -- utility process ----------------------------------------------------
 
@@ -2953,6 +3139,44 @@ class PiRuntime(AgentRuntime):
     async def _utility_command(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         process = await self._ensure_utility()
         return await process.request(payload)
+
+
+def _timeline_prefix_hash(items: Sequence[RuntimeTimelineItem], count: int) -> str:
+    """Fingerprint the first ``count`` projected items (id + content)."""
+
+    digest = hashlib.sha256()
+    for item in items[:count]:
+        digest.update(item.id.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(item.content_hash.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _timeline_checkpoint(
+    stored: Mapping[str, Any] | None,
+    *,
+    session_id: str,
+    boot_id: str,
+) -> tuple[int, int, str] | None:
+    """The stored (stable, pushed, prefix) checkpoint from this process."""
+
+    if not isinstance(stored, Mapping):
+        return None
+    if stored.get("version") != TIMELINE_SYNC_CHECKPOINT_VERSION:
+        return None
+    if stored.get("sessionId") != session_id or stored.get("boot") != boot_id:
+        return None
+    count = stored.get("count")
+    pushed = stored.get("pushed")
+    prefix = stored.get("prefix")
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+        return None
+    if not isinstance(pushed, int) or isinstance(pushed, bool) or pushed < count:
+        return None
+    if not isinstance(prefix, str) or not prefix:
+        return None
+    return count, pushed, prefix
 
 
 def _as_list(value: Any) -> list[Any]:

@@ -1442,6 +1442,199 @@ async def test_truncated_snapshot_is_not_complete(
         await runtime.stop()
 
 
+async def test_prepare_session_timeline_sync_publishes_delta_for_appends(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    """Scanner passes publish only the new tail of an append-only session.
+
+    Re-publishing the full projection every cycle is what made long, actively
+    written sessions the heaviest part of the connector's outbound traffic:
+    the platform timeline only grows, so a full replace repeats history. The
+    checkpoint keeps a growing pass incremental and falls back to a
+    replacement whenever the projection diverges.
+    """
+
+    session_file = tmp_path / "sessions" / "--tmp--" / "delta.jsonl"
+    write_messages_session(session_file, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        first = await runtime.prepare_session_timeline_sync("sess-delta", str(session_file))
+        assert first is not None and first.snapshot is not None and first.commit is not None
+        # The first pass has no checkpoint to extend, so it replaces.
+        assert first.snapshot.complete is True
+        baseline = [item.id for item in first.snapshot.items]
+        assert baseline
+        await first.commit()
+
+        # An unchanged file refreshes the checkpoint but publishes nothing.
+        unchanged = await runtime.prepare_session_timeline_sync("sess-delta", str(session_file))
+        assert unchanged is not None
+        assert unchanged.snapshot is None and unchanged.commit is not None
+        await unchanged.commit()
+
+        # Appending entries keeps the old prefix and publishes only the tail.
+        write_messages_session(session_file, 5)
+        appended = await runtime.prepare_session_timeline_sync("sess-delta", str(session_file))
+        assert appended is not None and appended.snapshot is not None
+        assert appended.snapshot.complete is False
+        delta_ids = [item.id for item in appended.snapshot.items]
+        assert delta_ids
+        full = await runtime.get_session_snapshot("sess-delta", str(session_file))
+        assert delta_ids[-1] == full.items[-1].id
+        assert len(delta_ids) < len(full.items)
+        await appended.commit()
+
+        # A rewrite that drops entries cannot be extended incrementally.
+        write_messages_session(session_file, 2)
+        rewritten = await runtime.prepare_session_timeline_sync("sess-delta", str(session_file))
+        assert rewritten is not None and rewritten.snapshot is not None
+        assert rewritten.snapshot.complete is True
+        full = await runtime.get_session_snapshot("sess-delta", str(session_file))
+        assert [item.id for item in rewritten.snapshot.items] == [
+            item.id for item in full.items
+        ]
+    finally:
+        await runtime.stop()
+
+
+async def test_prepare_session_timeline_sync_republishes_a_rewritten_tail(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    """A finalized tail item rides along with the next delta.
+
+    Pi finalizes a turn's last message (status, usage) only after its trailing
+    entries land, so the checkpoint hashes only the stable prefix and every
+    delta re-pushes the short unstable tail. A change deeper in the prefix is
+    a rewrite and still replaces.
+    """
+
+    session_file = tmp_path / "sessions" / "--tmp--" / "tail.jsonl"
+    write_messages_session(session_file, 31)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        first = await runtime.prepare_session_timeline_sync("sess-tail", str(session_file))
+        assert first is not None and first.snapshot is not None and first.commit is not None
+        await first.commit()
+
+        # Edit the last message and append one more entry, as a finishing turn
+        # does: the edit must reach the platform through the next delta.
+        lines = session_file.read_text(encoding="utf-8").splitlines()
+        lines[-1] = lines[-1].replace('"message 30"', '"message 30 edited"')
+        lines.append(
+            json.dumps(
+                {
+                    "type": "message",
+                    "id": "ent00031",
+                    "parentId": "ent00030",
+                    "timestamp": "2026-01-01T00:00:02.000Z",
+                    "message": {
+                        "role": "user",
+                        "content": "message 31",
+                        "timestamp": 1767225602000 + 31,
+                    },
+                }
+            )
+        )
+        session_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        prepared = await runtime.prepare_session_timeline_sync("sess-tail", str(session_file))
+        assert prepared is not None and prepared.snapshot is not None
+        assert prepared.snapshot.complete is False
+        delta_ids = [item.id for item in prepared.snapshot.items]
+        full = await runtime.get_session_snapshot("sess-tail", str(session_file))
+        assert len(delta_ids) < len(full.items)
+        assert delta_ids[-1] == full.items[-1].id
+        edited = next(
+            item.id
+            for item in full.items
+            if item.type == "message" and item.content.get("text") == "message 30 edited"
+        )
+        assert edited in delta_ids
+        await prepared.commit()
+
+        # A change in the stable prefix cannot be extended incrementally.
+        text = session_file.read_text(encoding="utf-8").replace(
+            '"message 5"', '"message 5 edited"'
+        )
+        session_file.write_text(text, encoding="utf-8")
+        rewritten = await runtime.prepare_session_timeline_sync("sess-tail", str(session_file))
+        assert rewritten is not None and rewritten.snapshot is not None
+        assert rewritten.snapshot.complete is True
+    finally:
+        await runtime.stop()
+
+
+async def test_prepare_session_timeline_sync_requires_same_boot(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    """A checkpoint from an earlier process replaces instead of trusting it.
+
+    A connector that crashed mid-turn leaves stream items the platform still
+    holds; the restart cannot know which sessions those were, so the first
+    changed pass replaces instead of extending the stale prefix.
+    """
+
+    session_file = tmp_path / "sessions" / "--tmp--" / "boot.jsonl"
+    write_messages_session(session_file, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        first = await runtime.prepare_session_timeline_sync("sess-boot", str(session_file))
+        assert first is not None and first.snapshot is not None and first.commit is not None
+        await first.commit()
+
+        runtime._boot_id = "another-process"
+        write_messages_session(session_file, 4)
+        restarted = await runtime.prepare_session_timeline_sync("sess-boot", str(session_file))
+        assert restarted is not None and restarted.snapshot is not None
+        assert restarted.snapshot.complete is True
+    finally:
+        await runtime.stop()
+
+
+async def test_prepare_session_timeline_sync_defers_live_sessions(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    """Live sessions keep the realtime + settle path instead of a scan delta."""
+
+    session_file = tmp_path / "sessions" / "--tmp--" / "live.jsonl"
+    write_messages_session(session_file, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        runtime._live["sess-live"] = PiLiveSession(runtime, "sess-live", cwd=str(tmp_path))
+        assert await runtime.prepare_session_timeline_sync("sess-live", str(session_file)) is None
+    finally:
+        await runtime.stop()
+
+
+async def test_settle_replace_seeds_the_scanner_checkpoint(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    """After a settle replacement the scanner extends instead of repeating."""
+
+    session_file = tmp_path / "sessions" / "--tmp--" / "settle.jsonl"
+    write_messages_session(session_file, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        live = PiLiveSession(runtime, "sess-settle", cwd=str(tmp_path))
+        live.session_file = str(session_file)
+        runtime._live["sess-settle"] = live
+        await runtime._publish_timeline(live)
+        assert fake_host.timeline_syncs[-1]["complete"] is True
+
+        runtime._live.pop("sess-settle")
+        write_messages_session(session_file, 4)
+        prepared = await runtime.prepare_session_timeline_sync("sess-settle", str(session_file))
+        assert prepared is not None and prepared.snapshot is not None
+        assert prepared.snapshot.complete is False
+    finally:
+        await runtime.stop()
+
+
 async def test_concurrent_ensure_live_shares_one_session(
     fake_pi: Path,
     tmp_path: Path,
