@@ -655,18 +655,24 @@ class TranscriptProjector:
             native_item_type=native_type,
             client_message_id=client_message_id,
         ).to_mapping()
+        content_hash = timeline_content_hash(
+            item_type=item_type,  # type: ignore[arg-type]
+            status=status,  # type: ignore[arg-type]
+            role=role,  # type: ignore[arg-type]
+            content=dict(content),
+        )
+        if client_message_id is not None:
+            # The server uses contentHash to accept source updates, including
+            # clientMessageId reconciliation. Unbound items retain their hash.
+            payload = {"contentHash": content_hash, "clientMessageId": client_message_id}
+            content_hash = "sha256:" + hashlib.sha256(_canonical_json(payload).encode()).hexdigest()
         return RuntimeTimelineItem(
             id=item_id(self.external_session_id, item_type, key),
             session_id=self.session_id,
             type=item_type,
             status=status,
             order_seq=order_seq,
-            content_hash=timeline_content_hash(
-                item_type=item_type,  # type: ignore[arg-type]
-                status=status,  # type: ignore[arg-type]
-                role=role,  # type: ignore[arg-type]
-                content=dict(content),
-            ),
+            content_hash=content_hash,
             role=role,
             turn_id=turn_id,
             content=dict(content),
