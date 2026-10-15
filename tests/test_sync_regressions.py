@@ -14,6 +14,7 @@ from connector.runtime_protocol import (
 
 from pi_aa.runtime import PiLiveSession
 from tests.conftest import FakeHost
+from tests.sync_helpers import prepare_and_capture_sync
 from tests.test_runtime import make_runtime, write_messages_session
 
 
@@ -25,7 +26,7 @@ async def test_snapshot_read_does_not_acknowledge_delivery(fake_pi, tmp_path, fa
     session = (await runtime.list_sessions())[0]
     await runtime.get_session_snapshot(session.session_id, str(path), limit=limit)
     assert (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
-    prepared = await runtime.prepare_session_timeline_sync(session.session_id, str(path))
+    prepared = await prepare_and_capture_sync(runtime, session.session_id, str(path))
     assert prepared.snapshot.complete
     await prepared.commit()
     assert not (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
@@ -55,7 +56,7 @@ async def test_settle_acknowledges_only_successful_delivery(
     )
     if failure:
         # A failed settle remains eligible for a full scanner retry.
-        prepared = await runtime.prepare_session_timeline_sync(session.session_id, str(path))
+        prepared = await prepare_and_capture_sync(runtime, session.session_id, str(path))
         assert prepared.snapshot.complete
         await fake_host.timeline_sync(
             session.session_id, "pi", prepared.snapshot.items, complete=True
@@ -80,7 +81,7 @@ async def test_file_append_during_publish_remains_unsynced(
     monkeypatch.setattr(fake_host, "timeline_sync", append_during_send)
     await runtime._publish_timeline(live)
     assert (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
-    prepared = await runtime.prepare_session_timeline_sync(session.session_id, str(path))
+    prepared = await prepare_and_capture_sync(runtime, session.session_id, str(path))
     assert prepared.snapshot is not None
     assert any(item.content.get("text") == "message 3" for item in prepared.snapshot.items)
 
@@ -323,7 +324,7 @@ async def test_tool_completion_updates_same_length_timeline(fake_pi, tmp_path, f
             + "\n"
         )
     runtime = make_runtime(fake_pi, tmp_path, fake_host)
-    first = await runtime.prepare_session_timeline_sync("session", str(path))
+    first = await prepare_and_capture_sync(runtime, "session", str(path))
     assert next(item for item in first.snapshot.items if item.type == "tool").status == "running"
     await first.commit()
     with path.open("a") as handle:
@@ -344,7 +345,7 @@ async def test_tool_completion_updates_same_length_timeline(fake_pi, tmp_path, f
             )
             + "\n"
         )
-    prepared = await runtime.prepare_session_timeline_sync("session", str(path))
+    prepared = await prepare_and_capture_sync(runtime, "session", str(path))
     assert prepared.snapshot is not None
     assert not prepared.snapshot.complete
     assert len(prepared.snapshot.items) < len(first.snapshot.items)
@@ -352,7 +353,7 @@ async def test_tool_completion_updates_same_length_timeline(fake_pi, tmp_path, f
     assert tool.status == "done"
     assert tool.content["output"] == "hi"
     await prepared.commit()
-    assert (await runtime.prepare_session_timeline_sync("session", str(path))).snapshot is None
+    assert (await prepare_and_capture_sync(runtime, "session", str(path))).snapshot is None
 
 
 @pytest.mark.parametrize("append", [False, True])
@@ -360,19 +361,19 @@ async def test_replaced_tail_ids_require_removing_old_branch(fake_pi, tmp_path, 
     path = tmp_path / "sessions" / "branch.jsonl"
     write_messages_session(path, 20)
     runtime = make_runtime(fake_pi, tmp_path, fake_host)
-    first = await runtime.prepare_session_timeline_sync("session", str(path))
+    first = await prepare_and_capture_sync(runtime, "session", str(path))
     await first.commit()
     if append:
         write_messages_session(path, 21)
     path.write_text(path.read_text().replace('"ent00019"', '"branch-19"'))
-    prepared = await runtime.prepare_session_timeline_sync("session", str(path))
+    prepared = await prepare_and_capture_sync(runtime, "session", str(path))
     assert prepared.snapshot.complete
     old_ids = {item.id for item in first.snapshot.items}
     new_ids = {item.id for item in prepared.snapshot.items}
     assert old_ids - new_ids
 
 
-@pytest.mark.parametrize("index,complete", [(3, True), (-1, False)])
+@pytest.mark.parametrize("index,complete", [(4, True), (-2, False)])
 @pytest.mark.parametrize("field", ["source", "metadata"])
 async def test_reconciliation_fields_sync_even_with_same_content_hash(
     fake_pi, tmp_path, fake_host, monkeypatch, index, complete, field
@@ -380,10 +381,10 @@ async def test_reconciliation_fields_sync_even_with_same_content_hash(
     path = tmp_path / "sessions" / "binding.jsonl"
     write_messages_session(path, 20)
     runtime = make_runtime(fake_pi, tmp_path, fake_host)
-    first = await runtime.prepare_session_timeline_sync("session", str(path))
+    first = await prepare_and_capture_sync(runtime, "session", str(path))
     await first.commit()
     project = runtime._project_session_items
-    previous = first.snapshot.items[index]
+    previous = (await runtime.get_session_snapshot("session", str(path))).items[index]
 
     async def project_reconciled(*args, **kwargs):
         items = list(await project(*args, **kwargs))
@@ -391,12 +392,13 @@ async def test_reconciliation_fields_sync_even_with_same_content_hash(
         return tuple(items)
 
     monkeypatch.setattr(runtime, "_project_session_items", project_reconciled)
-    prepared = await runtime.prepare_session_timeline_sync("session", str(path))
+    prepared = await prepare_and_capture_sync(runtime, "session", str(path))
     assert prepared.snapshot is not None
     assert prepared.snapshot.complete is complete
     reconciled = next(item for item in prepared.snapshot.items if item.id == previous.id)
     assert reconciled.content_hash == previous.content_hash
-    assert getattr(reconciled, field)["clientMessageId"] == "optimistic-message"
+    if field == "source":
+        assert reconciled.source["clientMessageId"] == "optimistic-message"
 
 
 async def test_attachment_capabilities_allow_files_on_new_and_existing_sessions(

@@ -1156,6 +1156,7 @@ class PiRuntime(AgentRuntime):
         self.directory = SessionDirectory(self.sessions_dir)
         self._live: dict[str, PiLiveSession] = {}
         self._live_locks: dict[str, asyncio.Lock] = {}
+        self._session_path_locks: dict[str, asyncio.Lock] = {}
         self._known_paths: dict[str, str] = {}
         self._synced: dict[str, tuple[float, int]] = {}
         self._utility: PiRpcProcess | None = None
@@ -1237,6 +1238,7 @@ class PiRuntime(AgentRuntime):
             await live.stop()
         self._live.clear()
         self._live_locks.clear()
+        self._session_path_locks.clear()
         async with self._utility_lock:
             process = self._utility
             self._utility = None
@@ -1719,6 +1721,23 @@ class PiRuntime(AgentRuntime):
         session_id: str,
         external_session_id: str | None = None,
     ) -> PreparedSessionTimelineSync | None:
+        """Order scanner replacement and activation by physical session path."""
+
+        path = self._resolve_session_path(session_id, external_session_id)
+        if path is None:
+            return PreparedSessionTimelineSync(snapshot=None)
+        async with self._session_path_lock(path):
+            live = self._live_for_session_path(session_id, path)
+            if live is not None:
+                async with live.lifecycle_lock:
+                    return await self._prepare_session_timeline_sync(session_id, str(path))
+            return await self._prepare_session_timeline_sync(session_id, str(path))
+
+    async def _prepare_session_timeline_sync(
+        self,
+        session_id: str,
+        external_session_id: str | None = None,
+    ) -> PreparedSessionTimelineSync | None:
         """Publish one scanner pass incrementally when the file only grew.
 
         Pi session files are append-only JSONL, so a scanner pass that
@@ -1739,10 +1758,7 @@ class PiRuntime(AgentRuntime):
             return None
 
         def current_live() -> PiLiveSession | None:
-            return self._live.get(session_id) or next(
-                (live for live in self._live.values() if live.external_id == external_session_id),
-                None,
-            )
+            return self._live_for_session_path(session_id, Path(external_session_id))
 
         live = current_live()
         generation = live.turn_generation if live is not None else None
@@ -1757,28 +1773,18 @@ class PiRuntime(AgentRuntime):
                 )
             )
 
-        if live is not None:
-
-            async def refresh_live_state() -> None:
-                current = current_live()
-                if current is None:
-                    return
-                async with current.lifecycle_lock:
-                    if current_live() is current:
-                        # The connector read state before prepare and can
-                        # publish that stale idle value after a new turn starts.
-                        await self._push_state(current, force=True)
-
-            async with live.lifecycle_lock:
-                if can_sync():
-                    # Keep the replacement ahead of the next agent_start and
-                    # its stream items. Returning it to the connector would
-                    # allow its delayed delivery to delete that new stream.
-                    await self._publish_timeline(live)
-            return PreparedSessionTimelineSync(snapshot=None, commit=refresh_live_state)
+        async def refresh_live_state() -> None:
+            current = current_live()
+            if current is None:
+                return
+            async with current.lifecycle_lock:
+                if current_live() is current:
+                    # A live process can appear after prepare, while the
+                    # connector still holds its pre-read idle state.
+                    await self._push_state(current, force=True)
 
         if not can_sync():
-            return PreparedSessionTimelineSync(snapshot=None)
+            return PreparedSessionTimelineSync(snapshot=None, commit=refresh_live_state)
         path = self._resolve_session_path(session_id, external_session_id)
         if path is None:
             return PreparedSessionTimelineSync(snapshot=None)
@@ -1787,7 +1793,7 @@ class PiRuntime(AgentRuntime):
             return PreparedSessionTimelineSync(snapshot=None)
         items = await self._project_session_items(session_id, doc)
 
-        async def commit() -> None:
+        async def acknowledge() -> None:
             if not can_sync():
                 return
             if not await self._write_timeline_checkpoint(
@@ -1801,6 +1807,11 @@ class PiRuntime(AgentRuntime):
             self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
             self._known_paths[session_id] = doc.summary.path
 
+        async def commit() -> None:
+            async with self._session_path_lock(path):
+                await acknowledge()
+            await refresh_live_state()
+
         checkpoint = _timeline_checkpoint(
             await self._read_timeline_checkpoint(external_session_id),
             session_id=session_id,
@@ -1808,6 +1819,9 @@ class PiRuntime(AgentRuntime):
         )
         if not can_sync():
             return PreparedSessionTimelineSync(snapshot=None)
+        if live is not None:
+            # Failed settle retries must also remove temporary stream ids.
+            checkpoint = None
         if checkpoint is not None:
             stable, pushed, prefix, tail_ids, tail = checkpoint
             same_prefix = pushed <= len(items) and (
@@ -1851,22 +1865,49 @@ class PiRuntime(AgentRuntime):
                     ),
                     commit=commit,
                 )
-        return PreparedSessionTimelineSync(
-            snapshot=RuntimeTimelineSnapshot(
-                session_id=session_id,
-                external_session_id=doc.summary.path,
-                runtime=RUNTIME,
-                runtime_id=self.config.runtime_id,
-                items=items,
-                complete=True,
-                metadata={
-                    "itemCount": len(items),
-                    "piSessionId": doc.summary.session_id,
-                    "sync": "replace",
-                },
-            ),
-            commit=commit,
+        # The host's ordered notification lane puts metadata before timeline
+        # ingestion. A complete snapshot must finish entering that lane before
+        # activation is allowed; lending it to the connector reopens the race.
+        observed_at = _iso_from_epoch(doc.summary.modified_at)
+        wire_items = await asyncio.to_thread(
+            lambda: [
+                _scanner_item_payload(item, observed_at)
+                for item in items
+                if item.type not in {"turn.start", "turn.end"}
+            ]
         )
+        try:
+            await self.host.publish_runtime_notifications(
+                RUNTIME,
+                [
+                    {
+                        "method": "session.meta.upsert",
+                        "params": {
+                            "sessionId": session_id,
+                            "externalSessionId": doc.summary.path,
+                            "title": doc.summary.title,
+                            "cwd": doc.summary.cwd,
+                            "lastActivityAt": observed_at,
+                            "metadata": doc.summary.metadata(),
+                        },
+                    },
+                    {
+                        "method": "timeline.sync",
+                        "params": {
+                            "sessionId": session_id,
+                            "externalSessionId": doc.summary.path,
+                            "items": wire_items,
+                            "complete": True,
+                        },
+                    },
+                ],
+                runtime_id=self.config.runtime_id,
+            )
+        except Exception:
+            logger.exception("failed to push scanner replacement for %s", session_id)
+        else:
+            await acknowledge()
+        return PreparedSessionTimelineSync(snapshot=None, commit=refresh_live_state)
 
     # -- state / notices ----------------------------------------------------
 
@@ -3010,6 +3051,21 @@ class PiRuntime(AgentRuntime):
         external_session_id: str | None,
         cwd: str | None,
     ) -> PiLiveSession:
+        path = self._resolve_session_path(session_id, external_session_id)
+        lock = (
+            self._session_path_lock(path)
+            if path is not None
+            else self._live_lock(f"activation:{session_id}")
+        )
+        async with lock:
+            return await self._ensure_live_locked(session_id, external_session_id, cwd)
+
+    async def _ensure_live_locked(
+        self,
+        session_id: str,
+        external_session_id: str | None,
+        cwd: str | None,
+    ) -> PiLiveSession:
         if external_session_id and not self._within_sessions_root(Path(external_session_id)):
             raise RuntimeInvalidRequestError("session path is outside sessionsDir")
         live = self._live.get(session_id)
@@ -3041,6 +3097,26 @@ class PiRuntime(AgentRuntime):
                     self._live[session_id] = live
         await live.ensure_started()
         return live
+
+    def _session_path_lock(self, path: Path) -> asyncio.Lock:
+        # Canonicalize only the lock key: public session identities retain
+        # their discovered path, including safe symlink aliases.
+        key = str(path.resolve())
+        return self._session_path_locks.setdefault(key, asyncio.Lock())
+
+    def _live_for_session_path(self, session_id: str, path: Path) -> PiLiveSession | None:
+        live = self._live.get(session_id)
+        if live is not None:
+            return live
+        key = path.resolve()
+        return next(
+            (
+                candidate
+                for candidate in self._live.values()
+                if candidate.external_id and Path(candidate.external_id).resolve() == key
+            ),
+            None,
+        )
 
     def _live_lock(self, session_id: str) -> asyncio.Lock:
         lock = self._live_locks.get(session_id)
@@ -3301,6 +3377,41 @@ class PiRuntime(AgentRuntime):
     async def _utility_command(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         process = await self._ensure_utility()
         return await process.request(payload)
+
+
+def _scanner_item_payload(item: RuntimeTimelineItem, observed_at: str) -> dict[str, Any]:
+    """Session-only wire contract used by synchronous runtime batch ingestion."""
+
+    source = item.source
+    payload = {
+        "id": item.id,
+        "sessionId": item.session_id,
+        "type": item.type,
+        "status": item.status,
+        "role": item.role,
+        "content": dict(item.content),
+        "orderSeq": item.order_seq,
+        "revision": item.revision,
+        "contentHash": item.content_hash,
+        "createdAt": observed_at,
+        "updatedAt": observed_at,
+        "source": {
+            key: value
+            for key, value in {
+                "runtime": source.get("runtime"),
+                "runtimeType": source.get("runtimeType"),
+                "runtimeId": source.get("runtimeId"),
+                "sessionId": source.get("sessionId") or source.get("threadId"),
+                "itemId": source.get("itemId") or item.id,
+                "itemType": source.get("itemType") or source.get("rawType"),
+                "event": source.get("event"),
+                "derivedKey": source.get("derivedKey"),
+                "clientMessageId": source.get("clientMessageId"),
+            }.items()
+            if value is not None
+        },
+    }
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def _timeline_prefix_hash(items: Sequence[RuntimeTimelineItem], count: int) -> str:

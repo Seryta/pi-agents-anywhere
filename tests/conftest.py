@@ -18,7 +18,7 @@ AA_SOURCE = Path(
 if AA_SOURCE.is_dir() and str(AA_SOURCE) not in sys.path:
     sys.path.insert(0, str(AA_SOURCE))
 
-from connector.runtime_protocol import RuntimeAttachmentContent
+from connector.runtime_protocol import RuntimeAttachmentContent, RuntimeTimelineItem
 from connector.runtime_protocol.host import RuntimeHostClient
 
 FAKE_PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-image-bytes"
@@ -38,6 +38,7 @@ class FakeHost(RuntimeHostClient):
         self.capability_sets: list[Any] = []
         self.attachment_downloads: list[dict[str, str]] = []
         self.sync_state: dict[str, Any] = {}
+        self.notification_batches: list[Any] = []
 
     @property
     def connector_id(self) -> str:
@@ -101,7 +102,42 @@ class FakeHost(RuntimeHostClient):
     async def publish_runtime_notifications(
         self, runtime: str, notifications: list[dict[str, Any]], runtime_id: str | None = None
     ) -> None:
-        return None
+        self.notification_batches.append((runtime, notifications, runtime_id))
+        for notification in notifications:
+            params = notification["params"]
+            if notification["method"] == "session.meta.upsert":
+                await self.session_meta_upsert(
+                    params["sessionId"],
+                    runtime,
+                    external_session_id=params.get("externalSessionId"),
+                    title=params.get("title"),
+                    cwd=params.get("cwd"),
+                    ordering_time=params.get("lastActivityAt"),
+                    metadata=params.get("metadata"),
+                )
+            elif notification["method"] == "timeline.sync":
+                items = tuple(
+                    RuntimeTimelineItem(
+                        id=item["id"],
+                        session_id=item["sessionId"],
+                        type=item["type"],
+                        status=item["status"],
+                        order_seq=item["orderSeq"],
+                        content_hash=item["contentHash"],
+                        content=item.get("content", {}),
+                        source=item.get("source", {}),
+                        role=item.get("role"),
+                        revision=item.get("revision", 1),
+                    )
+                    for item in params["items"]
+                )
+                await self.timeline_sync(
+                    session_id=params["sessionId"],
+                    runtime=runtime,
+                    items=items,
+                    external_session_id=params.get("externalSessionId"),
+                    complete=params.get("complete", False),
+                )
 
     async def sync_state_read(self, key: str) -> dict[str, Any] | None:
         return self.sync_state.get(key)
