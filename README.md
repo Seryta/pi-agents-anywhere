@@ -208,6 +208,21 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 CI 覆盖 pi 0.87.1 / 1.1.0，并固定 Connector v2.0.3 的提交；仓库变量
 `PI_AA_CONNECTOR_REF` 可覆盖该提交以验证其他版本。基础镜像及系统包仍由上游更新。
 
+长会话响应性可重复验证：先运行
+`docker/run-tests.sh python scripts/benchmark-session.py --doctor` 检查隔离环境和依赖，再运行
+`docker/run-tests.sh python scripts/benchmark-session.py --max-loop-lag-ms 100`。
+脚本用固定 JSONL 输入（默认 12,000 条、每条 4 KiB 文本）和 32 MiB 附件，测量投影、
+文件读取、附件落盘、scanner prepare+commit 的耗时及 1 ms 心跳的最大延迟，向 stdout
+输出 JSON；`ok=false` 时退出码为 1。可用 `--entries`、`--text-bytes`、`--attachment-mib`、
+`--repeats` 调整负载，`--max-loop-lag-ms` 设置门禁。临时文件均在一次性容器内生成，
+不需要 pi 进程、模型凭据或网络。测试镜像包含脚本使用的测试 Host，源码挂载须保留 `tests/`。
+
+一次同镜像实测（3 轮，50,695,864 字节会话）：线程卸载前后，投影最大事件循环延迟
+从 444.822 ms 降至 35.979 ms，scanner prepare+commit 从 1194.930 ms 降至 44.935 ms，
+附件写入从 28.121 ms 降至 0.945 ms。投影总耗时中位数为 432.846 → 584.724 ms，
+scanner 为 1253.065 → 1521.567 ms；优化目标是保持交互响应，调度增加的耗时仍需承担。
+这些数据只代表本机确定性负载，不覆盖真实网络和慢盘；Python GIL、GC 与机器负载仍会影响延迟。
+
 自定义命令以参数形式传递，例如 `docker/run-tests.sh python -m pytest tests/test_cli.py`。
 
 `docker/run-tests.sh` 默认从 `../Agents-Anywhere/connector` 读取官方 Connector 源码，可用

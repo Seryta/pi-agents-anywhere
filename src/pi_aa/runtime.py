@@ -1641,7 +1641,8 @@ class PiRuntime(AgentRuntime):
             len(client_messages),
         )
         truncated = limit is not None and limit > 0
-        items = projection.project_session(
+        items = await asyncio.to_thread(
+            projection.project_session,
             doc.entries,
             session_id=session_id,
             external_session_id=doc.summary.path,
@@ -1685,6 +1686,10 @@ class PiRuntime(AgentRuntime):
 
         stable = max(0, len(items) - TIMELINE_SYNC_TAIL_GRACE)
         try:
+            prefix = await asyncio.to_thread(_timeline_prefix_hash, items, stable)
+            tail = await asyncio.to_thread(
+                _timeline_prefix_hash, items[stable:], len(items) - stable
+            )
             await self.host.sync_state_write(
                 self._timeline_checkpoint_key(external_session_id),
                 {
@@ -1693,9 +1698,9 @@ class PiRuntime(AgentRuntime):
                     "boot": self._boot_id,
                     "count": stable,
                     "pushed": len(items),
-                    "prefix": _timeline_prefix_hash(items, stable),
+                    "prefix": prefix,
                     "tailIds": [item.id for item in items[stable:]],
-                    "tail": _timeline_prefix_hash(items[stable:], len(items) - stable),
+                    "tail": tail,
                 },
             )
         except Exception:
@@ -1786,17 +1791,24 @@ class PiRuntime(AgentRuntime):
             checkpoint = None
         if checkpoint is not None:
             stable, pushed, prefix, tail_ids, tail = checkpoint
+            same_prefix = pushed <= len(items) and (
+                await asyncio.to_thread(_timeline_prefix_hash, items, stable) == prefix
+            )
+            if not can_sync():
+                return PreparedSessionTimelineSync(snapshot=None)
             if (
-                pushed <= len(items)
-                and _timeline_prefix_hash(items, stable) == prefix
+                same_prefix
                 # Upserts cannot remove old branch items. Replacing any
                 # previously published id needs a complete replacement.
                 and tuple(item.id for item in items[stable:pushed]) == tail_ids
             ):
-                if (
-                    len(items) == pushed
-                    and _timeline_prefix_hash(items[stable:], pushed - stable) == tail
-                ):
+                same_tail = len(items) == pushed and (
+                    await asyncio.to_thread(_timeline_prefix_hash, items[stable:], pushed - stable)
+                    == tail
+                )
+                if not can_sync():
+                    return PreparedSessionTimelineSync(snapshot=None)
+                if same_tail:
                     # Nothing new: refresh the checkpoint without publishing.
                     return PreparedSessionTimelineSync(snapshot=None, commit=commit)
                 # Re-push the finalized tail alongside the new items so a
@@ -3111,8 +3123,8 @@ class PiRuntime(AgentRuntime):
             name = attachment.name or downloaded.name or attachment.file_id
             target = attachment_target(session_id, attachment.file_id, name)
             try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(downloaded.content)
+                await asyncio.to_thread(target.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(target.write_bytes, downloaded.content)
             except OSError:
                 logger.exception(
                     "pi attachment save failed file_id=%s path=%s",
