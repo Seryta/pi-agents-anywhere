@@ -511,3 +511,93 @@ async def test_restart_resolves_old_dialog_when_eof_event_drain_is_cancelled(
         if previous is not None:
             await previous.close()
         await runtime.stop()
+
+
+async def test_restart_drops_dead_process_queues_and_retry_reason(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        original_file, original_id = live.session_file, live.pi_session_id
+        live.session_stats = {"tokens": {"total": 42}, "cost": 0.25}
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "queue_update",
+                "steering": ["old steering"],
+                "followUp": ["old followup"],
+            },
+        )
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "auto_retry_start",
+                "errorMessage": "old failure",
+            },
+        )
+        live.cleared_queue = {"steering": ["previous interrupt receipt"], "followUp": []}
+        state = await runtime.get_session_state(live.platform_id)
+        assert state is not None and state.metadata["pendingMessageCount"] == 2
+        assert state.status_reason == "retrying: old failure"
+        previous = live.process
+        assert previous is not None and previous._process is not None
+        previous._process.kill()
+        await previous._process.wait()
+        await live.ensure_started()
+        state = await runtime.get_session_state(live.platform_id)
+        assert state is not None and state.status == "idle"
+        assert state.metadata["pendingMessageCount"] == 0
+        assert state.metadata["pendingSteering"] == []
+        assert state.metadata["pendingFollowUp"] == []
+        assert state.status_reason is None
+        assert "clearedQueue" not in state.metadata
+        assert state.external_session_id == original_file
+        assert state.metadata["piSessionId"] == original_id
+        assert state.metadata["tokens"] == {"total": 42}
+        assert state.metadata["cost"] == 0.25
+    finally:
+        await runtime.stop()
+
+
+@pytest.mark.parametrize("method", ["confirm", "notify"])
+async def test_restart_recovers_when_old_notice_close_fails(
+    method: str,
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        original_file = live.session_file
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "extension_ui_request",
+                "id": "old-notice",
+                "method": method,
+                "title": "Old dialog",
+                "message": "Old toast",
+            },
+        )
+
+        async def failing_notice(notice) -> None:
+            raise OSError("notice endpoint temporarily unavailable")
+
+        monkeypatch.setattr(fake_host, "notice_upsert", failing_notice)
+        previous = live.process
+        assert previous is not None and previous._process is not None
+        previous._process.kill()
+        await previous._process.wait()
+        await live.ensure_started()
+        assert live.alive and live.process is not previous
+        assert not live.pending_ui and not live.open_notifications
+        state = await runtime.get_session_state(live.platform_id)
+        assert state is not None and state.status == "idle"
+        assert state.external_session_id == original_file
+        assert "notice endpoint temporarily unavailable" in caplog.text
+    finally:
+        await runtime.stop()

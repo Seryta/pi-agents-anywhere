@@ -2817,14 +2817,29 @@ class PiRuntime(AgentRuntime):
         # The process that could have produced a cleared-queue receipt is gone;
         # a later state push from a replacement must not replay it.
         live.cleared_queue = None
-        if self._stopping:
-            return
+        # These queues and retry state belong to the exited process. A crash
+        # has no clear_queue acknowledgement, so do not fabricate a receipt.
+        live.steering_queue.clear()
+        live.followup_queue.clear()
+        live.pending_message_count = 0
+        live.status_reason = None
         live.is_streaming = False
         live.is_compacting = False
         live.extension_status.clear()
-        for pending in list(live.pending_ui.values()):
-            await self.host.notice_upsert(pending.as_notice(live.platform_id, status="resolved"))
+        pending_interactions = list(live.pending_ui.values())
         live.pending_ui.clear()
+        if self._stopping:
+            live.open_notifications.clear()
+            return
+        for pending in pending_interactions:
+            try:
+                await self.host.notice_upsert(pending.as_notice(live.platform_id, status="resolved"))
+            except Exception:
+                logger.exception(
+                    "failed to resolve exited interaction session=%s notice=%s",
+                    live.platform_id,
+                    pending.notice_id,
+                )
         await self._resolve_open_notifications(live)
         if self._live.get(live.platform_id) is not live:
             # The session was reclaimed or replaced while this process was
