@@ -84,6 +84,95 @@ async def test_file_append_during_publish_remains_unsynced(
     assert any(item.content.get("text") == "message 3" for item in prepared.snapshot.items)
 
 
+@pytest.mark.parametrize("alias", [False, True])
+async def test_failed_settle_retries_and_acknowledges_idle_live(
+    fake_pi, tmp_path, fake_host, monkeypatch, alias
+):
+    path = tmp_path / "sessions" / "live-retry.jsonl"
+    write_messages_session(path, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    session = (await runtime.list_sessions())[0]
+    live_id = "platform-created-session" if alias else session.session_id
+    previous = await runtime.prepare_session_timeline_sync(session.session_id, str(path))
+    await previous.commit()
+    # A previous successful turn has a checkpoint. The new turn left
+    # temporary stream ids behind, so its failed settle still needs a replace.
+    write_messages_session(path, 4)
+    live = PiLiveSession(runtime, live_id, cwd=str(tmp_path), session_path=str(path))
+    live.stream_settled = True
+    runtime._live[live_id] = live
+
+    async def fail(*args, **kwargs):
+        raise OSError("backend unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fake_host, "timeline_sync", fail)
+        await runtime._publish_timeline(live)
+    prepared = await runtime.prepare_session_timeline_sync(session.session_id, str(path))
+    assert prepared.snapshot is not None and prepared.snapshot.complete
+    await fake_host.timeline_sync(session.session_id, "pi", prepared.snapshot.items, complete=True)
+    await prepared.commit()
+    assert not (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
+
+
+@pytest.mark.parametrize("settle_again", [False, True])
+async def test_scanner_discards_snapshot_if_new_turn_starts_during_projection(
+    fake_pi, tmp_path, fake_host, monkeypatch, settle_again
+):
+    path = tmp_path / "sessions" / "new-turn.jsonl"
+    write_messages_session(path, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "session", cwd=str(tmp_path), session_path=str(path))
+    live.stream_settled = True
+    runtime._live[live.platform_id] = live
+    project = runtime._project_session_items
+
+    async def start_during_projection(*args, **kwargs):
+        items = await project(*args, **kwargs)
+        await runtime.handle_live_event(live, {"type": "agent_start"})
+        if settle_again:
+            live.is_streaming = False
+            live.stream_settled = True
+        return items
+
+    monkeypatch.setattr(runtime, "_project_session_items", start_during_projection)
+    prepared = await runtime.prepare_session_timeline_sync(live.platform_id, str(path))
+    assert prepared is not None and prepared.snapshot is None and prepared.commit is None
+    assert not fake_host.sync_state
+    assert (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
+
+
+async def test_active_live_explicitly_skips_snapshot_fallback(fake_pi, tmp_path, fake_host):
+    path = tmp_path / "sessions" / "active.jsonl"
+    write_messages_session(path, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    session = (await runtime.list_sessions())[0]
+    live = PiLiveSession(
+        runtime, "platform-created-session", cwd=str(tmp_path), session_path=str(path)
+    )
+    live.is_streaming = True
+    runtime._live[live.platform_id] = live
+    prepared = await runtime.prepare_session_timeline_sync(session.session_id, str(path))
+    assert prepared is not None and prepared.snapshot is None and prepared.commit is None
+
+
+async def test_new_turn_before_scanner_commit_does_not_acknowledge_old_generation(
+    fake_pi, tmp_path, fake_host
+):
+    path = tmp_path / "sessions" / "late-commit.jsonl"
+    write_messages_session(path, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "session", cwd=str(tmp_path), session_path=str(path))
+    live.stream_settled = True
+    runtime._live[live.platform_id] = live
+    prepared = await runtime.prepare_session_timeline_sync(live.platform_id, str(path))
+    assert prepared.snapshot.complete
+    await runtime.handle_live_event(live, {"type": "agent_start"})
+    await prepared.commit()
+    assert not fake_host.sync_state
+    assert (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
+
+
 async def test_tool_completion_updates_same_length_timeline(fake_pi, tmp_path, fake_host):
     path = tmp_path / "sessions" / "tool.jsonl"
     write_messages_session(path, 20)

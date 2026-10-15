@@ -605,6 +605,7 @@ class PiLiveSession:
         self.stream_ops_idle = asyncio.Event()
         self.stream_ops_idle.set()
         self.stream_settled = False
+        self.turn_generation = 0
         self.last_activity = time.monotonic()
         self._start_lock = asyncio.Lock()
         self.last_state_key: tuple[Any, ...] | None = None
@@ -1714,13 +1715,35 @@ class PiRuntime(AgentRuntime):
         rewrite, a deletion, or a checkpoint written before this process
         started -- falls back to the full replacement.
 
-        Live sessions return ``None`` on purpose: their items stream in real
-        time and the settle sync performs the full replacement, so the
-        scanner must not interleave its own delta.
+        Active live sessions explicitly skip scanner publication: returning
+        ``None`` would make the connector fall back to a full snapshot. Once
+        settled, scanner publication can retry a failed settle push.
         """
 
-        if session_id in self._live or not external_session_id:
+        if not external_session_id:
             return None
+
+        def current_live() -> PiLiveSession | None:
+            return self._live.get(session_id) or next(
+                (live for live in self._live.values() if live.external_id == external_session_id),
+                None,
+            )
+
+        live = current_live()
+        generation = live.turn_generation if live is not None else None
+
+        def can_sync() -> bool:
+            return current_live() is live and (
+                live is None
+                or (
+                    live.stream_settled
+                    and live.status == "idle"
+                    and live.turn_generation == generation
+                )
+            )
+
+        if not can_sync():
+            return PreparedSessionTimelineSync(snapshot=None)
         path = self._resolve_session_path(session_id, external_session_id)
         if path is None:
             return PreparedSessionTimelineSync(snapshot=None)
@@ -1730,11 +1753,15 @@ class PiRuntime(AgentRuntime):
         items = await self._project_session_items(session_id, doc)
 
         async def commit() -> None:
+            if not can_sync():
+                return
             if not await self._write_timeline_checkpoint(
                 session_id,
                 doc.summary.path,
                 items,
             ):
+                return
+            if not can_sync():
                 return
             self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
             self._known_paths[session_id] = doc.summary.path
@@ -1744,6 +1771,12 @@ class PiRuntime(AgentRuntime):
             session_id=session_id,
             boot_id=self._boot_id,
         )
+        if not can_sync():
+            return PreparedSessionTimelineSync(snapshot=None)
+        if live is not None:
+            # A failed settle may leave temporary streaming ids on the
+            # platform. An incremental retry cannot remove those items.
+            checkpoint = None
         if checkpoint is not None:
             stable, pushed, prefix, tail_ids, tail = checkpoint
             if (
@@ -2668,6 +2701,7 @@ class PiRuntime(AgentRuntime):
             # again.
             live.stream_settled = False
             live.turn_outcome = "completed"
+            live.turn_generation += 1
             live.status_reason = None
             live.is_streaming = True
             await self._push_state(live)

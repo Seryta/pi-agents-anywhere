@@ -1605,7 +1605,8 @@ async def test_prepare_session_timeline_sync_defers_live_sessions(
     await runtime.start()
     try:
         runtime._live["sess-live"] = PiLiveSession(runtime, "sess-live", cwd=str(tmp_path))
-        assert await runtime.prepare_session_timeline_sync("sess-live", str(session_file)) is None
+        prepared = await runtime.prepare_session_timeline_sync("sess-live", str(session_file))
+        assert prepared is not None and prepared.snapshot is None and prepared.commit is None
     finally:
         await runtime.stop()
 
