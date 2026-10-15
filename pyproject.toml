@@ -1,6 +1,6 @@
 [project]
 name = "pi-agents-anywhere"
-version = "0.2.1"
+version = "0.2.2"
 description = "Pi coding agent as an Agents Anywhere runtime (connector adapter)"
 readme = "README.md"
 license = "MIT"

@@ -50,7 +50,7 @@ uv tool install --python 3.12 "git+https://github.com/Seryta/pi-agents-anywhere"
 
 装完 `pi-aa-connector` 在 PATH 里可直接调用（`pipx install pi-agents-anywhere` 等价）。
 
-已通过 `uv tool` 从 PyPI 安装的用户，可升级到最新发布版本（本次为 0.2.1），并重启
+已通过 `uv tool` 从 PyPI 安装的用户，可升级到最新发布版本（本次为 0.2.2），并重启
 Connector 使其生效：
 
 ```bash
@@ -134,7 +134,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `get_session_state` | `get_state` + 进程内存态（运行/空闲/等待交互）+ 队列事实（`pendingMessageCount` / `pendingSteering` / `pendingFollowUp`） |
 | `runtime.attachment` | 从平台下载附件：图片按 base64 `ImageContent` 附加到 `prompt`/`steer`；非图片保存到连接器附件目录（单文件 ≤64 MiB），并把路径写入 prompt 供 pi 读取 |
 | `get_session_snapshot` | 读会话文件 → 时间线投影（edit 结果附 unified diff `changes`，供工作台 diff 面板与文件预览） |
-| 实时推送（`timeline_item_upsert`） | `message_update` 的文本/思考与 `tool_execution_*` 工具状态，按约 300ms 聚合；轮次结束由全量投影替换；扩展写入的 `/btw` 问答条目在会话空闲时立即触发一次全量时间线刷新（流式进行中则随该轮 settle 推送） |
+| 实时推送（`timeline_item_upsert`） | `message_update` 的文本/思考与 `tool_execution_*` 工具状态，按约 300ms 聚合；轮次结束由全量投影替换；扩展写入的 `/btw` 问答条目立即单项推送，不替换正在生成的主任务回复，轮次结束后以相同 ID 合并进完整历史 |
 | `list_model_catalog` | `get_available_models`（独立工具进程） |
 | `list_commands` / `execute_command` | `get_commands`（扩展/模板/skill）；另代理 4 个 TUI 内置命令：`compact` / `name` / `stats` / `export`（connector 直接调用对应 RPC，不走 prompt 文本）；其余命令 = 发送 `/命令`，结果上报 `executionState=accepted`（2.0.3 命令契约）。扩展命令声明 `metadata.ui.allowedStatuses` 含 `running`（pi 对流式中的扩展命令立即派发），所以 `/btw` 这类命令在会话运行中也能执行；模板/skill 与内置代理仍仅空闲可执行 |
 | 会话统计 | `get_session_stats`：每轮 `agent_settled` 后刷新 token/成本/`contextUsage` 进状态元数据；上下文 ≥90% 时发预警 notice，回落自动 resolved |
@@ -181,7 +181,7 @@ curl -fsSL -o ~/.pi/agent/extensions/reload.ts \
 调用（无工具、不进入对话历史）回答关于当前会话的临时问题。会话运行中也能执行
 （pi 对流式中的扩展命令立即派发，不会打断当前任务）。TUI 里答案显示在浮层
 面板；RPC 模式下扩展把问答存成 `pi.btw` 自定义会话条目，Connector 投影为时间线项，
-因此 AA 里也能看到答案。安装方式相同：
+问答完成后立即推送到 AA，无需等待主任务结束或会话文件落盘。安装方式相同：
 
 ```bash
 curl -fsSL -o ~/.pi/agent/extensions/btw.ts \
@@ -190,7 +190,6 @@ curl -fsSL -o ~/.pi/agent/extensions/btw.ts \
 
 ## 已知限制
 
-- **全新会话里的 `/btw` 可能延迟出现在时间线**：pi 对尚无消息的会话文件采用内存缓冲（首条 user/assistant 消息才触发落盘）；此时 `/btw` 写入的自定义条目要等会话文件真正生成后才随全量快照可见。已有对话的会话不受影响。
 - **附件大小上限**：单个附件（含图片）超过 64 MiB 会被跳过（防磁盘滥用），日志有记录。
 - **无权限目录**：pi 没有运行时工具审批概念（工具权限由启动配置决定），因此没有 permission catalog。
 - **流式为消息级聚合**：文本/思考在生成过程中按约 300ms 聚合推送（非逐 token），工具输出同样节流；轮次结束后临时项由会话文件的全量投影替换。
