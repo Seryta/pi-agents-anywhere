@@ -50,6 +50,16 @@ uv tool install --python 3.12 "git+https://github.com/Seryta/pi-agents-anywhere"
 
 装完 `pi-aa-connector` 在 PATH 里可直接调用（`pipx install pi-agents-anywhere` 等价）。
 
+已通过 `uv tool` 从 PyPI 安装的用户，可升级到最新发布版本（本次为 0.2.1），并重启
+Connector 使其生效：
+
+```bash
+uv tool upgrade --reinstall pi-agents-anywhere
+systemctl --user restart pi-aa-connector  # 若采用下方的 systemd user service
+```
+
+版本变更见 [CHANGELOG.md](https://github.com/Seryta/pi-agents-anywhere/blob/main/CHANGELOG.md)。
+
 开发或需要跟随最新源码时，用可编辑安装：
 
 ```bash
@@ -217,7 +227,8 @@ CI 覆盖 pi 0.87.1 / 1.1.0，并固定 Connector v2.0.3 的提交；仓库变�
 `--repeats` 调整负载，`--max-loop-lag-ms` 设置门禁。临时文件均在一次性容器内生成，
 不需要 pi 进程、模型凭据或网络。性能脚本复用 `tests/` 中的测试 Host，运行时须挂载完整源码（含 `tests/`）。
 
-最终集成版本实测（3 轮，50,695,864 字节会话，12,000 条记录，32 MiB 附件）：
+上一轮集成版本实测（本次消息排序修复后未重跑；3 轮，50,695,864 字节会话，
+12,000 条记录，32 MiB 附件）：
 
 | 路径 | 总耗时中位数 | 最大事件循环延迟 |
 | --- | ---: | ---: |
@@ -242,20 +253,21 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 ### 验证状态
 
 本轮验收（2026-10-15）：全部在 Docker 内使用 Python 3.12.13、Node 22.19.0 执行。
-开启无模型凭据的真 pi 集成测试后，四组兼容性矩阵均为 `225 passed, 1 skipped`；
+开启无模型凭据的真 pi 集成测试后，四组兼容性矩阵均为 `239 passed, 1 skipped`；
 唯一跳过项是需显式开启的真实模型付费调用。未开启真 pi 的默认模式本轮未单独重跑。
 
 | 官方 Connector | pi 0.87.1 | pi 1.1.0 |
 | --- | --- | --- |
-| 2.0.0 | 225 passed, 1 skipped | 225 passed, 1 skipped |
-| 2.0.3 | 225 passed, 1 skipped | 225 passed, 1 skipped |
+| 2.0.0 | 239 passed, 1 skipped | 239 passed, 1 skipped |
+| 2.0.3 | 239 passed, 1 skipped | 239 passed, 1 skipped |
 
 `ruff check` 与 `ruff format --check` 均通过，覆盖 `src`、`tests` 和
-`scripts/benchmark-session.py`（26 个文件）。本轮验证包括：
+`scripts/benchmark-session.py`（27 个文件）。本轮验证包括：
 
 - 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→终态收敛（done/cancelled/failed）、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、内置命令代理（compact/name/stats/export）、命令 id 消毒后按 pi 原生名派发、命令 `sourceInfo` 元数据、`/btw` 自定义条目投影与 `entry_appended` 实时推送、会话统计与上下文预警、扩展 `setStatus`/`notify` 生命周期、非图片附件落盘与乐观消息对账、附件目录保留策略、Provider 配置、Runtime 生命周期与交互流程、图片附件转发、CLI 参数解析与错误映射。
-- 回归：会话路径越界拒绝、进程重启恢复与回收、RPC 生命周期顺序、原生中断/失败终态、同步成功确认与失败重试、等长时间线和元数据更新、跨轮同步交付互斥、非图片附件能力声明、事件循环响应性。
-- 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态。
+- 回归：会话路径越界拒绝、进程重启恢复与回收、RPC 生命周期顺序、原生中断/失败终态、同步成功确认与失败重试、等长时间线和元数据更新、跨轮同步交付互斥、非图片附件能力声明、事件循环响应性；用户消息确认先于 agent 回复、确认失败重试、相同文本的队列消息按原生 entry ID 对账，以及队列清除和进程重启后的身份恢复。
+- 真 pi：版本探测、模型目录/命令响应、`pi --mode rpc --session <文件>` 恢复既有会话并读取状态；使用容器内本地确定性假模型供应商，验证真实 pi 的首条用户消息在流式回复之前完成确认，且与最终会话投影使用同一个原生 ID，不需要账号或付费调用。
+- 协议与客户端源码：将实际 pi 事件交给官方 Server 的时间线纯规则、从源码提取的序号分配分支，以及 Web / Desktop 的实际 TypeScript 合并与排序逻辑执行，确认正式用户消息先于新回复且不与乐观消息重复；此项不等同于实际浏览器渲染或服务端数据库端到端验证。
 
 历史验证记录（本轮未重跑）：真实模型调用及完整投影；与自托管 AA Server 2.0.0
 的连接、既有会话批量同步、时间线投影和模型目录上报；PyPI `anywhere-cli` 2.0.3 wheel
@@ -264,4 +276,5 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 未验证（需要环境）：
 
 - AA 各客户端（Web / Desktop / Android / iOS）上的完整渲染验收。
+- 本轮未执行包含实际客户端、Server 数据库和 Redis 的完整端到端流程。
 - Windows 平台；多会话并发压力。
