@@ -142,12 +142,12 @@ def normalized_config_values(raw: Mapping[str, Any]) -> dict[str, Any]:
     sessions_dir = values.get("sessionsDir")
     if not isinstance(sessions_dir, str) or not sessions_dir.strip():
         raise RuntimeInvalidRequestError("sessionsDir must be a non-empty string")
-    values["sessionsDir"] = str(expand_sessions_dir(sessions_dir))
+    values["sessionsDir"] = str(expand_sessions_dir(sessions_dir).absolute())
 
     default_cwd = values.get("defaultCwd")
     if not isinstance(default_cwd, str) or not default_cwd.strip():
         raise RuntimeInvalidRequestError("defaultCwd must be a non-empty string")
-    values["defaultCwd"] = str(Path(default_cwd).expanduser())
+    values["defaultCwd"] = str(Path(default_cwd).expanduser().absolute())
 
     timeout = values.get("requestTimeoutMs")
     if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1_000 <= timeout <= 600_000:

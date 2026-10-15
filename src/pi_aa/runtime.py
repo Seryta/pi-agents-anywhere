@@ -2903,9 +2903,9 @@ class PiRuntime(AgentRuntime):
                 if doc_cwd:
                     workdir = doc_cwd
             elif external_session_id:
-                # Pi also accepts a not-yet-created session file. Resolve it
-                # here so validation and Pi use the same absolute target.
-                session_path = str(Path(external_session_id).resolve())
+                # Keep the same path identity as directory discovery, including
+                # safe symlinks, while avoiding Pi's cwd-relative interpretation.
+                session_path = str(Path(external_session_id).absolute())
             async with self._live_lock(session_id):
                 live = self._live.get(session_id)
                 if live is None:
@@ -2942,7 +2942,7 @@ class PiRuntime(AgentRuntime):
         candidate = Path(cwd).expanduser() if cwd else Path(self.default_cwd).expanduser()
         if not candidate.is_dir():
             raise RuntimeInvalidRequestError(f"working directory does not exist: {candidate}")
-        return str(candidate)
+        return str(candidate.absolute())
 
     def _resolve_session_path(
         self,
@@ -2965,7 +2965,7 @@ class PiRuntime(AgentRuntime):
         for candidate in candidates:
             path = Path(candidate)
             if self._within_sessions_root(path) and path.is_file():
-                return path.resolve()
+                return path.absolute()
         # Fall back to a scan when the platform id is not yet known.
         for summary in self.directory.list_sessions(limit=0):
             if self._within_sessions_root(Path(summary.path)) and (

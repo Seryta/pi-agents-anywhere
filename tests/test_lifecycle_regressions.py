@@ -7,10 +7,12 @@ import shutil
 from pathlib import Path
 
 import pytest
-from connector.runtime_protocol import RuntimeInvalidRequestError
+from connector.runtime_protocol import RuntimeConfig, RuntimeInvalidRequestError
 
+from pi_aa.config import normalized_config_values
+from pi_aa.provider import PiProvider
 from pi_aa.rpc import PiRpcProcess, PiRpcProcessExited
-from pi_aa.runtime import PiLiveSession, platform_session_id
+from pi_aa.runtime import PiLiveSession, PiRuntime, platform_session_id
 from tests.conftest import FakeHost
 from tests.test_runtime import make_runtime
 from tests.test_sessions import write_session
@@ -305,3 +307,102 @@ async def test_stop_waits_for_utility_start_and_rejects_new_requests(
         await runtime.stop()
         for child in children:
             await child.close()
+
+
+@pytest.mark.parametrize("symlink_kind", ["root", "inner"])
+@pytest.mark.parametrize(
+    "use_real_pi",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                os.environ.get("PI_AA_TRUE_PI") != "1", reason="requires real pi opt-in"
+            ),
+        ),
+    ],
+)
+async def test_safe_symlinks_preserve_discovery_snapshot_and_resume_identity(
+    symlink_kind: str,
+    use_real_pi: bool,
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # fake_pi prepends its directory to PATH; select the installed real pi.
+    executable = Path("/usr/local/bin/pi") if use_real_pi else fake_pi
+    root = tmp_path / "sessions"
+    if symlink_kind == "root":
+        storage = tmp_path / "storage"
+        storage.mkdir()
+        root.symlink_to(storage, target_is_directory=True)
+        target = root / "history.jsonl"
+    else:
+        storage = root / "storage"
+        storage.mkdir(parents=True)
+        original = storage / "history.jsonl"
+        write_session(original, cwd=str(tmp_path))
+        target = root / "alias.jsonl"
+        target.symlink_to(original)
+    if symlink_kind == "root":
+        write_session(target, cwd=str(tmp_path))
+    monkeypatch.setenv("PI_FAKE_SESSION_FILE", str(target))
+    runtime = make_runtime(executable, tmp_path, fake_host)
+    try:
+        inventory = await runtime.list_sessions()
+        session = next(item for item in inventory if item.external_session_id == str(target))
+        snapshot = await runtime.get_session_snapshot(
+            session.session_id, session.external_session_id
+        )
+        assert snapshot.complete
+        assert snapshot.external_session_id == session.external_session_id
+        live = await runtime._ensure_live(session.session_id, session.external_session_id, None)
+        assert live.external_id == session.external_session_id
+        assert live.process is not None
+        assert live.process.argv[-2:] == ["--session", session.external_session_id]
+        assert (
+            platform_session_id(fake_host.session_namespace, live.external_id) == session.session_id
+        )
+    finally:
+        await runtime.stop()
+
+
+async def test_relative_config_uses_connector_paths_for_discovery_and_pi(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    target = tmp_path / "sessions" / "history.jsonl"
+    write_session(target, cwd=str(project))
+    monkeypatch.setenv("PI_FAKE_SESSION_FILE", str(target))
+    config = RuntimeConfig(
+        runtime="pi",
+        revision=1,
+        values={
+            "executablePath": str(fake_pi),
+            "sessionsDir": "sessions",
+            "defaultCwd": "project",
+        },
+    )
+    values = normalized_config_values(config.values)
+    assert values["sessionsDir"] == str(target.parent)
+    assert values["defaultCwd"] == str(project)
+    provider = PiProvider()
+    assert provider.resource_claims(config)[0].key == provider.session_source_key(config).key
+    runtime = PiRuntime(config, fake_host)
+    try:
+        session = (await runtime.list_sessions())[0]
+        assert session.external_session_id == str(target)
+        snapshot = await runtime.get_session_snapshot(session.session_id, "sessions/history.jsonl")
+        assert snapshot.external_session_id == str(target)
+        live = await runtime._ensure_live(session.session_id, "sessions/history.jsonl", "project")
+        assert live.cwd == str(project)
+        assert live.process is not None
+        argv = live.process.argv
+        assert argv[argv.index("--session-dir") + 1] == str(target.parent)
+        assert argv[-2:] == ["--session", str(target)]
+        assert runtime._resolve_cwd("project") == str(project)
+    finally:
+        await runtime.stop()
