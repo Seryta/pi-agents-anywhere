@@ -167,6 +167,16 @@ curl -fsSL -o ~/.pi/agent/extensions/reload.ts \
 （先提示“正在重载”，重载完成后提示“重载完成”；10 秒内无事件则静默清理标记，
 不会在重启或后续会话里误报）。
 
+`examples/extensions/btw.ts` 是另一个例子：在 pi 继续干活的同时，用一次旁路模型
+调用（无工具、不进入对话历史）回答关于当前会话的临时问题。TUI 里答案显示在浮层
+面板；RPC 模式下扩展把问答存成 `pi.btw` 自定义会话条目，Connector 投影为时间线项，
+因此 AA 里也能看到答案。安装方式相同：
+
+```bash
+curl -fsSL -o ~/.pi/agent/extensions/btw.ts \
+  https://raw.githubusercontent.com/Seryta/pi-agents-anywhere/main/examples/extensions/btw.ts
+```
+
 ## 已知限制
 
 - **全新会话里的 `/btw` 可能延迟出现在时间线**：pi 对尚无消息的会话文件采用内存缓冲（首条 user/assistant 消息才触发落盘）；此时 `/btw` 写入的自定义条目要等会话文件真正生成后才随全量快照可见。已有对话的会话不受影响。
