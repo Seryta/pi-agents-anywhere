@@ -22,6 +22,12 @@ from connector.runtime_protocol.timeline import TimelineSource, timeline_content
 
 RUNTIME = "pi"
 
+# ``pi.appendEntry`` type used by ``examples/extensions/btw.ts`` for headless
+# side-question exchanges. Custom entries stay out of the LLM context; the
+# payload is ``{question, answer}`` or ``{question, error}``. Keep this value
+# in sync with the extension's ``BTW_ENTRY_TYPE``.
+BTW_CUSTOM_TYPE = "pi.btw"
+
 IMAGE_PLACEHOLDER = "[图片暂不支持跨设备预览]"
 
 _TOOL_KINDS: dict[str, str] = {
@@ -196,6 +202,8 @@ class TranscriptProjector:
                     text=summary,
                     kind="notice",
                 )
+        elif entry_type == "custom" and entry.get("customType") == BTW_CUSTOM_TYPE:
+            self._apply_btw_entry(entry)
         elif entry_type == "custom_message":
             content = content_text(entry.get("content"))
             if content and entry.get("display") is not False:
@@ -204,6 +212,30 @@ class TranscriptProjector:
                     text=content,
                     kind="system",
                 )
+
+    def _apply_btw_entry(self, entry: Mapping[str, Any]) -> None:
+        """Project a headless ``/btw`` exchange into the timeline.
+
+        The extension writes the question plus the answer (or the error) via
+        ``pi.appendEntry``; custom entries never enter the LLM context, so the
+        side question stays out of the conversation history.
+        """
+
+        data = entry.get("data")
+        if not isinstance(data, Mapping):
+            return
+        question = _as_text(data.get("question"))
+        if question is None:
+            return
+        answer = _as_text(data.get("answer"))
+        error = _as_text(data.get("error"))
+        if error:
+            text, kind = f"/btw {question}\n\n{error}", "error"
+        elif answer:
+            text, kind = f"/btw {question}\n\n{answer}", "system"
+        else:
+            return
+        self._add_system_text(key=f"{_entry_id(entry) or 'btw'}:btw", text=text, kind=kind)
 
     # -- message level ------------------------------------------------------
 

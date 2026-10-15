@@ -160,6 +160,74 @@ def test_compaction_marker() -> None:
     assert items[0].content["kind"] == "compact"
 
 
+def test_btw_entry_projects_question_and_answer() -> None:
+    """Headless /btw exchanges must show up in the timeline.
+
+    The extension persists them as custom entries (never sent to the LLM);
+    without this projection the answer would stay invisible in the platform.
+    """
+
+    records = [
+        {
+            "type": "custom",
+            "id": "btw1",
+            "parentId": None,
+            "timestamp": "t",
+            "customType": "pi.btw",
+            "data": {
+                "question": "那个配置文件叫什么？",
+                "answer": "~/.pi/agent/settings.json",
+            },
+        }
+    ]
+    items = project_session(records, session_id="s", external_session_id="/tmp/s.jsonl")
+    assert len(items) == 1
+    item = items[0]
+    assert item.type == "system"
+    assert item.status == "done"
+    assert item.content["kind"] == "system"
+    assert item.content["text"] == "/btw 那个配置文件叫什么？\n\n~/.pi/agent/settings.json"
+    assert item.source["itemId"] == "btw1:btw"
+
+
+def test_btw_error_entry_projects_as_error() -> None:
+    """A failed side question is still part of the record, marked as error."""
+
+    records = [
+        {
+            "type": "custom",
+            "id": "btw2",
+            "parentId": None,
+            "timestamp": "t",
+            "customType": "pi.btw",
+            "data": {"question": "2+2?", "error": "No model selected."},
+        }
+    ]
+    items = project_session(records, session_id="s", external_session_id="/tmp/s.jsonl")
+    assert len(items) == 1
+    assert items[0].type == "system"
+    assert items[0].status == "done"
+    assert items[0].content["kind"] == "error"
+    assert items[0].content["text"] == "/btw 2+2?\n\nNo model selected."
+
+
+def test_unrelated_custom_entries_stay_out_of_the_timeline() -> None:
+    """Only the btw entry type is projected; pi's own state entries are not."""
+
+    records = [
+        {
+            "type": "custom",
+            "id": "state1",
+            "parentId": None,
+            "timestamp": "t",
+            "customType": "pi.virtual-model-state",
+            "data": {"provider": "test", "modelId": "test-model"},
+        }
+    ]
+    items = project_session(records, session_id="s", external_session_id="/tmp/s.jsonl")
+    assert items == ()
+
+
 def long_transcript() -> list[dict]:
     """Four turns of user/assistant/tool traffic to slice from many angles."""
 

@@ -2555,6 +2555,85 @@ async def test_live_exit_clears_the_interrupt_queue_receipt(
     assert live.cleared_queue is None
 
 
+async def test_entry_appended_publishes_btw_timeline_when_idle(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """A headless /btw answer must surface as soon as its entry lands.
+
+    The extension persists the exchange through ``pi.appendEntry``, which pi
+    reports as an ``entry_appended`` event. Only the btw custom type is
+    projected, and a streaming run defers to its settle push so the complete
+    replace cannot wipe the run's temporary stream item mid-generation.
+    """
+
+    session_path = tmp_path / "sessions" / "--tmp--" / "btw.jsonl"
+    session_path.parent.mkdir(parents=True)
+    btw_entry = {
+        "type": "custom",
+        "id": "btw1",
+        "parentId": None,
+        "timestamp": "2026-01-01T00:00:00.000Z",
+        "customType": "pi.btw",
+        "data": {"question": "那个配置文件叫什么？", "answer": "settings.json"},
+    }
+    session_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session",
+                        "version": 3,
+                        "id": "sess-btw",
+                        "timestamp": "2026-01-01T00:00:00.000Z",
+                        "cwd": str(tmp_path),
+                    }
+                ),
+                json.dumps(btw_entry),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "sess-btw", cwd=str(tmp_path), session_path=str(session_path))
+    runtime._live["sess-btw"] = live
+    try:
+        # Mid-stream the run owns the timeline; the settle push picks it up.
+        live.is_streaming = True
+        await runtime.handle_live_event(live, {"type": "entry_appended", "entry": btw_entry})
+        assert fake_host.timeline_syncs == []
+
+        # Other custom entries (pi's own state bookkeeping) are not projected.
+        live.is_streaming = False
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "entry_appended",
+                "entry": {
+                    **btw_entry,
+                    "id": "state1",
+                    "customType": "pi.virtual-model-state",
+                },
+            },
+        )
+        assert fake_host.timeline_syncs == []
+
+        await runtime.handle_live_event(live, {"type": "entry_appended", "entry": btw_entry})
+        assert len(fake_host.timeline_syncs) == 1
+        synced = fake_host.timeline_syncs[-1]
+        assert synced["complete"] is True
+        btw_items = [
+            item for item in synced["items"] if item.content.get("text", "").startswith("/btw")
+        ]
+        assert len(btw_items) == 1
+        assert "settings.json" in btw_items[0].content["text"]
+    finally:
+        await runtime.stop()
+
+
 def _upserts_by_id(host: FakeHost, item_type: str) -> dict[str, list]:
     grouped: dict[str, list] = {}
     for item in host.timeline_items:

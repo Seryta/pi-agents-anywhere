@@ -2535,6 +2535,20 @@ class PiRuntime(AgentRuntime):
             live.session_name = name if isinstance(name, str) and name else None
             await self._push_meta(live)
             return
+        if event_type == "entry_appended":
+            entry = record.get("entry")
+            if (
+                isinstance(entry, Mapping)
+                and entry.get("type") == "custom"
+                and entry.get("customType") == projection.BTW_CUSTOM_TYPE
+                and not live.is_streaming
+            ):
+                # A headless /btw answer lands as a custom entry while no turn
+                # owns the timeline, so refresh it now. Mid-stream the settle
+                # push picks the entry up instead: a complete replace now would
+                # wipe the run's temporary stream item.
+                await self._publish_timeline(live)
+            return
         if event_type == "auto_retry_start":
             message = record.get("errorMessage")
             live.status_reason = f"retrying: {message}" if isinstance(message, str) else "retrying"
