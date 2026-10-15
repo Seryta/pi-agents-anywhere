@@ -207,6 +207,19 @@ def _restore_native_command_text(raw: str, command: str, native: str) -> str:
 COMMAND_SOURCE_INFO_KEYS = ("path", "source", "scope", "origin", "baseDir")
 
 
+# AA clients gate command execution on the session's runtime status through
+# ``metadata.ui.allowedStatuses``; without it a command only runs while idle.
+# Pi executes registered extension commands immediately even while the agent
+# is streaming (docs/rpc-commands.md), which is what side-question commands
+# such as /btw rely on. Prompt templates/skills start a turn, and the builtin
+# proxies own their RPC calls, so those stay idle-only.
+def _command_ui(*, allow_running: bool) -> dict[str, Any]:
+    """Build the platform command UI metadata for one command."""
+
+    statuses = ["idle", "running", "error"] if allow_running else ["idle", "error"]
+    return {"kind": "execute", "allowedStatuses": statuses}
+
+
 def _command_source_info(raw: Mapping[str, Any]) -> dict[str, str] | None:
     """Pick the known string fields of a command's ``sourceInfo`` block.
 
@@ -2437,7 +2450,7 @@ class PiRuntime(AgentRuntime):
                 scope="session",
                 # compact/name/export proxy a text argument; stats ignores one.
                 accepts_args=name != "stats",
-                metadata={"source": "pi-builtin"},
+                metadata={"source": "pi-builtin", "ui": _command_ui(allow_running=False)},
             )
             for name, description in BUILTIN_COMMANDS
             if not needle or needle in name.lower()
@@ -2458,7 +2471,10 @@ class PiRuntime(AgentRuntime):
             self._command_native_names[command_id] = name
             if needle and needle not in name.lower():
                 continue
-            metadata: dict[str, Any] = {"source": raw.get("source")}
+            metadata: dict[str, Any] = {
+                "source": raw.get("source"),
+                "ui": _command_ui(allow_running=raw.get("source") == "extension"),
+            }
             source_info = _command_source_info(raw)
             if source_info is not None:
                 metadata["sourceInfo"] = source_info

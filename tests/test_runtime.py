@@ -1129,12 +1129,19 @@ async def test_list_commands_maps_pi_names_to_platform_safe_ids(
         assert all(len(command_id) <= 64 for command_id in ids)
 
         by_id = {command.id: command for command in commands}
-        # Native names survive on the title; metadata stays untouched.
+        # Native names survive on the title; metadata carries the source and
+        # the status gate the platform uses to allow or block a command.
         assert by_id["skill-pdf-tools"].title == "skill:pdf-tools"
-        assert by_id["skill-pdf-tools"].metadata == {"source": "skill"}
+        assert by_id["skill-pdf-tools"].metadata == {
+            "source": "skill",
+            "ui": {"kind": "execute", "allowedStatuses": ["idle", "error"]},
+        }
         assert by_id["my-ext"].title == "my.ext"
         assert by_id["stats-2"].title == "stats"
-        assert by_id["stats-2"].metadata == {"source": "extension"}
+        assert by_id["stats-2"].metadata == {
+            "source": "extension",
+            "ui": {"kind": "execute", "allowedStatuses": ["idle", "running", "error"]},
+        }
         assert by_id["cmd-2fa"].title == "2fa"
         assert by_id["a-b"].title == "a:b"
         assert by_id["a-b-2"].title == "a.b"
@@ -1225,6 +1232,42 @@ async def test_command_catalog_declares_argument_support(
         assert by_id["export"].accepts_args is True
         assert by_id["stats"].accepts_args is False
         assert by_id["skill-pdf-tools"].accepts_args is True
+    finally:
+        await runtime.stop()
+
+
+async def test_command_catalog_allows_extension_commands_while_running(
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+) -> None:
+    """AA clients gate commands by status; extension commands must run busy.
+
+    Pi executes registered extension commands immediately even while the
+    agent is streaming, which is the whole point of side-question commands
+    like /btw. Without ``allowedStatuses`` the client falls back to idle-only
+    and the command is rejected with "agent busy" while a turn runs. Prompt
+    templates/skills and the builtin proxies must stay idle-only.
+    """
+
+    async def fake_command(_payload):
+        return {
+            "data": {
+                "commands": [
+                    {"name": "btw", "description": "side question", "source": "extension"},
+                    {"name": "fix-tests", "description": "prompt", "source": "prompt"},
+                ]
+            }
+        }
+
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    await runtime.start()
+    try:
+        runtime._utility_command = fake_command  # type: ignore[method-assign]
+        by_id = {command.id: command for command in await runtime.list_commands("sess-none")}
+        assert by_id["btw"].metadata["ui"]["allowedStatuses"] == ["idle", "running", "error"]
+        for command_id in ("fix-tests", "compact", "name", "stats", "export"):
+            assert by_id[command_id].metadata["ui"]["allowedStatuses"] == ["idle", "error"]
     finally:
         await runtime.stop()
 

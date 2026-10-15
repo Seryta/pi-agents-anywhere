@@ -136,7 +136,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `get_session_snapshot` | 读会话文件 → 时间线投影（edit 结果附 unified diff `changes`，供工作台 diff 面板与文件预览） |
 | 实时推送（`timeline_item_upsert`） | `message_update` 的文本/思考与 `tool_execution_*` 工具状态，按约 300ms 聚合；轮次结束由全量投影替换；扩展写入的 `/btw` 问答条目在会话空闲时立即触发一次全量时间线刷新（流式进行中则随该轮 settle 推送） |
 | `list_model_catalog` | `get_available_models`（独立工具进程） |
-| `list_commands` / `execute_command` | `get_commands`（扩展/模板/skill）；另代理 4 个 TUI 内置命令：`compact` / `name` / `stats` / `export`（connector 直接调用对应 RPC，不走 prompt 文本）；其余命令 = 发送 `/命令`，结果上报 `executionState=accepted`（2.0.3 命令契约） |
+| `list_commands` / `execute_command` | `get_commands`（扩展/模板/skill）；另代理 4 个 TUI 内置命令：`compact` / `name` / `stats` / `export`（connector 直接调用对应 RPC，不走 prompt 文本）；其余命令 = 发送 `/命令`，结果上报 `executionState=accepted`（2.0.3 命令契约）。扩展命令声明 `metadata.ui.allowedStatuses` 含 `running`（pi 对流式中的扩展命令立即派发），所以 `/btw` 这类命令在会话运行中也能执行；模板/skill 与内置代理仍仅空闲可执行 |
 | 会话统计 | `get_session_stats`：每轮 `agent_settled` 后刷新 token/成本/`contextUsage` 进状态元数据；上下文 ≥90% 时发预警 notice，回落自动 resolved |
 | `get_session_notices` / `respond_interaction` | 扩展 UI 的 `select`/`confirm`/`input`/`editor` → interaction notice；`notify` → notification（轮次结束/进程退出时 resolved）；`setStatus` → 状态元数据 `extensionStatus` |
 | `session_turn_ended` | 收到 `agent_settled` 时上报 |
@@ -178,7 +178,8 @@ curl -fsSL -o ~/.pi/agent/extensions/reload.ts \
 不会在重启或后续会话里误报）。
 
 `examples/extensions/btw.ts` 是另一个例子：在 pi 继续干活的同时，用一次旁路模型
-调用（无工具、不进入对话历史）回答关于当前会话的临时问题。TUI 里答案显示在浮层
+调用（无工具、不进入对话历史）回答关于当前会话的临时问题。会话运行中也能执行
+（pi 对流式中的扩展命令立即派发，不会打断当前任务）。TUI 里答案显示在浮层
 面板；RPC 模式下扩展把问答存成 `pi.btw` 自定义会话条目，Connector 投影为时间线项，
 因此 AA 里也能看到答案。安装方式相同：
 
@@ -253,13 +254,13 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 ### 验证状态
 
 本轮验收（2026-10-15）：全部在 Docker 内使用 Python 3.12.13、Node 22.19.0 执行。
-开启无模型凭据的真 pi 集成测试后，四组兼容性矩阵均为 `239 passed, 1 skipped`；
+开启无模型凭据的真 pi 集成测试后，四组兼容性矩阵均为 `240 passed, 1 skipped`；
 唯一跳过项是需显式开启的真实模型付费调用。未开启真 pi 的默认模式本轮未单独重跑。
 
 | 官方 Connector | pi 0.87.1 | pi 1.1.0 |
 | --- | --- | --- |
-| 2.0.0 | 239 passed, 1 skipped | 239 passed, 1 skipped |
-| 2.0.3 | 239 passed, 1 skipped | 239 passed, 1 skipped |
+| 2.0.0 | 240 passed, 1 skipped | 240 passed, 1 skipped |
+| 2.0.3 | 240 passed, 1 skipped | 240 passed, 1 skipped |
 
 `ruff check` 与 `ruff format --check` 均通过，覆盖 `src`、`tests` 和
 `scripts/benchmark-session.py`（27 个文件）。本轮验证包括：
