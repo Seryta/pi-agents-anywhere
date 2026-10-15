@@ -338,25 +338,35 @@ async function askBtw(question: string, ctx: ExtensionContext, runtime: BtwRunti
  * Headless /btw: no panel to show, so persist the exchange instead. The
  * custom entry never enters the LLM context and the connector projects it
  * into the platform timeline; a failed side question is recorded as an error.
+ * Called fire-and-forget like the TUI path: pi holds the prompt response
+ * until the handler returns, and the command must not stay pending for the
+ * whole model call. Every failure is caught so the detached promise cannot
+ * become an unhandled rejection.
  */
 async function askBtwHeadless(
 	pi: ExtensionAPI,
 	question: string,
 	ctx: ExtensionContext,
 ): Promise<void> {
-	if (!question) {
-		ctx.ui.notify("Usage: /btw <question>", "warning");
-		return;
-	}
-	const item: BtwItem = { question, state: "loading", answer: "" };
 	try {
-		await answerSideQuestion(question, ctx, item, undefined);
+		if (!question) {
+			ctx.ui.notify("Usage: /btw <question>", "warning");
+			return;
+		}
+		const item: BtwItem = { question, state: "loading", answer: "" };
+		try {
+			await answerSideQuestion(question, ctx, item, undefined);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			pi.appendEntry(BTW_ENTRY_TYPE, { question, error: message });
+			return;
+		}
+		pi.appendEntry(BTW_ENTRY_TYPE, { question, answer: item.answer });
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		pi.appendEntry(BTW_ENTRY_TYPE, { question, error: message });
-		return;
+		// Last resort: the exchange could not be recorded after the handler
+		// returned; surface it instead of leaving a floating rejection.
+		ctx.ui.notify(`/btw: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}
-	pi.appendEntry(BTW_ENTRY_TYPE, { question, answer: item.answer });
 }
 
 export default function btwExtension(pi: ExtensionAPI) {
@@ -365,7 +375,7 @@ export default function btwExtension(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const question = args.trim();
 			if (ctx.mode !== "tui") {
-				await askBtwHeadless(pi, question, ctx);
+				void askBtwHeadless(pi, question, ctx);
 				return;
 			}
 			const runtime = runtimeFor(ctx);
