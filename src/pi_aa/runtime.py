@@ -1580,7 +1580,6 @@ class PiRuntime(AgentRuntime):
             )
         truncated = limit is not None and limit > 0
         items = await self._project_session_items(session_id, doc, limit=limit)
-        self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
         self._known_paths[session_id] = doc.summary.path
         return RuntimeTimelineSnapshot(
             session_id=session_id,
@@ -3116,31 +3115,30 @@ class PiRuntime(AgentRuntime):
             logger.exception("failed to push pi session meta for %s", live.platform_id)
 
     async def _publish_timeline(self, live: PiLiveSession) -> None:
-        path = live.session_file or live.session_path
-        if not path or not Path(path).is_file():
+        path = self._resolve_session_path(live.platform_id, live.session_file or live.session_path)
+        if path is None:
             return
-        snapshot = await self.get_session_snapshot(live.platform_id, path)
-        if not snapshot.complete:
+        doc = await asyncio.to_thread(load_session_doc, path)
+        if doc is None:
             return
+        items = await self._project_session_items(live.platform_id, doc)
         try:
             await self.host.timeline_sync(
                 session_id=live.platform_id,
                 runtime=RUNTIME,
-                items=snapshot.items,
-                external_session_id=snapshot.external_session_id,
+                items=items,
+                external_session_id=doc.summary.path,
                 complete=True,
             )
         except Exception:
             logger.exception("failed to push pi timeline for %s", live.platform_id)
             return
-        if snapshot.external_session_id:
-            # The replacement cleared the platform timeline, so the scanner
-            # can extend it incrementally from this projection on.
-            await self._write_timeline_checkpoint(
-                live.platform_id,
-                snapshot.external_session_id,
-                snapshot.items,
-            )
+        # Confirm only the document actually sent, after both publication and
+        # checkpoint persistence succeed. Reads and failed sends must remain
+        # discoverable by the scanner, including files appended during send.
+        if await self._write_timeline_checkpoint(live.platform_id, doc.summary.path, items):
+            self._synced[doc.summary.path] = (doc.summary.modified_at, doc.summary.size)
+            self._known_paths[live.platform_id] = doc.summary.path
 
     # -- utility process ----------------------------------------------------
 
