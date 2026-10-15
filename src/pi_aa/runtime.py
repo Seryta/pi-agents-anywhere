@@ -570,6 +570,7 @@ class PiLiveSession:
         self.is_compacting = False
         self.message_count = 0
         self.status_reason: str | None = None
+        self.turn_outcome = "completed"
         # Latest ``get_session_stats`` payload, cached so state reads do not
         # need an RPC of their own.
         self.session_stats: dict[str, Any] | None = None
@@ -2613,6 +2614,13 @@ class PiRuntime(AgentRuntime):
         if event_type == "message_end":
             message = record.get("message")
             if isinstance(message, Mapping) and message.get("role") == "assistant":
+                # Native pi settles with only {type: "agent_settled"}; its
+                # assistant terminal message carries the actual stop reason.
+                # Replace the prior result so a successful retry clears error.
+                live.turn_outcome = {
+                    "aborted": "interrupted",
+                    "error": "failed",
+                }.get(message.get("stopReason"), "completed")
                 live.message_count += 1
                 await live.finish_stream_message(message)
             return
@@ -2645,6 +2653,7 @@ class PiRuntime(AgentRuntime):
             # The previous settle closed the stream gate; this turn may stream
             # again.
             live.stream_settled = False
+            live.turn_outcome = "completed"
             live.status_reason = None
             live.is_streaming = True
             await self._push_state(live)
@@ -2672,10 +2681,9 @@ class PiRuntime(AgentRuntime):
             await self._push_state(live, force=True)
             await self._publish_timeline(live)
             await self._push_meta(live)
-            # pi marks an aborted run in the event payload; the server-side
-            # turn outcome whitelist is {completed, interrupted, cancelled,
-            # failed}, so map it explicitly.
-            outcome = "interrupted" if record.get("aborted") else "completed"
+            # Older integrations may attach ``aborted`` to settle; native pi
+            # uses the final assistant message's stopReason instead.
+            outcome = "interrupted" if record.get("aborted") else live.turn_outcome
             try:
                 await self.host.session_turn_ended(
                     session_id=live.platform_id,

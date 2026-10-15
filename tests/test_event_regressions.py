@@ -152,3 +152,54 @@ async def test_natural_exit_drains_terminal_event_before_exit_callback(tmp_path:
         assert order == ["agent_settled", "exit"]
     finally:
         await process.close()
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "outcome"),
+    [("aborted", "interrupted"), ("error", "failed"), ("stop", "completed")],
+)
+async def test_native_settle_uses_assistant_stop_reason(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost, stop_reason: str, outcome: str
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "native-outcome", cwd=str(tmp_path))
+    await runtime.handle_live_event(live, {"type": "agent_start"})
+    await runtime.handle_live_event(
+        live,
+        {
+            "type": "message_end",
+            "message": {"role": "assistant", "content": [], "stopReason": stop_reason},
+        },
+    )
+    # pi 0.87.1 / 1.1.0 emit this shape, with no aborted flag.
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+    assert fake_host.turn_ends[-1]["outcome"] == outcome
+
+
+async def test_outcome_resets_for_successful_retry_and_next_turn(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "retry-outcome", cwd=str(tmp_path))
+    await runtime.handle_live_event(live, {"type": "agent_start"})
+    for reason in ("error", "stop"):
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "message_end",
+                "message": {"role": "assistant", "content": [], "stopReason": reason},
+            },
+        )
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+    assert fake_host.turn_ends[-1]["outcome"] == "completed"
+
+    await runtime.handle_live_event(live, {"type": "agent_start"})
+    await runtime.handle_live_event(
+        live,
+        {"type": "message_end", "message": {"role": "assistant", "stopReason": "aborted"}},
+    )
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+    assert fake_host.turn_ends[-1]["outcome"] == "interrupted"
+    await runtime.handle_live_event(live, {"type": "agent_start"})
+    await runtime.handle_live_event(live, {"type": "agent_settled"})
+    assert fake_host.turn_ends[-1]["outcome"] == "completed"
