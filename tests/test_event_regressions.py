@@ -171,7 +171,7 @@ async def test_native_settle_uses_assistant_stop_reason(
             "message": {"role": "assistant", "content": [], "stopReason": stop_reason},
         },
     )
-    # pi 0.87.1 / 1.1.0 emit this shape, with no aborted flag.
+    # Cover the missing-flag fallback; pi 1.1.0 can also supply aborted.
     await runtime.handle_live_event(live, {"type": "agent_settled"})
     assert fake_host.turn_ends[-1]["outcome"] == outcome
 

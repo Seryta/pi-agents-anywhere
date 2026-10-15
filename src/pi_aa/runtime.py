@@ -2817,8 +2817,8 @@ class PiRuntime(AgentRuntime):
             await self._push_state(live, force=True)
             await self._publish_timeline(live)
             await self._push_meta(live)
-            # Older integrations may attach ``aborted`` to settle; native pi
-            # uses the final assistant message's stopReason instead.
+            # Pi 1.1 can include ``aborted`` on settle. When it is absent,
+            # retain the outcome from the final assistant message's stopReason.
             outcome = "interrupted" if record.get("aborted") else live.turn_outcome
             try:
                 await self.host.session_turn_ended(
