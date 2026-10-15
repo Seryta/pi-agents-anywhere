@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
+from connector.runtime_protocol import (
+    CAPABILITY_RUNTIME_ATTACHMENT,
+    RuntimeAttachment,
+    RuntimeAttachmentContent,
+)
 
 from pi_aa.runtime import PiLiveSession
 from tests.conftest import FakeHost
@@ -179,3 +185,61 @@ async def test_reconciliation_fields_sync_even_with_same_content_hash(
     reconciled = next(item for item in prepared.snapshot.items if item.id == previous.id)
     assert reconciled.content_hash == previous.content_hash
     assert getattr(reconciled, field)["clientMessageId"] == "optimistic-message"
+
+
+async def test_attachment_capabilities_allow_files_on_new_and_existing_sessions(
+    fake_pi, tmp_path, fake_host
+):
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    for capabilities in (
+        await runtime.get_runtime_capabilities(),
+        await runtime.get_session_capabilities("session"),
+    ):
+        attachment = next(
+            item
+            for item in capabilities.capabilities
+            if item.capability_id == CAPABILITY_RUNTIME_ATTACHMENT
+        )
+        assert attachment.supported and attachment.available and attachment.allowed
+        # The official composer and server interpret a present list as the
+        # exhaustive allowlist. Omitting it permits both images and documents.
+        assert "allowedMimeTypes" not in attachment.metadata
+
+
+@pytest.mark.parametrize(
+    "media_type,name",
+    [
+        ("application/pdf", "document.pdf"),
+        ("text/plain", "notes.txt"),
+        ("image/svg+xml", "drawing.svg"),
+        ("image/bmp", "drawing.bmp"),
+        ("image/png", "drawing.png"),
+        ("IMAGE/JPEG; charset=binary", "drawing.jpg"),
+    ],
+)
+async def test_advertised_attachments_reach_pi_in_supported_form(
+    fake_pi, tmp_path, fake_host, monkeypatch, media_type, name
+):
+    monkeypatch.setenv("AGENT_CONNECTOR_ATTACHMENTS_ROOT", str(tmp_path / "attachments"))
+    content = b"uploaded attachment content"
+
+    async def download(*args):
+        return RuntimeAttachmentContent(
+            file_id="upload", name=name, media_type=media_type, content=content
+        )
+
+    monkeypatch.setattr(fake_host, "attachment_download", download)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    images, notes = await runtime._prepare_attachments(
+        "session", (RuntimeAttachment(file_id="upload", name=name, media_type=media_type),)
+    )
+    if name.endswith((".png", ".jpg")):
+        assert len(images) == 1
+        assert images[0]["mimeType"] in {"image/png", "image/jpeg"}
+        assert notes == ()
+        assert not (tmp_path / "attachments").exists()
+    else:
+        assert images == ()
+        assert len(notes) == 1
+        assert notes[0][0] == name
+        assert Path(notes[0][1]).read_bytes() == content

@@ -2525,7 +2525,7 @@ async def test_runtime_capabilities_advertise_attachments(
     assert attachment.supported is True
     assert attachment.available is True
     assert attachment.allowed is True
-    assert attachment.metadata["allowedMimeTypes"]
+    assert "allowedMimeTypes" not in attachment.metadata
     # Session actions are advertised at runtime scope too so the platform's
     # per-session projection has a fallback for sessions without own facts.
     assert by_id[CAPABILITY_SESSION_SEND_MESSAGE].scope == "runtime"

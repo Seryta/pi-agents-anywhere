@@ -1966,11 +1966,6 @@ class PiRuntime(AgentRuntime):
                     scope="runtime",
                     runtime=RUNTIME,
                     runtime_id=self.config.runtime_id,
-                    metadata=(
-                        {"allowedMimeTypes": list(PI_IMAGE_MIME_TYPES)}
-                        if capability_id == CAPABILITY_RUNTIME_ATTACHMENT
-                        else {}
-                    ),
                 )
                 for capability_id in (
                     CAPABILITY_SESSION_SEND_MESSAGE,
@@ -2004,11 +1999,6 @@ class PiRuntime(AgentRuntime):
                 runtime=RUNTIME,
                 runtime_id=self.config.runtime_id,
                 session_id=session_id if scope == "session" else None,
-                metadata=(
-                    {"allowedMimeTypes": list(PI_IMAGE_MIME_TYPES)}
-                    if capability_id == CAPABILITY_RUNTIME_ATTACHMENT
-                    else {}
-                ),
             )
             for capability_id, scope in (
                 (CAPABILITY_SESSION_SEND_MESSAGE, "session"),
@@ -3009,7 +2999,6 @@ class PiRuntime(AgentRuntime):
         images: list[Mapping[str, Any]] = []
         notes: list[tuple[str, str]] = []
         for attachment in attachments:
-            media_type = (attachment.media_type or "").strip().lower()
             try:
                 downloaded = await self.host.attachment_download(session_id, attachment.file_id)
             except Exception:  # skipped attachments must not block the turn
@@ -3025,8 +3014,13 @@ class PiRuntime(AgentRuntime):
                     len(downloaded.content),
                 )
                 continue
-            if media_type.startswith("image/"):
-                resolved_media_type = (downloaded.media_type or media_type).strip().lower()
+            resolved_media_type = (
+                downloaded.media_type or attachment.media_type or ""
+            ).split(";", 1)[0].strip().lower()
+            # The capability accepts files of any type. Only formats pi's
+            # model providers support become inline images; SVG/BMP and other
+            # formats remain available through the regular file path.
+            if resolved_media_type in PI_IMAGE_MIME_TYPES:
                 images.append(
                     {
                         "type": "image",
