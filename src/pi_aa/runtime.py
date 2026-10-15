@@ -17,7 +17,7 @@ import re
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -92,7 +92,7 @@ MAX_CLIENT_MESSAGE_BINDINGS_PER_SESSION = 200
 # Version of the per-session scanner checkpoint: the fingerprint of the item
 # prefix the platform already holds, so append-only session files sync their
 # new tail instead of re-publishing the whole history every scanner pass.
-TIMELINE_SYNC_CHECKPOINT_VERSION = 2
+TIMELINE_SYNC_CHECKPOINT_VERSION = 3
 
 # The last few projected items are not stable: a turn's message is finalized
 # (status, tool result, usage) only once its following entries land, so the
@@ -1671,6 +1671,8 @@ class PiRuntime(AgentRuntime):
                     "count": stable,
                     "pushed": len(items),
                     "prefix": _timeline_prefix_hash(items, stable),
+                    "tailIds": [item.id for item in items[stable:]],
+                    "tail": _timeline_prefix_hash(items[stable:], len(items) - stable),
                 },
             )
         except Exception:
@@ -1728,37 +1730,41 @@ class PiRuntime(AgentRuntime):
             boot_id=self._boot_id,
         )
         if checkpoint is not None:
-            stable, pushed, prefix = checkpoint
+            stable, pushed, prefix, tail_ids, tail = checkpoint
             if (
-                stable <= len(items)
+                pushed <= len(items)
                 and _timeline_prefix_hash(items, stable) == prefix
+                # Upserts cannot remove old branch items. Replacing any
+                # previously published id needs a complete replacement.
+                and tuple(item.id for item in items[stable:pushed]) == tail_ids
             ):
-                if len(items) == pushed:
+                if (
+                    len(items) == pushed
+                    and _timeline_prefix_hash(items[stable:], pushed - stable) == tail
+                ):
                     # Nothing new: refresh the checkpoint without publishing.
                     return PreparedSessionTimelineSync(snapshot=None, commit=commit)
-                if len(items) > pushed:
-                    # Re-push the finalized tail alongside the new items so a
-                    # rewritten tail entry lands on the platform too.
-                    start = max(0, pushed - TIMELINE_SYNC_TAIL_GRACE)
-                    delta = items[start:]
-                    return PreparedSessionTimelineSync(
-                        snapshot=RuntimeTimelineSnapshot(
-                            session_id=session_id,
-                            external_session_id=doc.summary.path,
-                            runtime=RUNTIME,
-                            runtime_id=self.config.runtime_id,
-                            items=delta,
-                            complete=False,
-                            metadata={
-                                "itemCount": len(delta),
-                                "totalItemCount": len(items),
-                                "piSessionId": doc.summary.session_id,
-                                "sync": "delta",
-                            },
-                        ),
-                        commit=commit,
-                    )
-                # Fewer items than the last push: the file was rewritten.
+                # Re-push the finalized tail alongside the new items so a
+                # tool result or metadata-only change lands even when the
+                # projection has the same number of items.
+                delta = items[stable:]
+                return PreparedSessionTimelineSync(
+                    snapshot=RuntimeTimelineSnapshot(
+                        session_id=session_id,
+                        external_session_id=doc.summary.path,
+                        runtime=RUNTIME,
+                        runtime_id=self.config.runtime_id,
+                        items=delta,
+                        complete=False,
+                        metadata={
+                            "itemCount": len(delta),
+                            "totalItemCount": len(items),
+                            "piSessionId": doc.summary.session_id,
+                            "sync": "delta",
+                        },
+                    ),
+                    commit=commit,
+                )
         return PreparedSessionTimelineSync(
             snapshot=RuntimeTimelineSnapshot(
                 session_id=session_id,
@@ -3173,13 +3179,18 @@ class PiRuntime(AgentRuntime):
 
 
 def _timeline_prefix_hash(items: Sequence[RuntimeTimelineItem], count: int) -> str:
-    """Fingerprint the first ``count`` projected items (id + content)."""
+    """Fingerprint every published field, including reconciliation metadata."""
 
     digest = hashlib.sha256()
     for item in items[:count]:
-        digest.update(item.id.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(item.content_hash.encode("utf-8"))
+        digest.update(
+            json.dumps(
+                {entry.name: getattr(item, entry.name) for entry in fields(item)},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
         digest.update(b"\n")
     return digest.hexdigest()
 
@@ -3189,8 +3200,8 @@ def _timeline_checkpoint(
     *,
     session_id: str,
     boot_id: str,
-) -> tuple[int, int, str] | None:
-    """The stored (stable, pushed, prefix) checkpoint from this process."""
+) -> tuple[int, int, str, tuple[str, ...], str] | None:
+    """The stored prefix and mutable tail checkpoint from this process."""
 
     if not isinstance(stored, Mapping):
         return None
@@ -3201,13 +3212,23 @@ def _timeline_checkpoint(
     count = stored.get("count")
     pushed = stored.get("pushed")
     prefix = stored.get("prefix")
+    tail_ids = stored.get("tailIds")
+    tail = stored.get("tail")
     if not isinstance(count, int) or isinstance(count, bool) or count < 0:
         return None
     if not isinstance(pushed, int) or isinstance(pushed, bool) or pushed < count:
         return None
     if not isinstance(prefix, str) or not prefix:
         return None
-    return count, pushed, prefix
+    if (
+        not isinstance(tail_ids, list)
+        or len(tail_ids) != pushed - count
+        or not all(isinstance(item_id, str) for item_id in tail_ids)
+        or not isinstance(tail, str)
+        or not tail
+    ):
+        return None
+    return count, pushed, prefix, tuple(tail_ids), tail
 
 
 def _as_list(value: Any) -> list[Any]:
