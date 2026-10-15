@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
-from pi_aa.runtime import PiLiveSession
+import pytest
+from connector.runtime_protocol import RuntimeConfig
+
+from pi_aa.runtime import PiLiveSession, PiRuntime
 from tests.conftest import FakeHost, wait_for
 from tests.test_runtime import make_runtime
 
@@ -391,5 +397,154 @@ async def test_dead_unconsumed_followup_cannot_steal_new_followup_identity(
         assert user.source["clientMessageId"] == "new-followup", (
             "a dead process's unconsumed pending binding stole a later native user entry"
         )
+    finally:
+        await runtime.stop()
+
+
+@pytest.fixture
+async def local_order_provider():
+    """A local-only SSE model; no provider account or model spend is involved."""
+    requests = []
+    errors = []
+
+    async def respond(reader, writer):
+        try:
+            header = await reader.readuntil(b"\r\n\r\n")
+            headers = header.decode().split("\r\n")
+            length = next(
+                int(line.split(":", 1)[1])
+                for line in headers
+                if line.lower().startswith("content-length:")
+            )
+            requests.append(json.loads(await reader.readexactly(length)))
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            await writer.drain()
+            # The reply remains slow enough to observe the user acknowledgement
+            # while the new 0.87 session file has not been flushed yet.
+            await asyncio.sleep(0.2)
+            chunks = [
+                {"delta": {"role": "assistant", "content": ""}, "finish_reason": None},
+                {"delta": {"content": "local deterministic reply"}, "finish_reason": None},
+                {"delta": {}, "finish_reason": "stop"},
+            ]
+            for chunk in chunks:
+                payload = {
+                    "id": "local-order-fixture",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "order-fixture",
+                    "choices": [{"index": 0, **chunk}],
+                }
+                writer.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                await writer.drain()
+                await asyncio.sleep(0.05)
+            writer.write(b"data: [DONE]\n\n")
+            await writer.drain()
+        except (OSError, ValueError, asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
+            errors.append(repr(exc))
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(respond, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        yield f"http://127.0.0.1:{port}/v1", requests, errors
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.skipif(
+    os.environ.get("PI_AA_TRUE_PI") != "1",
+    reason="set PI_AA_TRUE_PI=1 for real pi with a local deterministic provider",
+)
+async def test_real_pi_confirms_native_user_before_stream(
+    tmp_path: Path, fake_host: FakeHost, monkeypatch, local_order_provider
+) -> None:
+    """A real first turn clears optimistic user state before any streamed reply."""
+    real_pi = shutil.which("pi")
+    assert real_pi, "real pi executable missing"
+    base_url, requests, errors = local_order_provider
+    agent_dir = tmp_path / "isolated-agent"
+    agent_dir.mkdir()
+    (agent_dir / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "order-fixture": {
+                        "api": "openai-completions",
+                        "baseUrl": base_url,
+                        "apiKey": "local-fixture-no-account",
+                        "models": [
+                            {
+                                "id": "order-fixture",
+                                "name": "Local order fixture",
+                                "reasoning": False,
+                                "input": ["text"],
+                                "contextWindow": 32768,
+                                "maxTokens": 512,
+                                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                            }
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+    wrapper = tmp_path / "local-pi"
+    wrapper.write_text(
+        "#!/bin/sh\nexec pi --provider order-fixture --model order-fixture "
+        '--no-extensions --no-skills "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    runtime = PiRuntime(
+        config=RuntimeConfig(
+            runtime="pi",
+            revision=1,
+            values={
+                "executablePath": str(wrapper),
+                "sessionsDir": str(tmp_path / "sessions"),
+                "defaultCwd": str(tmp_path),
+                "requestTimeoutMs": 15000,
+            },
+        ),
+        host=fake_host,
+    )
+    live_items = []
+    original_upsert = fake_host.timeline_item_upsert
+
+    async def record_upsert(item):
+        live_items.append(item)
+        await original_upsert(item)
+
+    monkeypatch.setattr(fake_host, "timeline_item_upsert", record_upsert)
+    await runtime.start()
+    try:
+        result = await runtime.start_turn(
+            "real-order", None, "local order question", client_message_id="local-client-1"
+        )
+        assert result.ok
+        await wait_for(lambda: bool(fake_host.turn_ends), timeout=20)
+        assert not errors
+        assert len(requests) == 1
+        assert requests[0]["model"] == "order-fixture"
+        assert fake_host.turn_ends[0]["outcome"] == "completed"
+        assert live_items[0].role == "user", "native user must clear optimistic state first"
+        user = live_items[0]
+        assert user.source["clientMessageId"] == "local-client-1"
+        assert any(
+            item.role == "assistant" and item.content.get("text") == "local deterministic reply"
+            for item in live_items
+        )
+        final_users = [
+            item for item in fake_host.timeline_syncs[-1]["items"] if item.role == "user"
+        ]
+        assert len(final_users) == 1
+        assert final_users[0].id == user.id, "the early acknowledgement uses the final native ID"
+        assert final_users[0].source["clientMessageId"] == "local-client-1"
     finally:
         await runtime.stop()
