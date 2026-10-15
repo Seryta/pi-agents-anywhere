@@ -77,6 +77,11 @@ class PiRpcProcess:
         self._exit_code: int | None = None
         self._exited = asyncio.Event()
         self._closing = False
+        # Responses stay on the reader; session events are applied in wire
+        # order even when a callback awaits a slow host notification. UI
+        # requests bypass this lock so a dialog can unblock an RPC command.
+        self._event_lock = asyncio.Lock()
+        self._event_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def argv(self) -> list[str]:
@@ -182,6 +187,7 @@ class PiRpcProcess:
         self._closing = True
         process = self._process
         if process is None:
+            await self._drain_events()
             return
         if process.returncode is None:
             if process.stdin is not None and not process.stdin.is_closing():
@@ -212,6 +218,20 @@ class PiRpcProcess:
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        await self._drain_events()
+
+    async def _drain_events(self) -> None:
+        tasks = tuple(self._event_tasks)
+        if not tasks:
+            return
+        if not self._closing:
+            # On a natural exit, give already-read terminal events a bounded
+            # chance to land before the exit callback publishes idle state.
+            await asyncio.wait(tasks, timeout=EVENT_DRAIN_TIMEOUT_SECONDS)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     def _fail_pending(self, error: Exception) -> None:
         pending = list(self._pending.values())
@@ -248,6 +268,7 @@ class PiRpcProcess:
             self._exit_code = exit_code
             self._exited.set()
             self._fail_pending(PiRpcProcessExited(f"Pi RPC process exited with code {exit_code}"))
+            await self._drain_events()
             if self._on_exit is not None:
                 with contextlib.suppress(Exception):
                     await self._on_exit(exit_code)
@@ -278,13 +299,19 @@ class PiRpcProcess:
                 return
             logger.debug("pi rpc: response without pending request id=%r", request_id)
             return
-        if self._on_event is not None:
-            asyncio.get_running_loop().create_task(self._safe_event(record))
+        if self._on_event is not None and not self._closing:
+            task = asyncio.create_task(self._safe_event(record))
+            self._event_tasks.add(task)
+            task.add_done_callback(self._event_tasks.discard)
 
     async def _safe_event(self, record: Mapping[str, Any]) -> None:
         assert self._on_event is not None
         try:
-            await self._on_event(record)
+            if record.get("type") == "extension_ui_request":
+                await self._on_event(record)
+            else:
+                async with self._event_lock:
+                    await self._on_event(record)
         except Exception:
             logger.exception("pi rpc event handler failed for type=%r", record.get("type"))
 
