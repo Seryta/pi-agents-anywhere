@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -109,15 +110,15 @@ async def test_failed_settle_retries_and_acknowledges_idle_live(
         patch.setattr(fake_host, "timeline_sync", fail)
         await runtime._publish_timeline(live)
     prepared = await runtime.prepare_session_timeline_sync(session.session_id, str(path))
-    assert prepared.snapshot is not None and prepared.snapshot.complete
-    await fake_host.timeline_sync(session.session_id, "pi", prepared.snapshot.items, complete=True)
+    assert prepared.snapshot is None
+    assert fake_host.timeline_syncs[-1]["complete"]
     await prepared.commit()
     assert not (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
 
 
-@pytest.mark.parametrize("settle_again", [False, True])
-async def test_scanner_discards_snapshot_if_new_turn_starts_during_projection(
-    fake_pi, tmp_path, fake_host, monkeypatch, settle_again
+@pytest.mark.parametrize("phase", ["projection", "publish"])
+async def test_live_retry_replacement_precedes_next_turn_stream(
+    fake_pi, tmp_path, fake_host, monkeypatch, phase
 ):
     path = tmp_path / "sessions" / "new-turn.jsonl"
     write_messages_session(path, 3)
@@ -125,21 +126,62 @@ async def test_scanner_discards_snapshot_if_new_turn_starts_during_projection(
     live = PiLiveSession(runtime, "session", cwd=str(tmp_path), session_path=str(path))
     live.stream_settled = True
     runtime._live[live.platform_id] = live
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+    platform = {}
     project = runtime._project_session_items
 
-    async def start_during_projection(*args, **kwargs):
-        items = await project(*args, **kwargs)
-        await runtime.handle_live_event(live, {"type": "agent_start"})
-        if settle_again:
-            live.is_streaming = False
-            live.stream_settled = True
-        return items
+    async def slow_project(*args, **kwargs):
+        if phase == "projection":
+            blocked.set()
+            await release.wait()
+        return await project(*args, **kwargs)
 
-    monkeypatch.setattr(runtime, "_project_session_items", start_during_projection)
-    prepared = await runtime.prepare_session_timeline_sync(live.platform_id, str(path))
-    assert prepared is not None and prepared.snapshot is None and prepared.commit is None
-    assert not fake_host.sync_state
-    assert (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
+    async def publish(*args, **kwargs):
+        if phase == "publish":
+            blocked.set()
+            await release.wait()
+        if kwargs.get("complete"):
+            platform.clear()
+        platform.update((item.id, item) for item in kwargs["items"])
+
+    async def stream(item):
+        platform[item.id] = item
+
+    monkeypatch.setattr(runtime, "_project_session_items", slow_project)
+    monkeypatch.setattr(fake_host, "timeline_sync", publish)
+    monkeypatch.setattr(fake_host, "timeline_item_upsert", stream)
+    retry = asyncio.create_task(runtime.prepare_session_timeline_sync(live.platform_id, str(path)))
+    await asyncio.wait_for(blocked.wait(), 1)
+
+    async def next_turn():
+        await runtime.handle_live_event(live, {"type": "agent_start"})
+        await runtime.handle_live_event(
+            live, {"type": "message_start", "message": {"role": "assistant"}}
+        )
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "new live answer"}],
+                    "stopReason": "stop",
+                },
+            },
+        )
+
+    turn = asyncio.create_task(next_turn())
+    await asyncio.sleep(0)
+    assert not live.is_streaming
+    release.set()
+    prepared, _ = await asyncio.wait_for(asyncio.gather(retry, turn), 2)
+    assert prepared.snapshot is None
+    assert any(item.content.get("text") == "new live answer" for item in platform.values())
+    # Model the connector publishing its pre-read idle state after prepare.
+    await fake_host.session_state_update(live.platform_id, "pi", status="idle")
+    await prepared.commit()
+    assert fake_host.states[-1]["status"] == "running"
 
 
 async def test_active_live_explicitly_skips_snapshot_fallback(fake_pi, tmp_path, fake_host):
@@ -153,11 +195,11 @@ async def test_active_live_explicitly_skips_snapshot_fallback(fake_pi, tmp_path,
     live.is_streaming = True
     runtime._live[live.platform_id] = live
     prepared = await runtime.prepare_session_timeline_sync(session.session_id, str(path))
-    assert prepared is not None and prepared.snapshot is None and prepared.commit is None
+    assert prepared is not None and prepared.snapshot is None and prepared.commit is not None
 
 
-async def test_new_turn_before_scanner_commit_does_not_acknowledge_old_generation(
-    fake_pi, tmp_path, fake_host
+async def test_new_turn_before_scanner_delivery_keeps_stream_and_refreshes_state(
+    fake_pi, tmp_path, fake_host, monkeypatch
 ):
     path = tmp_path / "sessions" / "late-commit.jsonl"
     write_messages_session(path, 3)
@@ -165,12 +207,93 @@ async def test_new_turn_before_scanner_commit_does_not_acknowledge_old_generatio
     live = PiLiveSession(runtime, "session", cwd=str(tmp_path), session_path=str(path))
     live.stream_settled = True
     runtime._live[live.platform_id] = live
+    platform = {}
+
+    async def publish(*args, **kwargs):
+        if kwargs.get("complete"):
+            platform.clear()
+        platform.update((item.id, item) for item in kwargs["items"])
+
+    async def stream(item):
+        platform[item.id] = item
+
+    monkeypatch.setattr(fake_host, "timeline_sync", publish)
+    monkeypatch.setattr(fake_host, "timeline_item_upsert", stream)
     prepared = await runtime.prepare_session_timeline_sync(live.platform_id, str(path))
-    assert prepared.snapshot.complete
     await runtime.handle_live_event(live, {"type": "agent_start"})
+    await runtime.handle_live_event(
+        live, {"type": "message_start", "message": {"role": "assistant"}}
+    )
+    await runtime.handle_live_event(
+        live,
+        {
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "new live answer"}],
+                "stopReason": "stop",
+            },
+        },
+    )
+    # Mirror the connector's delayed snapshot delivery, if the adapter handed
+    # one out. A stale complete snapshot would erase the just-published answer.
+    if prepared.snapshot is not None:
+        await fake_host.timeline_sync(
+            session_id=live.platform_id,
+            runtime="pi",
+            items=prepared.snapshot.items,
+            complete=prepared.snapshot.complete,
+        )
+    await fake_host.session_state_update(live.platform_id, "pi", status="idle")
     await prepared.commit()
-    assert not fake_host.sync_state
-    assert (await runtime.list_sessions())[0].metadata["sync"]["requires_timeline_sync"]
+    assert any(item.content.get("text") == "new live answer" for item in platform.values())
+    assert fake_host.states[-1]["status"] == "running"
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_live_retry_failure_releases_event_lock_and_allows_ui(
+    fake_pi, tmp_path, fake_host, monkeypatch, cancel
+):
+    path = tmp_path / "sessions" / "failed-retry.jsonl"
+    write_messages_session(path, 3)
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    live = PiLiveSession(runtime, "session", cwd=str(tmp_path), session_path=str(path))
+    live.stream_settled = True
+    runtime._live[live.platform_id] = live
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_publish(*args, **kwargs):
+        blocked.set()
+        await release.wait()
+        raise OSError("backend unavailable")
+
+    monkeypatch.setattr(fake_host, "timeline_sync", fail_publish)
+    retry = asyncio.create_task(runtime.prepare_session_timeline_sync(live.platform_id, str(path)))
+    await asyncio.wait_for(blocked.wait(), 1)
+    # Extension UI must remain available while lifecycle publication awaits
+    # I/O; otherwise an RPC waiting on a dialog response can deadlock.
+    await asyncio.wait_for(
+        runtime.handle_live_event(
+            live,
+            {
+                "type": "extension_ui_request",
+                "method": "notify",
+                "message": "still responsive",
+            },
+        ),
+        1,
+    )
+    assert fake_host.notices
+    if cancel:
+        retry.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await retry
+    else:
+        release.set()
+        await asyncio.wait_for(retry, 1)
+    await asyncio.wait_for(runtime.handle_live_event(live, {"type": "agent_start"}), 1)
+    assert live.is_streaming
 
 
 async def test_tool_completion_updates_same_length_timeline(fake_pi, tmp_path, fake_host):

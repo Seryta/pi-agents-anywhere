@@ -606,6 +606,9 @@ class PiLiveSession:
         self.stream_ops_idle.set()
         self.stream_settled = False
         self.turn_generation = 0
+        # Scanner retries must publish complete replacements in the same
+        # order as lifecycle events, without lending the lock to the connector.
+        self.lifecycle_lock = asyncio.Lock()
         self.last_activity = time.monotonic()
         self._start_lock = asyncio.Lock()
         self._exit_handled = True
@@ -1754,6 +1757,26 @@ class PiRuntime(AgentRuntime):
                 )
             )
 
+        if live is not None:
+
+            async def refresh_live_state() -> None:
+                current = current_live()
+                if current is None:
+                    return
+                async with current.lifecycle_lock:
+                    if current_live() is current:
+                        # The connector read state before prepare and can
+                        # publish that stale idle value after a new turn starts.
+                        await self._push_state(current, force=True)
+
+            async with live.lifecycle_lock:
+                if can_sync():
+                    # Keep the replacement ahead of the next agent_start and
+                    # its stream items. Returning it to the connector would
+                    # allow its delayed delivery to delete that new stream.
+                    await self._publish_timeline(live)
+            return PreparedSessionTimelineSync(snapshot=None, commit=refresh_live_state)
+
         if not can_sync():
             return PreparedSessionTimelineSync(snapshot=None)
         path = self._resolve_session_path(session_id, external_session_id)
@@ -1785,10 +1808,6 @@ class PiRuntime(AgentRuntime):
         )
         if not can_sync():
             return PreparedSessionTimelineSync(snapshot=None)
-        if live is not None:
-            # A failed settle may leave temporary streaming ids on the
-            # platform. An incremental retry cannot remove those items.
-            checkpoint = None
         if checkpoint is not None:
             stable, pushed, prefix, tail_ids, tail = checkpoint
             same_prefix = pushed <= len(items) and (
@@ -2660,6 +2679,15 @@ class PiRuntime(AgentRuntime):
     # -- live event handling ------------------------------------------------
 
     async def handle_live_event(self, live: PiLiveSession, record: Mapping[str, Any]) -> None:
+        # UI requests can answer an RPC that the current lifecycle handler is
+        # awaiting; keep that independent lane free of the lifecycle lock.
+        if record.get("type") == "extension_ui_request":
+            await self._handle_live_event(live, record)
+            return
+        async with live.lifecycle_lock:
+            await self._handle_live_event(live, record)
+
+    async def _handle_live_event(self, live: PiLiveSession, record: Mapping[str, Any]) -> None:
         live.touch()
         event_type = record.get("type")
         if event_type == "extension_ui_request":
@@ -2824,6 +2852,10 @@ class PiRuntime(AgentRuntime):
             )
 
     async def handle_live_exit(self, live: PiLiveSession, code: int | None) -> None:
+        async with live.lifecycle_lock:
+            await self._handle_live_exit(live, code)
+
+    async def _handle_live_exit(self, live: PiLiveSession, code: int | None) -> None:
         logger.info("pi session %s process exited code=%s", live.platform_id, code)
         await live.settle_stream()
         # The process that could have produced a cleared-queue receipt is gone;
