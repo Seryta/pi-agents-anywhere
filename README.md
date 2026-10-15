@@ -131,7 +131,7 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `get_session_notices` / `respond_interaction` | 扩展 UI 的 `select`/`confirm`/`input`/`editor` → interaction notice；`notify` → notification（轮次结束/进程退出时 resolved）；`setStatus` → 状态元数据 `extensionStatus` |
 | `session_turn_ended` | 收到 `agent_settled` 时上报 |
 
-同步模型：**流式增量 + 轮询兜底 + 结束即推**。消息与工具状态按约 300ms 聚合实时 upsert；Connector 默认每 30s 扫描一次；Runtime 在 `agent_settled` 时立刻重读会话文件并推送一次全量快照（替换流式临时项），最终一致性由会话文件保证。
+同步模型：**流式增量 + 轮询兜底 + 结束即推**。消息与工具状态按约 300ms 聚合实时 upsert；Connector 默认每 30s 扫描一次，扫描命中上次已同步的投影前缀时只推送新增尾部（`complete=false`，尾部若干项因 pi 定稿回填会随 delta 重推），改写或压缩后回退整份替换；Runtime 在 `agent_settled` 时立刻重读会话文件并推送一次全量快照（替换流式临时项），最终一致性由会话文件保证。
 
 ## 配置项
 
