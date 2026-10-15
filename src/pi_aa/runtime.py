@@ -3171,13 +3171,23 @@ class PiRuntime(AgentRuntime):
                 isinstance(entry, Mapping)
                 and entry.get("type") == "custom"
                 and entry.get("customType") == projection.BTW_CUSTOM_TYPE
-                and not live.is_streaming
             ):
-                # A headless /btw answer lands as a custom entry while no turn
-                # owns the timeline, so refresh it now. Mid-stream the settle
-                # push picks the entry up instead: a complete replace now would
-                # wipe the run's temporary stream item.
-                await self._publish_timeline(live)
+                # Publish the native entry directly: a complete replace would
+                # wipe the main run's stream items, and a new session may not
+                # have flushed its file yet. The normal full projection uses
+                # the same item ID, so settle reconciles rather than duplicates.
+                items = projection.project_session(
+                    [entry],
+                    session_id=live.platform_id,
+                    external_session_id=live.external_id or live.platform_id,
+                )
+                for item in items:
+                    try:
+                        await self.host.timeline_item_upsert(replace(item, order_seq=0))
+                    except Exception:
+                        logger.exception("failed to upsert pi side answer for %s", live.platform_id)
+                if not live.is_streaming:
+                    await self._publish_timeline(live)
             return
         if event_type == "auto_retry_start":
             message = record.get("errorMessage")

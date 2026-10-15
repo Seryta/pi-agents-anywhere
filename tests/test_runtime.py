@@ -2800,8 +2800,8 @@ async def test_entry_appended_publishes_btw_timeline_when_idle(
 
     The extension persists the exchange through ``pi.appendEntry``, which pi
     reports as an ``entry_appended`` event. Only the btw custom type is
-    projected, and a streaming run defers to its settle push so the complete
-    replace cannot wipe the run's temporary stream item mid-generation.
+    projected. Streaming uses a single-item upsert; an idle session also
+    refreshes its full timeline without wiping an active run's stream items.
     """
 
     session_path = tmp_path / "sessions" / "--tmp--" / "btw.jsonl"
@@ -2837,10 +2837,12 @@ async def test_entry_appended_publishes_btw_timeline_when_idle(
     live = PiLiveSession(runtime, "sess-btw", cwd=str(tmp_path), session_path=str(session_path))
     runtime._live["sess-btw"] = live
     try:
-        # Mid-stream the run owns the timeline; the settle push picks it up.
+        # Mid-stream only the side answer is upserted, preserving the main run.
         live.is_streaming = True
         await runtime.handle_live_event(live, {"type": "entry_appended", "entry": btw_entry})
         assert fake_host.timeline_syncs == []
+        assert len(fake_host.timeline_items) == 1
+        assert "settings.json" in fake_host.timeline_items[0].content["text"]
 
         # Other custom entries (pi's own state bookkeeping) are not projected.
         live.is_streaming = False
