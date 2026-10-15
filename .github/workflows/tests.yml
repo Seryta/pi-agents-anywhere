@@ -7,16 +7,25 @@ on:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pi-version: ["0.87.1", "1.1.0"]
     env:
       PI_AA_CONNECTOR_SOURCE: /tmp/Agents-Anywhere/connector
+      # Agents Anywhere v2.0.3; repository variables can opt into another ref.
+      PI_AA_CONNECTOR_REF: ${{ vars.PI_AA_CONNECTOR_REF || 'c0c3810d80331a9b8434e25538eeb389f84301ce' }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Check out the Agents Anywhere connector
-        run: git clone --depth 1 https://github.com/anywhere-labs/Agents-Anywhere.git /tmp/Agents-Anywhere
+        run: |
+          git init /tmp/Agents-Anywhere
+          git -C /tmp/Agents-Anywhere remote add origin https://github.com/anywhere-labs/Agents-Anywhere.git
+          git -C /tmp/Agents-Anywhere fetch --depth 1 origin "$PI_AA_CONNECTOR_REF"
+          git -C /tmp/Agents-Anywhere checkout --detach FETCH_HEAD
 
       - name: Build the test image
-        run: docker/build-test-env.sh
+        run: docker/build-test-env.sh --build-arg PI_VERSION=${{ matrix.pi-version }}
 
       - name: Lint
         run: docker/run-tests.sh bash -c "python -m ruff check src tests && python -m ruff format --check src tests"

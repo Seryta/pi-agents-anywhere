@@ -7,7 +7,7 @@
 #
 FROM python:3.12-slim
 
-ARG NODE_VERSION=v22.14.0
+ARG NODE_VERSION=v22.19.0
 ARG PI_VERSION=0.87.1
 # Registry endpoints default to the upstream projects; override them for
 # restricted networks, e.g. --build-arg PIP_INDEX_URL=<mirror>/pypi/simple.
@@ -15,7 +15,8 @@ ARG NODE_DIST=https://nodejs.org/dist
 ARG NPM_REGISTRY=https://registry.npmjs.org
 ARG PIP_INDEX_URL=https://pypi.org/simple
 
-RUN apt-get update \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
     && curl -fsSL -o /tmp/node.tar.xz "${NODE_DIST}/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
     && tar -xf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
@@ -25,13 +26,7 @@ RUN apt-get update \
     && npm cache clean --force \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" \
-        pytest \
-        pytest-asyncio \
-        pydantic \
-        loguru \
-        jsonschema \
-        httpx \
-        ruff
+COPY test-requirements.txt /tmp/test-requirements.txt
+RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" -r /tmp/test-requirements.txt
 
 WORKDIR /work

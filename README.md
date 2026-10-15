@@ -201,6 +201,13 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 镜像构建默认走官方源；受限网络可通过 `PI_AA_NODE_DIST` / `PI_AA_NPM_REGISTRY` /
 `PI_AA_PIP_INDEX_URL` 环境变量（或 `--build-arg`）指向镜像源。
 
+测试镜像默认使用 Node 22.19.0（满足 pi 的最低版本要求）和 pi 0.87.1，Python 测试依赖
+在 `docker/test-requirements.txt` 固定版本。验证其他 pi 版本可运行
+`docker/build-test-env.sh -t pi-aa-test-env:pi-1.1.0 --build-arg PI_VERSION=1.1.0`，
+然后设置 `PI_AA_TEST_IMAGE=pi-aa-test-env:pi-1.1.0` 运行测试。
+CI 覆盖 pi 0.87.1 / 1.1.0，并固定 Connector v2.0.3 的提交；仓库变量
+`PI_AA_CONNECTOR_REF` 可覆盖该提交以验证其他版本。基础镜像及系统包仍由上游更新。
+
 自定义命令以参数形式传递，例如 `docker/run-tests.sh python -m pytest tests/test_cli.py`。
 
 `docker/run-tests.sh` 默认从 `../Agents-Anywhere/connector` 读取官方 Connector 源码，可用
