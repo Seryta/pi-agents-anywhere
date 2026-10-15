@@ -448,3 +448,66 @@ async def test_restart_drains_old_events_before_starting_replacement(
         if previous is not None:
             await previous.close()
         await runtime.stop()
+
+
+@pytest.mark.parametrize("method", ["confirm", "notify"])
+async def test_restart_resolves_old_dialog_when_eof_event_drain_is_cancelled(
+    method: str,
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_notice_upsert = fake_host.notice_upsert
+
+    async def delayed_notice(notice) -> None:
+        await original_notice_upsert(notice)
+        if notice.status == "open":
+            entered.set()
+            await release.wait()
+
+    monkeypatch.setattr(fake_host, "notice_upsert", delayed_notice)
+    previous = None
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        previous = live.process
+        assert previous is not None and previous._process is not None
+        await runtime.handle_live_event(
+            live,
+            {
+                "type": "extension_ui_request",
+                "method": "setStatus",
+                "statusKey": "old-extension",
+                "statusText": "old process running",
+            },
+        )
+        assert live.extension_status
+        previous._dispatch_line(
+            json.dumps(
+                {
+                    "type": "extension_ui_request",
+                    "id": "old-dialog",
+                    "method": method,
+                    "title": "Continue?",
+                    "message": "Old process notice",
+                }
+            ).encode()
+        )
+        await entered.wait()
+        assert live.status == ("waiting_approval" if method == "confirm" else "idle")
+        previous._process.kill()
+        await previous._process.wait()
+        await live.ensure_started()
+        assert live.alive and live.process is not previous
+        assert live.pending_ui == {}
+        assert live.open_notifications == {}
+        assert live.extension_status == {}
+        assert live.status == "idle"
+        assert [notice.status for notice in fake_host.notices] == ["open", "resolved"]
+    finally:
+        release.set()
+        if previous is not None:
+            await previous.close()
+        await runtime.stop()

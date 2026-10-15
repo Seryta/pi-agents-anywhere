@@ -608,6 +608,7 @@ class PiLiveSession:
         self.turn_generation = 0
         self.last_activity = time.monotonic()
         self._start_lock = asyncio.Lock()
+        self._exit_handled = True
         self.last_state_key: tuple[Any, ...] | None = None
 
     @property
@@ -668,6 +669,10 @@ class PiLiveSession:
                     return
                 previous = self.process
                 if previous is None or previous is drained:
+                    if previous is not None and not self._exit_handled:
+                        # close can cancel a reader still draining events,
+                        # before its exit callback has resolved old dialogs.
+                        await self._handle_exit(previous.returncode)
                     await self._start_process()
                     return
             # EOF can leave event callbacks awaiting the host. Join them before
@@ -682,7 +687,7 @@ class PiLiveSession:
         async def on_exit(code: int | None) -> None:
             # A stopped process must not clear a replacement's state.
             async with self._start_lock:
-                if self.process is process:
+                if self.process is process and not self._exit_handled:
                     await self._handle_exit(code)
 
         process = PiRpcProcess(
@@ -694,6 +699,7 @@ class PiLiveSession:
         )
         await process.start()
         self.process = process
+        self._exit_handled = False
         try:
             await self.refresh_state()
         except (PiRpcProcessExited, PiRpcRequestFailed, PiRpcTimeout, TimeoutError) as exc:
@@ -1115,6 +1121,7 @@ class PiLiveSession:
 
     async def _handle_exit(self, code: int | None) -> None:
         await self.runtime.handle_live_exit(self, code)
+        self._exit_handled = True
 
     async def _on_event(self, record: Mapping[str, Any]) -> None:
         await self.runtime.handle_live_event(self, record)
@@ -2814,6 +2821,7 @@ class PiRuntime(AgentRuntime):
             return
         live.is_streaming = False
         live.is_compacting = False
+        live.extension_status.clear()
         for pending in list(live.pending_ui.values()):
             await self.host.notice_upsert(pending.as_notice(live.platform_id, status="resolved"))
         live.pending_ui.clear()
