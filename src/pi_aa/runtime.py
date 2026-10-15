@@ -2873,6 +2873,8 @@ class PiRuntime(AgentRuntime):
         external_session_id: str | None,
         cwd: str | None,
     ) -> PiLiveSession:
+        if external_session_id and not self._within_sessions_root(Path(external_session_id)):
+            raise RuntimeInvalidRequestError("session path is outside sessionsDir")
         live = self._live.get(session_id)
         if live is None:
             # Resolve the target first; installation below is synchronous, so two
@@ -2887,7 +2889,9 @@ class PiRuntime(AgentRuntime):
                 if doc_cwd:
                     workdir = doc_cwd
             elif external_session_id:
-                session_path = external_session_id
+                # Pi also accepts a not-yet-created session file. Resolve it
+                # here so validation and Pi use the same absolute target.
+                session_path = str(Path(external_session_id).resolve())
             async with self._live_lock(session_id):
                 live = self._live.get(session_id)
                 if live is None:
@@ -2946,11 +2950,13 @@ class PiRuntime(AgentRuntime):
             candidates.append(known)
         for candidate in candidates:
             path = Path(candidate)
-            if path.is_file():
-                return path
+            if self._within_sessions_root(path) and path.is_file():
+                return path.resolve()
         # Fall back to a scan when the platform id is not yet known.
         for summary in self.directory.list_sessions(limit=0):
-            if platform_session_id(self.host.session_namespace, summary.path) == session_id:
+            if self._within_sessions_root(Path(summary.path)) and (
+                platform_session_id(self.host.session_namespace, summary.path) == session_id
+            ):
                 self._known_paths[session_id] = summary.path
                 return Path(summary.path)
         return None
