@@ -658,35 +658,49 @@ class PiLiveSession:
         return argv
 
     async def ensure_started(self) -> None:
-        async with self._start_lock:
-            if self.alive:
-                return
+        drained: PiRpcProcess | None = None
+        while True:
+            async with self._start_lock:
+                if self.runtime._stopping:
+                    raise PiRpcProcessExited("Pi runtime is stopping")
+                if self.alive:
+                    return
+                previous = self.process
+                if previous is None or previous is drained:
+                    await self._start_process()
+                    return
+            # EOF can leave event callbacks awaiting the host. Join them before
+            # replacing the process so they cannot mutate the next turn.
+            # close also joins on_exit, which needs _start_lock itself.
+            await previous.close()
+            drained = previous
 
-            async def on_exit(code: int | None) -> None:
-                # An old reader can finish after its process has been
-                # replaced. Complete cleanup before a restart, or skip it
-                # when the replacement already owns this live session.
-                async with self._start_lock:
-                    if self.process is process:
-                        await self._handle_exit(code)
+    async def _start_process(self) -> None:
+        """Start while the caller holds _start_lock and the old reader is drained."""
 
-            process = PiRpcProcess(
-                self.argv(),
-                cwd=self.cwd,
-                on_event=self._on_event,
-                on_exit=on_exit,
-                request_timeout=self.runtime.request_timeout,
+        async def on_exit(code: int | None) -> None:
+            # A stopped process must not clear a replacement's state.
+            async with self._start_lock:
+                if self.process is process:
+                    await self._handle_exit(code)
+
+        process = PiRpcProcess(
+            self.argv(),
+            cwd=self.cwd,
+            on_event=self._on_event,
+            on_exit=on_exit,
+            request_timeout=self.runtime.request_timeout,
+        )
+        await process.start()
+        self.process = process
+        try:
+            await self.refresh_state()
+        except (PiRpcProcessExited, PiRpcRequestFailed, PiRpcTimeout, TimeoutError) as exc:
+            logger.warning(
+                "pi session %s started but get_state failed: %s",
+                self.platform_id,
+                exc,
             )
-            await process.start()
-            self.process = process
-            try:
-                await self.refresh_state()
-            except (PiRpcProcessExited, PiRpcRequestFailed, PiRpcTimeout, TimeoutError) as exc:
-                logger.warning(
-                    "pi session %s started but get_state failed: %s",
-                    self.platform_id,
-                    exc,
-                )
 
     async def refresh_state(self) -> Mapping[str, Any]:
         process = self.process

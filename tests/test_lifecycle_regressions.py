@@ -406,3 +406,45 @@ async def test_relative_config_uses_connector_paths_for_discovery_and_pi(
         assert runtime._resolve_cwd("project") == str(project)
     finally:
         await runtime.stop()
+
+
+async def test_restart_drains_old_events_before_starting_replacement(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def delayed_event(live: PiLiveSession, record) -> None:
+        entered.set()
+        try:
+            await release.wait()
+            live.is_streaming = False
+            live.stream_settled = True
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(runtime, "handle_live_event", delayed_event)
+    previous = None
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        previous = live.process
+        assert previous is not None and previous._process is not None
+        previous._dispatch_line(b'{"type":"agent_settled"}')
+        await entered.wait()
+        previous._process.kill()
+        await previous._process.wait()
+        replacements = await asyncio.gather(*(live.ensure_started() for _ in range(3)))
+        assert replacements == [None, None, None]
+        assert live.process is not previous and live.alive
+        assert cancelled.is_set()
+        live.is_streaming = True
+        live.stream_settled = False
+        release.set()
+        await asyncio.sleep(0)
+        assert live.is_streaming and not live.stream_settled
+    finally:
+        release.set()
+        if previous is not None:
+            await previous.close()
+        await runtime.stop()
