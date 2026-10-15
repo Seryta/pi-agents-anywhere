@@ -83,10 +83,10 @@ logger = logging.getLogger(__name__)
 # interval, so a burst of deltas cannot turn into a burst of platform upserts.
 STREAM_FLUSH_INTERVAL_SECONDS = 0.3
 
-# Optimistic sends are reconciled by client message id; the pairs live in the
-# session transcript projection. Keep the most recent ones persisted per
-# session so a connector restart cannot orphan the echo of an in-flight send.
-CLIENT_MESSAGE_BINDINGS_VERSION = 1
+# Optimistic sends are reconciled by client message id. Persist pending sends
+# with their native cursor, then bind them to entry IDs on actual consumption;
+# a restart must not orphan a send or attach it to an older same-text message.
+CLIENT_MESSAGE_BINDINGS_VERSION = 2
 MAX_CLIENT_MESSAGE_BINDINGS_PER_SESSION = 200
 
 # Version of the per-session scanner checkpoint: the fingerprint of the item
@@ -581,8 +581,16 @@ class PiLiveSession:
         # Fire-and-forget ``notify`` toasts still open for this run, keyed by
         # notice id; settle and process exit resolve them.
         self.open_notifications: dict[str, SessionNotice] = {}
-        # (text, clientMessageId) pairs waiting for their projected user message.
+        # Legacy text pairs remain readable; new sends use native entry IDs.
         self.client_messages: list[tuple[str, str]] = []
+        # New sends remain unbound until pi actually consumes their user event.
+        # mode distinguishes steering from follow-ups with identical text.
+        self.pending_client_messages: list[tuple[str, str, str | None, str, str | None]] = []
+        self.client_entry_bindings: dict[str, str] = {}
+        self.client_bindings_lock = asyncio.Lock()
+        self.entry_cursor: str | None = None
+        self.pending_user_entries: list[Mapping[str, Any]] = []
+        self.confirmed_user_entries: set[str] = set()
         # Queued steering/follow-up texts pi reports via ``queue_update``; the
         # event carries the complete queues, so these are replaced wholesale.
         self.steering_queue: list[str] = []
@@ -703,6 +711,28 @@ class PiLiveSession:
         await process.start()
         self.process = process
         self._exit_handled = False
+        # Persisted entries already have native IDs. Seed the cursor off-loop
+        # instead of requesting a potentially huge get_entries JSON response.
+        self.entry_cursor = None
+        self.pending_user_entries.clear()
+        self.confirmed_user_entries.clear()
+        if self.external_id:
+            doc = await asyncio.to_thread(load_session_doc, Path(self.external_id))
+            await self.runtime._load_client_bindings(self.external_id)
+            if doc is not None and doc.entries:
+                self.entry_cursor = doc.entries[-1].get("id")
+                self.confirmed_user_entries.update(
+                    entry["id"] for entry in doc.entries if isinstance(entry.get("id"), str)
+                )
+                self.runtime._recover_pending_client_bindings(self.external_id, doc.entries)
+            self.client_entry_bindings.update(
+                self.runtime._client_entry_bindings.get(self.external_id, {})
+            )
+            # The replacement process has no old in-memory queues. Recover
+            # consumed sends from its file first, then discard unconsumed
+            # pending bindings so they cannot steal a later same-text send.
+            self.pending_client_messages.clear()
+            await self.runtime._persist_client_bindings(self)
         try:
             await self.refresh_state()
         except (PiRpcProcessExited, PiRpcRequestFailed, PiRpcTimeout, TimeoutError) as exc:
@@ -1098,19 +1128,49 @@ class PiLiveSession:
         *,
         streaming_behavior: str | None = None,
         images: Sequence[Mapping[str, Any]] = (),
+        client_message_id: str | None = None,
     ) -> None:
+        pending = None
+        if client_message_id:
+            await self.ensure_started()
+            content_blocks = [{"type": "text", "text": content}, *images]
+            pending = (
+                projection.content_text(content_blocks),
+                client_message_id,
+                streaming_behavior,
+                content,
+                self.entry_cursor,
+            )
+            self.pending_client_messages.append(pending)
+            try:
+                await self.runtime._persist_client_bindings(self, strict=True)
+            except BaseException:
+                self.pending_client_messages.remove(pending)
+                raise
         if streaming_behavior == "steer":
             payload: dict[str, Any] = {"type": "steer", "message": content}
             if images:
                 payload["images"] = list(images)
-            await self.command(payload)
+            try:
+                await self.command(payload)
+            except BaseException:
+                if pending in self.pending_client_messages:
+                    self.pending_client_messages.remove(pending)
+                    await self.runtime._persist_client_bindings(self)
+                raise
             return
         payload = {"type": "prompt", "message": content}
         if images:
             payload["images"] = list(images)
         if streaming_behavior:
             payload["streamingBehavior"] = streaming_behavior
-        await self.command(payload)
+        try:
+            await self.command(payload)
+        except BaseException:
+            if pending in self.pending_client_messages:
+                self.pending_client_messages.remove(pending)
+                await self.runtime._persist_client_bindings(self)
+            raise
 
     async def stop(self) -> None:
         async with self._start_lock:
@@ -1175,6 +1235,10 @@ class PiRuntime(AgentRuntime):
         self._stale_reset_task: asyncio.Task[None] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
         self._client_bindings: dict[str, tuple[tuple[str, str], ...]] = {}
+        self._client_entry_bindings: dict[str, dict[str, str]] = {}
+        self._pending_client_bindings: dict[
+            str, tuple[tuple[str, str, str | None, str, str | None], ...]
+        ] = {}
         # Scanner checkpoints from a previous connector process cannot be
         # trusted: a crash mid-turn leaves stream items the platform still
         # holds, so the first changed pass after a restart replaces instead.
@@ -1536,6 +1600,31 @@ class PiRuntime(AgentRuntime):
             )
             value = None
         if isinstance(value, Mapping):
+            raw_pending = value.get("pendingBindings")
+            if isinstance(raw_pending, list):
+                self._pending_client_bindings[external_session_id] = tuple(
+                    (
+                        p["text"],
+                        p["clientMessageId"],
+                        p.get("mode"),
+                        p["prompt"],
+                        p.get("afterEntryId"),
+                    )
+                    for p in raw_pending
+                    if isinstance(p, Mapping)
+                    and all(
+                        isinstance(p.get(k), str) for k in ("text", "clientMessageId", "prompt")
+                    )
+                    and p.get("mode") in (None, "steer", "followUp")
+                    and (p.get("afterEntryId") is None or isinstance(p.get("afterEntryId"), str))
+                )
+            raw_entries = value.get("entryBindings")
+            if isinstance(raw_entries, Mapping):
+                self._client_entry_bindings[external_session_id] = {
+                    key: binding
+                    for key, binding in raw_entries.items()
+                    if isinstance(key, str) and isinstance(binding, str)
+                }
             raw_bindings = value.get("bindings")
             if isinstance(raw_bindings, list):
                 collected: list[tuple[str, str]] = []
@@ -1550,7 +1639,13 @@ class PiRuntime(AgentRuntime):
         self._client_bindings[external_session_id] = pairs
         return pairs
 
-    async def _persist_client_bindings(self, live: PiLiveSession) -> None:
+    async def _persist_client_bindings(self, live: PiLiveSession, *, strict: bool = False) -> None:
+        # Concurrent sends and consumed-user callbacks share this durable state.
+        # Serialize writes so an older slow write cannot overwrite newer sends.
+        async with live.client_bindings_lock:
+            await self._write_client_bindings(live, strict=strict)
+
+    async def _write_client_bindings(self, live: PiLiveSession, *, strict: bool = False) -> None:
         """Persist the session's optimistic-send pairs for future projections."""
 
         external_session_id = live.external_id
@@ -1561,11 +1656,32 @@ class PiRuntime(AgentRuntime):
             -MAX_CLIENT_MESSAGE_BINDINGS_PER_SESSION:
         ]
         self._client_bindings[external_session_id] = merged
+        entry_bindings = {
+            **self._client_entry_bindings.get(external_session_id, {}),
+            **live.client_entry_bindings,
+        }
+        entry_bindings = dict(
+            list(entry_bindings.items())[-MAX_CLIENT_MESSAGE_BINDINGS_PER_SESSION:]
+        )
+        self._client_entry_bindings[external_session_id] = entry_bindings
+        pending_bindings = tuple(live.pending_client_messages)
+        self._pending_client_bindings[external_session_id] = pending_bindings
         try:
             await self.host.sync_state_write(
                 self._client_bindings_key(external_session_id),
                 {
                     "version": CLIENT_MESSAGE_BINDINGS_VERSION,
+                    "entryBindings": entry_bindings,
+                    "pendingBindings": [
+                        {
+                            "text": text,
+                            "clientMessageId": binding,
+                            "mode": mode,
+                            "prompt": prompt,
+                            "afterEntryId": after,
+                        }
+                        for text, binding, mode, prompt, after in pending_bindings
+                    ],
                     "bindings": [
                         {"text": text, "clientMessageId": client_message_id}
                         for text, client_message_id in merged
@@ -1577,6 +1693,46 @@ class PiRuntime(AgentRuntime):
                 "failed to persist client message bindings session=%s",
                 external_session_id,
             )
+            if strict:
+                raise
+
+    def _recover_pending_client_bindings(
+        self, external_session_id: str, entries: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Recover sends accepted before a crash without matching old history.
+
+        Each pending send carries its pre-send native cursor. Only a matching
+        user after that boundary can consume it; queued but unconsumed sends
+        have no such entry and remain pending. Legacy text pairs stay separate.
+        """
+        pending = list(self._pending_client_bindings.get(external_session_id, ()))
+        if not pending:
+            return
+        bindings = self._client_entry_bindings.setdefault(external_session_id, {})
+        positions = {entry.get("id"): index for index, entry in enumerate(entries)}
+        bound_clients = set(bindings.values())
+        pending = [p for p in pending if p[1] not in bound_clients]
+        for index, entry in enumerate(entries):
+            entry_id = entry.get("id")
+            message = entry.get("message")
+            if not isinstance(entry_id, str) or entry_id in bindings:
+                continue
+            if not isinstance(message, Mapping) or message.get("role") != "user":
+                continue
+            text = projection.content_text(message.get("content"))
+            eligible = [
+                p
+                for p in pending
+                if p[0] == text
+                and (p[4] is None or (p[4] in positions and positions[p[4]] < index))
+            ]
+            selected = next((p for p in eligible if p[2] is None), None)
+            selected = selected or next((p for p in eligible if p[2] == "steer"), None)
+            selected = selected or next(iter(eligible), None)
+            if selected:
+                bindings[entry_id] = selected[1]
+                pending.remove(selected)
+        self._pending_client_bindings[external_session_id] = tuple(pending)
 
     async def get_session_snapshot(
         self,
@@ -1639,6 +1795,7 @@ class PiRuntime(AgentRuntime):
             await self._load_client_bindings(doc.summary.path),
             client_messages,
         )
+        self._recover_pending_client_bindings(doc.summary.path, doc.entries)
         logger.info(
             "pi project session_id=%s live=%s client_message_pairs=%d",
             session_id,
@@ -1652,6 +1809,10 @@ class PiRuntime(AgentRuntime):
             session_id=session_id,
             external_session_id=doc.summary.path,
             client_messages=client_messages,
+            client_entry_bindings={
+                **self._client_entry_bindings.get(doc.summary.path, {}),
+                **(live.client_entry_bindings if live is not None else {}),
+            },
             # Build only the tail the caller asked for; full construction is
             # wasted work for long transcripts (the platform polls snapshots).
             max_items=limit if truncated else None,
@@ -2542,20 +2703,14 @@ class PiRuntime(AgentRuntime):
         images, notes = await self._prepare_attachments(session_id, attachments)
         workdir = self._resolve_cwd(cwd)
         live = PiLiveSession(self, session_id, cwd=workdir)
-        # Bind the exact text pi will persist: the projection pairs optimistic
-        # sends by comparing this text with the transcript's user message.
         prompt = _prompt_with_attachment_notes(content, notes)
-        if client_message_id:
-            live.client_messages.append((prompt, client_message_id))
         self._live[session_id] = live
         await live.ensure_started()
         if is_meaningful_title(title):
             await live.command({"type": "set_session_name", "name": title})
         if selections:
             await self._apply_selections(live, selections)
-        await live.send_prompt(prompt, images=images)
-        if client_message_id:
-            await self._persist_client_bindings(live)
+        await live.send_prompt(prompt, images=images, client_message_id=client_message_id)
         await self._push_meta(live)
         await self._push_state(live, force=True)
         return RuntimeOperationResult(
@@ -2580,9 +2735,6 @@ class PiRuntime(AgentRuntime):
             session_id,
             client_message_id,
         )
-        if client_message_id:
-            live.client_messages.append((prompt, client_message_id))
-            await self._persist_client_bindings(live)
         if selections:
             await self._apply_selections(live, selections)
         behavior = "followUp" if (live.is_streaming or live.is_compacting) else None
@@ -2590,6 +2742,7 @@ class PiRuntime(AgentRuntime):
             prompt,
             streaming_behavior=behavior,
             images=images,
+            client_message_id=client_message_id,
         )
         return RuntimeOperationResult(
             result={"sessionId": session_id, "queued": behavior is not None}
@@ -2606,13 +2759,15 @@ class PiRuntime(AgentRuntime):
         images, notes = await self._prepare_attachments(session_id, attachments)
         live = await self._ensure_live(session_id, external_session_id, None)
         prompt = _prompt_with_attachment_notes(content, notes)
-        if client_message_id:
-            live.client_messages.append((prompt, client_message_id))
-            await self._persist_client_bindings(live)
         if live.is_streaming:
-            await live.send_prompt(prompt, streaming_behavior="steer", images=images)
+            await live.send_prompt(
+                prompt,
+                streaming_behavior="steer",
+                images=images,
+                client_message_id=client_message_id,
+            )
             return RuntimeOperationResult(result={"sessionId": session_id, "steered": True})
-        await live.send_prompt(prompt, images=images)
+        await live.send_prompt(prompt, images=images, client_message_id=client_message_id)
         return RuntimeOperationResult(result={"sessionId": session_id, "steered": False})
 
     async def interrupt_session(
@@ -2649,6 +2804,15 @@ class PiRuntime(AgentRuntime):
                     else []
                 )
             live.cleared_queue = cleared
+            for mode, key in (("steer", "steering"), ("followUp", "followUp")):
+                for text in cleared[key]:
+                    pending = next(
+                        (p for p in live.pending_client_messages if p[2] == mode and p[3] == text),
+                        None,
+                    )
+                    if pending is not None:
+                        live.pending_client_messages.remove(pending)
+            await self._persist_client_bindings(live)
         except Exception:  # a failed clear must never block the abort
             logger.warning(
                 "pi clear_queue failed for session %s; aborting anyway",
@@ -2719,6 +2883,123 @@ class PiRuntime(AgentRuntime):
 
     # -- live event handling ------------------------------------------------
 
+    async def _confirm_live_user(self, live: PiLiveSession, message: Mapping[str, Any]) -> None:
+        """Publish a consumed user before allowing its reply into the timeline.
+
+        pi emits message_end before appending synchronously to its in-memory
+        session manager. The next RPC therefore sees the native entry even in
+        0.87, where a new file is not flushed until the first assistant ends.
+        Retrying within this ordered callback retains every subsequent event;
+        the RPC reader/UI lane stays free and process.close cancels the wait.
+        """
+        if not projection.content_text(message.get("content")):
+            return
+        process = live.process
+        if process is None:
+            raise PiRpcProcessExited("Pi RPC process is not running")
+        item = None
+        entry_id = None
+        pending = None
+        while True:
+            try:
+                if item is None:
+
+                    def matches(entry: Mapping[str, Any]) -> bool:
+                        native = entry.get("message")
+                        return (
+                            isinstance(native, Mapping)
+                            and native.get("role") == "user"
+                            and native.get("content") == message.get("content")
+                            and (
+                                message.get("timestamp") is None
+                                or native.get("timestamp") == message.get("timestamp")
+                            )
+                        )
+
+                    entry = next((e for e in live.pending_user_entries if matches(e)), None)
+                    if entry is None:
+                        payload: dict[str, Any] = {"type": "get_entries"}
+                        if live.entry_cursor:
+                            payload["since"] = live.entry_cursor
+                        try:
+                            data = response_data(await process.request(payload))
+                        except PiRpcRequestFailed:
+                            if "since" not in payload:
+                                raise
+                            # A navigation/rewrite can invalidate the cursor.
+                            data = response_data(await process.request({"type": "get_entries"}))
+                        entries = data.get("entries")
+                        if not isinstance(entries, list):
+                            raise RuntimeError("pi get_entries returned no entries")
+                        if entries:
+                            live.entry_cursor = entries[-1].get("id")
+                        buffered_ids = {e.get("id") for e in live.pending_user_entries}
+                        for candidate in entries:
+                            if (
+                                isinstance(candidate, Mapping)
+                                and candidate.get("type") == "message"
+                                and isinstance(candidate.get("id"), str)
+                                and candidate["id"] not in live.confirmed_user_entries
+                                and candidate["id"] not in buffered_ids
+                                and isinstance(candidate.get("message"), Mapping)
+                                and candidate["message"].get("role") == "user"
+                            ):
+                                live.pending_user_entries.append(candidate)
+                        entry = next((e for e in live.pending_user_entries if matches(e)), None)
+                    if entry is None:
+                        raise RuntimeError("consumed pi user entry is not available yet")
+                    entry_id = entry["id"]
+                    text = projection.content_text(message.get("content"))
+                    candidates = [p for p in live.pending_client_messages if p[0] == text]
+                    # The initial prompt is consumed before queued steering;
+                    # thereafter native pi consumes steering before follow-ups.
+                    pending = next((p for p in candidates if p[2] is None), None)
+                    if pending is None:
+                        pending = next((p for p in candidates if p[2] == "steer"), None)
+                    if pending is None and candidates:
+                        pending = candidates[0]
+                    if pending is not None:
+                        live.client_entry_bindings[entry_id] = pending[1]
+                        await self._persist_client_bindings(live, strict=True)
+                    items = projection.project_session(
+                        [entry],
+                        session_id=live.platform_id,
+                        external_session_id=live.external_id or live.platform_id,
+                        client_entry_bindings=live.client_entry_bindings,
+                    )
+                    item = next(i for i in items if i.role == "user")
+                await self.host.publish_runtime_notifications(
+                    RUNTIME,
+                    [
+                        {
+                            "method": "timeline.itemUpsert",
+                            "params": {
+                                "sessionId": live.platform_id,
+                                "externalSessionId": live.external_id,
+                                "item": _scanner_item_payload(item, _iso_from_epoch(time.time())),
+                            },
+                        }
+                    ],
+                    runtime_id=self.config.runtime_id,
+                )
+                live.confirmed_user_entries.add(entry_id)
+                live.pending_user_entries = [
+                    e for e in live.pending_user_entries if e.get("id") != entry_id
+                ]
+                if pending in live.pending_client_messages:
+                    live.pending_client_messages.remove(pending)
+                    await self._persist_client_bindings(live)
+                return
+            except (PiRpcProcessExited, asyncio.CancelledError):
+                raise
+            except Exception:
+                logger.warning(
+                    "retrying consumed pi user confirmation session=%s",
+                    live.platform_id,
+                    exc_info=True,
+                )
+                await asyncio.sleep(STREAM_FLUSH_INTERVAL_SECONDS)
+
     async def handle_live_event(self, live: PiLiveSession, record: Mapping[str, Any]) -> None:
         # UI requests can answer an RPC that the current lifecycle handler is
         # awaiting; keep that independent lane free of the lifecycle lock.
@@ -2748,6 +3029,9 @@ class PiRuntime(AgentRuntime):
             return
         if event_type == "message_end":
             message = record.get("message")
+            if isinstance(message, Mapping) and message.get("role") == "user":
+                await self._confirm_live_user(live, message)
+                return
             if isinstance(message, Mapping) and message.get("role") == "assistant":
                 # Native pi settles with only {type: "agent_settled"}; its
                 # assistant terminal message carries the actual stop reason.
@@ -2906,6 +3190,8 @@ class PiRuntime(AgentRuntime):
         # has no clear_queue acknowledgement, so do not fabricate a receipt.
         live.steering_queue.clear()
         live.followup_queue.clear()
+        live.pending_client_messages.clear()
+        live.pending_user_entries.clear()
         live.pending_message_count = 0
         live.status_reason = None
         # The exit idle update bypasses _push_state; the old process's

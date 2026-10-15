@@ -525,6 +525,39 @@ def handle_command(command: dict) -> None:
                 "data": state_data(),
             }
         )
+    elif command_type == "get_entries":
+        path = session_path()
+        entries = (
+            [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            if path.exists()
+            else []
+        )
+        entries = [entry for entry in entries if entry.get("type") != "session"]
+        leaf = entries[-1]["id"] if entries else None
+        since = command.get("since")
+        if since is not None:
+            index = next((i for i, entry in enumerate(entries) if entry["id"] == since), None)
+            if index is None:
+                emit(
+                    {
+                        "id": request_id,
+                        "type": "response",
+                        "command": "get_entries",
+                        "success": False,
+                        "error": f"Entry not found: {since}",
+                    }
+                )
+                return
+            entries = entries[index + 1 :]
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": "get_entries",
+                "success": True,
+                "data": {"entries": entries, "leafId": leaf},
+            }
+        )
     elif command_type == "prompt":
         emit(
             {

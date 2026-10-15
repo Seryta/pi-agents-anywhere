@@ -150,6 +150,7 @@ class TranscriptProjector:
         external_session_id: str,
         *,
         client_messages: Sequence[tuple[str, str]] = (),
+        client_entry_bindings: Mapping[str, str] | None = None,
         max_items: int | None = None,
     ) -> None:
         self.session_id = session_id
@@ -166,6 +167,7 @@ class TranscriptProjector:
         self._turn_counter = 0
         self._current_turn_id: str | None = None
         self._client_messages: list[tuple[str, str]] = list(client_messages)
+        self._client_entry_bindings = client_entry_bindings or {}
 
     # -- public API ---------------------------------------------------------
 
@@ -250,7 +252,8 @@ class TranscriptProjector:
                     key=f"{entry_id or 'user'}:user",
                     role="user",
                     text=text,
-                    client_message_id=self._client_message_id_for(text),
+                    client_message_id=self._client_entry_bindings.get(entry_id)
+                    or self._client_message_id_for(text),
                 )
         elif role == "assistant":
             self._apply_assistant(message, entry_id=entry_id)
@@ -688,6 +691,7 @@ def project_session(
     session_id: str,
     external_session_id: str,
     client_messages: Sequence[tuple[str, str]] = (),
+    client_entry_bindings: Mapping[str, str] | None = None,
     max_items: int | None = None,
 ) -> tuple[RuntimeTimelineItem, ...]:
     """Project the active branch of a parsed Pi session document.
@@ -700,6 +704,7 @@ def project_session(
         session_id,
         external_session_id,
         client_messages=client_messages,
+        client_entry_bindings=client_entry_bindings,
         max_items=max_items,
     )
     projector.project_entries(doc_entries)

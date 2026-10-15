@@ -115,7 +115,7 @@ class FakeHost(RuntimeHostClient):
                     ordering_time=params.get("lastActivityAt"),
                     metadata=params.get("metadata"),
                 )
-            elif notification["method"] == "timeline.sync":
+            elif notification["method"] in {"timeline.sync", "timeline.itemUpsert"}:
                 items = tuple(
                     RuntimeTimelineItem(
                         id=item["id"],
@@ -129,8 +129,11 @@ class FakeHost(RuntimeHostClient):
                         role=item.get("role"),
                         revision=item.get("revision", 1),
                     )
-                    for item in params["items"]
+                    for item in (params["items"] if "items" in params else [params["item"]])
                 )
+                if notification["method"] == "timeline.itemUpsert":
+                    await self.timeline_item_upsert(items[0])
+                    continue
                 await self.timeline_sync(
                     session_id=params["sessionId"],
                     runtime=runtime,
