@@ -601,3 +601,36 @@ async def test_restart_recovers_when_old_notice_close_fails(
         assert "notice endpoint temporarily unavailable" in caplog.text
     finally:
         await runtime.stop()
+
+
+async def test_restart_announces_new_turn_running_after_exit_idle(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        await runtime.handle_live_event(live, {"type": "agent_start"})
+        assert [state["status"] for state in fake_host.states] == ["running"]
+        live.begin_stream_message()
+        original_stream_index = live.stream_index
+        original_file, original_id = live.session_file, live.pi_session_id
+        live.client_messages.append(("optimistic prompt", "client-message-1"))
+        live.session_stats = {"tokens": {"total": 42}, "cost": 0.25}
+        previous = live.process
+        assert previous is not None and previous._process is not None
+        previous._process.kill()
+        await previous._process.wait()
+        await live.ensure_started()
+        assert [state["status"] for state in fake_host.states] == ["running", "idle"]
+        await runtime.handle_live_event(live, {"type": "agent_start"})
+        assert [state["status"] for state in fake_host.states] == ["running", "idle", "running"]
+        assert live.stream_index == original_stream_index
+        assert live.client_messages == [("optimistic prompt", "client-message-1")]
+        state = await runtime.get_session_state(live.platform_id)
+        assert state is not None and state.status == "running"
+        assert state.external_session_id == original_file
+        assert state.metadata["piSessionId"] == original_id
+        assert state.metadata["tokens"] == {"total": 42}
+        assert state.metadata["cost"] == 0.25
+    finally:
+        await runtime.stop()

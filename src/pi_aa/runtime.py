@@ -2867,6 +2867,9 @@ class PiRuntime(AgentRuntime):
         live.followup_queue.clear()
         live.pending_message_count = 0
         live.status_reason = None
+        # The exit idle update bypasses _push_state; the old process's
+        # deduplication key must not suppress the replacement's first turn.
+        live.last_state_key = None
         live.is_streaming = False
         live.is_compacting = False
         live.extension_status.clear()
