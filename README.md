@@ -215,7 +215,7 @@ CI 覆盖 pi 0.87.1 / 1.1.0，并固定 Connector v2.0.3 的提交；仓库变�
 文件读取、附件落盘、scanner prepare+commit 的耗时及 1 ms 心跳的最大延迟，向 stdout
 输出 JSON；`ok=false` 时退出码为 1。可用 `--entries`、`--text-bytes`、`--attachment-mib`、
 `--repeats` 调整负载，`--max-loop-lag-ms` 设置门禁。临时文件均在一次性容器内生成，
-不需要 pi 进程、模型凭据或网络。测试镜像包含脚本使用的测试 Host，源码挂载须保留 `tests/`。
+不需要 pi 进程、模型凭据或网络。性能脚本复用 `tests/` 中的测试 Host，运行时须挂载完整源码（含 `tests/`）。
 
 一次同镜像实测（3 轮，50,695,864 字节会话）：线程卸载前后，投影最大事件循环延迟
 从 444.822 ms 降至 35.979 ms，scanner prepare+commit 从 1194.930 ms 降至 44.935 ms，
