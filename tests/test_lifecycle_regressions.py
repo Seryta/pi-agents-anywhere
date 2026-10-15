@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from connector.runtime_protocol import RuntimeInvalidRequestError
 
+from pi_aa.rpc import PiRpcProcess, PiRpcProcessExited
 from pi_aa.runtime import PiLiveSession, platform_session_id
 from tests.conftest import FakeHost
 from tests.test_runtime import make_runtime
@@ -198,3 +199,109 @@ async def test_real_pi_restart_restores_original_file_id_and_history(
         assert messages["data"]["messages"][0]["content"] == "recover this history"
     finally:
         await runtime.stop()
+
+
+async def test_concurrent_utility_queries_share_one_owned_process(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    processes = []
+    try:
+        processes = await asyncio.gather(*(runtime._ensure_utility() for _ in range(5)))
+        assert all(process is processes[0] for process in processes)
+        results = await asyncio.gather(
+            *(runtime._utility_command({"type": "get_commands"}) for _ in range(5))
+        )
+        assert all(result["success"] for result in results)
+        assert runtime._utility is processes[0]
+    finally:
+        await runtime.stop()
+        # Close every returned object even if ownership unexpectedly diverges.
+        for process in processes:
+            await process.close()
+    assert runtime._utility is None
+    assert all(not process.alive and process.returncode is not None for process in processes)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_utility_start_failure_or_cancellation_closes_child_and_allows_retry(
+    cancelled: bool,
+    fake_pi: Path,
+    tmp_path: Path,
+    fake_host: FakeHost,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    entered = asyncio.Event()
+    children = []
+    original_start = PiRpcProcess.start
+
+    async def failing_start(process: PiRpcProcess) -> None:
+        await original_start(process)
+        children.append(process)
+        entered.set()
+        if cancelled:
+            await asyncio.Event().wait()
+        raise OSError("startup failed after child spawn")
+
+    monkeypatch.setattr(PiRpcProcess, "start", failing_start)
+    task = asyncio.create_task(runtime._ensure_utility())
+    try:
+        await entered.wait()
+        if cancelled:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancelled else OSError):
+            await task
+        assert runtime._utility is None
+        assert len(children) == 1
+        assert not children[0].alive
+        assert children[0].returncode is not None
+        monkeypatch.setattr(PiRpcProcess, "start", original_start)
+        replacement = await runtime._ensure_utility()
+        assert replacement.alive and replacement is not children[0]
+    finally:
+        if not task.done():
+            task.cancel()
+        await runtime.stop()
+        for child in children:
+            await child.close()
+
+
+async def test_stop_waits_for_utility_start_and_rejects_new_requests(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    entered, release = asyncio.Event(), asyncio.Event()
+    children = []
+    original_start = PiRpcProcess.start
+
+    async def slow_start(process: PiRpcProcess) -> None:
+        await original_start(process)
+        children.append(process)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(PiRpcProcess, "start", slow_start)
+    starting = asyncio.create_task(runtime._ensure_utility())
+    stopping = None
+    try:
+        await entered.wait()
+        stopping = asyncio.create_task(runtime.stop())
+        await asyncio.sleep(0)
+        assert not stopping.done()
+        release.set()
+        with pytest.raises(PiRpcProcessExited, match="stopping"):
+            await starting
+        await stopping
+        assert runtime._utility is None
+        assert children[0].returncode is not None
+        with pytest.raises(PiRpcProcessExited, match="stopping"):
+            await runtime._ensure_utility()
+        assert len(children) == 1
+    finally:
+        release.set()
+        if stopping is not None:
+            await stopping
+        await runtime.stop()
+        for child in children:
+            await child.close()

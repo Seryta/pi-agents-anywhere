@@ -1133,6 +1133,7 @@ class PiRuntime(AgentRuntime):
         self._known_paths: dict[str, str] = {}
         self._synced: dict[str, tuple[float, int]] = {}
         self._utility: PiRpcProcess | None = None
+        self._utility_lock = asyncio.Lock()
         self._catalog_revision = 0
         # Platform command id -> pi-native command name, filled by
         # ``list_commands`` and consumed by ``execute_command``.
@@ -1210,9 +1211,11 @@ class PiRuntime(AgentRuntime):
             await live.stop()
         self._live.clear()
         self._live_locks.clear()
-        if self._utility is not None:
-            await self._utility.close()
+        async with self._utility_lock:
+            process = self._utility
             self._utility = None
+            if process is not None:
+                await process.close()
 
     async def reannounce_session_states(self, *, reason: str = "reconnect") -> None:
         """Publish the authoritative state of every known session.
@@ -3142,16 +3145,29 @@ class PiRuntime(AgentRuntime):
     # -- utility process ----------------------------------------------------
 
     async def _ensure_utility(self) -> PiRpcProcess:
-        if self._utility is not None and self._utility.alive:
-            return self._utility
-        process = PiRpcProcess(
-            [self.executable, "--mode", "rpc", "--no-session"],
-            cwd=self.default_cwd,
-            request_timeout=self.request_timeout,
-        )
-        await process.start()
-        self._utility = process
-        return process
+        async with self._utility_lock:
+            if self._stopping:
+                raise PiRpcProcessExited("Pi runtime is stopping")
+            if self._utility is not None:
+                if self._utility.alive:
+                    return self._utility
+                await self._utility.close()
+                self._utility = None
+            process = PiRpcProcess(
+                [self.executable, "--mode", "rpc", "--no-session"],
+                cwd=self.default_cwd,
+                request_timeout=self.request_timeout,
+            )
+            try:
+                await process.start()
+                if self._stopping:
+                    raise PiRpcProcessExited("Pi runtime is stopping")
+            except BaseException:
+                # A failed or cancelled startup may already own a child.
+                await process.close()
+                raise
+            self._utility = process
+            return process
 
     async def _utility_command(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         process = await self._ensure_utility()
