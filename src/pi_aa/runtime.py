@@ -2845,7 +2845,9 @@ class PiRuntime(AgentRuntime):
             return
         for pending in pending_interactions:
             try:
-                await self.host.notice_upsert(pending.as_notice(live.platform_id, status="resolved"))
+                await self.host.notice_upsert(
+                    pending.as_notice(live.platform_id, status="resolved")
+                )
             except Exception:
                 logger.exception(
                     "failed to resolve exited interaction session=%s notice=%s",
@@ -3106,8 +3108,11 @@ class PiRuntime(AgentRuntime):
                 )
                 continue
             resolved_media_type = (
-                downloaded.media_type or attachment.media_type or ""
-            ).split(";", 1)[0].strip().lower()
+                (downloaded.media_type or attachment.media_type or "")
+                .split(";", 1)[0]
+                .strip()
+                .lower()
+            )
             # The capability accepts files of any type. Only formats pi's
             # model providers support become inline images; SVG/BMP and other
             # formats remain available through the regular file path.

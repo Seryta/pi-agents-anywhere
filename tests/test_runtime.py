@@ -1491,9 +1491,7 @@ async def test_prepare_session_timeline_sync_publishes_delta_for_appends(
         assert rewritten is not None and rewritten.snapshot is not None
         assert rewritten.snapshot.complete is True
         full = await runtime.get_session_snapshot("sess-delta", str(session_file))
-        assert [item.id for item in rewritten.snapshot.items] == [
-            item.id for item in full.items
-        ]
+        assert [item.id for item in rewritten.snapshot.items] == [item.id for item in full.items]
     finally:
         await runtime.stop()
 
@@ -1555,9 +1553,7 @@ async def test_prepare_session_timeline_sync_republishes_a_rewritten_tail(
         await prepared.commit()
 
         # A change in the stable prefix cannot be extended incrementally.
-        text = session_file.read_text(encoding="utf-8").replace(
-            '"message 5"', '"message 5 edited"'
-        )
+        text = session_file.read_text(encoding="utf-8").replace('"message 5"', '"message 5 edited"')
         session_file.write_text(text, encoding="utf-8")
         rewritten = await runtime.prepare_session_timeline_sync("sess-tail", str(session_file))
         assert rewritten is not None and rewritten.snapshot is not None
