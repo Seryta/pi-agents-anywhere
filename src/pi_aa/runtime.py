@@ -652,19 +652,28 @@ class PiLiveSession:
             "--session-dir",
             str(self.runtime.sessions_dir),
         ]
-        if self.session_path:
-            argv.extend(["--session", self.session_path])
+        if self.external_id:
+            argv.extend(["--session", self.external_id])
         return argv
 
     async def ensure_started(self) -> None:
         async with self._start_lock:
             if self.alive:
                 return
+
+            async def on_exit(code: int | None) -> None:
+                # An old reader can finish after its process has been
+                # replaced. Complete cleanup before a restart, or skip it
+                # when the replacement already owns this live session.
+                async with self._start_lock:
+                    if self.process is process:
+                        await self._handle_exit(code)
+
             process = PiRpcProcess(
                 self.argv(),
                 cwd=self.cwd,
                 on_event=self._on_event,
-                on_exit=self._handle_exit,
+                on_exit=on_exit,
                 request_timeout=self.runtime.request_timeout,
             )
             await process.start()
@@ -1079,11 +1088,13 @@ class PiLiveSession:
         await self.command(payload)
 
     async def stop(self) -> None:
-        await self.cancel_stream_flush()
-        self.clear_stream_state()
-        process = self.process
-        self.process = None
+        async with self._start_lock:
+            await self.cancel_stream_flush()
+            self.clear_stream_state()
+            process = self.process
+            self.process = None
         if process is not None:
+            # close drains the reader, whose exit callback takes _start_lock.
             await process.close()
 
     async def _handle_exit(self, code: int | None) -> None:

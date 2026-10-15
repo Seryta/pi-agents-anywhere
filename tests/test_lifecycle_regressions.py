@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -79,3 +83,118 @@ async def test_discovery_and_known_paths_cannot_resume_symlink_escape(
     assert runtime._resolve_session_path(session_id, None) is None
     runtime._known_paths[session_id] = str(link)
     assert runtime._resolve_session_path(session_id, None) is None
+
+
+async def test_new_session_restart_uses_the_file_reported_by_pi(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        original_file = live.session_file
+        assert live.session_path is None and original_file
+        original_process = live.process
+        assert original_process is not None
+        await original_process.close()
+        await live.ensure_started()
+        assert live.process is not None and live.process is not original_process
+        assert live.process.argv[-2:] == ["--session", original_file]
+    finally:
+        await runtime.stop()
+
+
+async def test_late_old_process_exit_does_not_clear_replacement_state(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        previous = live.process
+        assert previous is not None
+        previous._closing = True
+        await live.ensure_started()
+        live.is_streaming = True
+        live.stream_settled = False
+        fake_host.states.clear()
+        await previous.close()
+        assert live.alive
+        assert live.is_streaming
+        assert not live.stream_settled
+        assert fake_host.states == []
+    finally:
+        await runtime.stop()
+
+
+async def test_restart_waits_for_exit_cleanup_already_in_progress(
+    fake_pi: Path, tmp_path: Path, fake_host: FakeHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = make_runtime(fake_pi, tmp_path, fake_host)
+    entered, release = asyncio.Event(), asyncio.Event()
+    previous = None
+    restart = None
+
+    async def slow_cleanup(live: PiLiveSession, code: int | None) -> None:
+        entered.set()
+        await release.wait()
+        live.is_streaming = False
+
+    monkeypatch.setattr(runtime, "handle_live_exit", slow_cleanup)
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        previous = live.process
+        assert previous is not None and previous._process is not None
+        previous._process.kill()
+        await previous._process.wait()
+        await entered.wait()
+        restart = asyncio.create_task(live.ensure_started())
+        await asyncio.sleep(0)
+        assert not restart.done()
+        release.set()
+        await restart
+        live.is_streaming = True
+        assert previous._reader_task is not None
+        await previous._reader_task
+        assert live.alive and live.is_streaming
+    finally:
+        release.set()
+        if restart is not None:
+            await restart
+        if previous is not None:
+            await previous.close()
+        await runtime.stop()
+
+
+@pytest.mark.skipif(os.environ.get("PI_AA_TRUE_PI") != "1", reason="requires real pi opt-in")
+async def test_real_pi_restart_restores_original_file_id_and_history(
+    tmp_path: Path, fake_host: FakeHost
+) -> None:
+    executable = shutil.which("pi")
+    assert executable
+    runtime = make_runtime(Path(executable), tmp_path, fake_host)
+    try:
+        live = await runtime._ensure_live("session", None, None)
+        original_file, original_id = live.session_file, live.pi_session_id
+        assert original_file and original_id
+        path = Path(original_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        records = [
+            {"type": "session", "version": 3, "id": original_id, "cwd": str(tmp_path)},
+            {
+                "type": "message",
+                "id": "user-1",
+                "parentId": None,
+                "message": {"role": "user", "content": "recover this history"},
+            },
+        ]
+        path.write_text("".join(json.dumps(record) + "\n" for record in records))
+        process = live.process
+        assert process is not None and process._process is not None
+        process._process.kill()
+        await process._process.wait()
+        await live.ensure_started()
+        assert live.session_file == original_file
+        assert live.pi_session_id == original_id
+        messages = await live.command({"type": "get_messages"})
+        assert messages["data"]["messages"][0]["content"] == "recover this history"
+    finally:
+        await runtime.stop()
