@@ -26,6 +26,7 @@ import type {
 import { matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 const SIDE_QUESTION_SYSTEM_PROMPT = [
+	"Language rule: always reply in Chinese. Do not switch to English or any other language, even when the side question or the transcript is in English, and even when refusing because the transcript lacks the answer.",
 	"You answer a quick side question about an ongoing coding session.",
 	"You only see the transcript excerpt provided; you cannot read files, run commands, or search.",
 	"Answer from the transcript. If it does not contain the answer, say so briefly instead of guessing.",
