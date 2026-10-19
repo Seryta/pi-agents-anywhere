@@ -1,5 +1,10 @@
 # 版本记录
 
+## 未发布（Connector shared.2 / DSH shared.3）
+
+- DSH 审批及用户回答使用与交互流相同的显式 Peer，修复审批重连风暴导致 AA 会话同步卡在启动中的问题。
+- DSH 原生 `/btw` 插件命令可经 AA 执行；旁支问答以独立时间线条目实时更新，不中断主回合、不进入主模型消息历史。Connector 与插件需配套更新，以启用新版历史投影。
+
 ## 0.3.0（2026-10-19）
 
 **不兼容变更**：Pi由独立Connector改为共享服务内的Runtime扩展，需按[安装迁移说明](docs/OPERATIONS.md)安装匹配的两份wheel；DSH使用匹配外部服务插件。Pi Python代码更新需重启整个共享服务进程，面板重启连接和Pi `/reload`不加载新Python代码。

@@ -82,6 +82,8 @@ python3 integrations/agents-anywhere/update.py "$AA_WORKTREE" --check
 
 7. 在另一份干净的目标基线工作树，用 `apply.py` 或正式发行构建重放补丁。`apply.py` 要求 HEAD 恰为清单基线；不要向已经包含集成提交的开发分支错误调用它。
 
+变更 DSH 历史投影版本时，同步更新 Connector 支持列表、持久检查点、`contracts/dsh-bridge/1.0` 的批次与检查点 Schema，以及协议说明。补丁维护入口必须收集该契约目录；仅修改 Host 与 Python 版本检查会使真实后端集成的 Schema 校验失败。
+
 发布输入是 Pi 仓库里的上游 commit 加完整补丁。正式构建会忽略相邻 AA 工作树的本地修改；漏更新补丁时，即使开发树测试通过，发布包仍可能缺少修复。
 
 ## 容器验证与验收
@@ -95,16 +97,17 @@ PI_AA_CONNECTOR_SOURCE="$AA_WORKTREE/connector" PI_AA_TRUE_PI=1 docker/run-tests
 PI_AA_UPSTREAM_SOURCE="$AA_WORKTREE" docker/build-shared-connector.sh
 ```
 
-按改动范围补官方 Connector 测试与 DSH 完整测试，实际负载全部在容器 / 虚机内运行。CI 的 Pi 版本矩阵要与声称支持的版本一致。DSH 测试指定容器内的 `AA_TEST_PYTHON`，准备其真实 Python / Server 夹具依赖；禁用 Node 安装脚本时，注意 uv 可执行文件的准备。既有串行运行曾规避短超时用例在并发下的波动，失败时先核实原因。
+按改动范围补官方 Connector 测试与 DSH 完整测试，实际负载全部在容器 / 虚机内运行。CI 的 Pi 版本矩阵要与声称支持的版本一致。DSH 测试指定容器内的 `AA_TEST_PYTHON`，准备其真实 Python / Server 夹具依赖；禁用 Node 安装脚本时，注意 uv 可执行文件的准备。既有串行运行曾规避短超时用例在并发下的波动，失败时先核实原因。uv 的 `--with-editable` 夹具会额外解析依赖，可将 `UV_CONSTRAINT` 指向本次约束文件，并按相同 UID 复用可写缓存。以非 root UID 运行完整 DSH 夹具时，容器必须有对应 passwd 用户记录；原生测试通过 `os.userInfo()` 确定用户路径。
 
-正式构建执行 typecheck、build、check:build 及打包后的跨语言回归。当前 8 项发行门禁只覆盖明确列出的场景，不能替代 DSH 全量测试或真实服务验收；以本次输出为准，不把 0.3.0 的测试数字复制成新版本结果。
+正式构建执行 typecheck、build、check:build 及打包后的跨语言回归。发行门禁只覆盖明确列出的场景，不能替代 DSH 全量测试或真实服务验收；以本次输出为准，不把 0.3.0 的测试数字复制成新版本结果。
 
 需要覆盖的业务行为：
 
 - 一个设备同时提供 Pi 与官方 Runtime；共享连接断开恢复后重新发布状态。
 - DSH 插件退出 / 重载不重启共享 Connector，Pi 会话继续；共享服务重启后 DSH 可重连。
 - 普通账号连接保留身份和凭据，跨账号替换被拒绝，所有权先于凭据操作。
-- Gateway 交互连接使用正确的显式 Peer；重试不反复广播未变化的能力，AA 最终离开“启动中”。
+- Gateway 交互流及 `$events/result` 回复使用同一显式 Peer；必须同时验证打开和回复两条路径。只验证订阅成功会漏掉审批回复引发的重连风暴。重试不反复广播未变化的能力，AA 最终离开“启动中”。
+- DSH `/btw` 依赖持久安装的 `dsh-btw` 插件；仅运行时注入不会跨 DSH 重启保留。Bridge 投影版本 4 需要接受该版本的配套 Connector，先准备两侧产物再切换；中文旁支回答在主任务运行时出现在 AA，主回合结束后不重复，也不进入主模型历史。
 - 实际安装后，在原设备上完成 Pi / DSH 真实会话收发，检查已有会话可恢复；只测试自己创建的会话。
 
 医生入口见 [运维说明](OPERATIONS.md#后续更新与回退)。doctor 验证本机状态，不能替代真实收发。需要账号、模型调用或运行环境而本次未获授权 / 无法完成的检查，明确写为未验证。

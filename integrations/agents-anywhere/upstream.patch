@@ -780,6 +780,28 @@ index 81c5399f..f95a28fc 100644
      async def get_config(self) -> RuntimeConfig:
          raise RuntimeUnsupportedError("get_config")
  
+diff --git a/connector/connector/runtimes/dsh/bridge/sync.py b/connector/connector/runtimes/dsh/bridge/sync.py
+index 1168ecb1..3d079b4c 100644
+--- a/connector/connector/runtimes/dsh/bridge/sync.py
++++ b/connector/connector/runtimes/dsh/bridge/sync.py
+@@ -36,7 +36,7 @@ def _checkpoint(value: Any) -> dict[str, Any] | None:
+     if not isinstance(value, Mapping):
+         return None
+     seq, fingerprint = value.get("throughSeq"), value.get("historyHash")
+-    if (value.get("version") != 1 or value.get("projectionVersion") not in (2, 3)
++    if (value.get("version") != 1 or value.get("projectionVersion") not in (2, 3, 4)
+         or type(seq) is not int or not -1 <= seq <= 9007199254740991
+         or type(value.get("settled")) is not bool or not isinstance(fingerprint, str)
+         or len(fingerprint) != 64 or any(c not in "0123456789abcdef" for c in fingerprint)):
+@@ -296,7 +296,7 @@ class SyncRelay:
+             })
+             subscription = await self.client.request("runtime.sync.subscribe", {"checkpointVersion": 1})
+             projection_version = subscription.get("projectionVersion")
+-            if projection_version not in (2, 3):
++            if projection_version not in (2, 3, 4):
+                 raise ValueError("Unsupported DSH projection version")
+             stream_id, expected = subscription["streamId"], 1
+             self.durable_checkpoints = subscription.get("checkpointVersion") == 1
 diff --git a/connector/connector/runtimes/dsh/provider.py b/connector/connector/runtimes/dsh/provider.py
 index e76f0128..68494d3b 100644
 --- a/connector/connector/runtimes/dsh/provider.py
@@ -808,6 +830,38 @@ index e76f0128..68494d3b 100644
          capabilities = provider_config.dsh_capabilities(
              metadata.get("runtimeCapabilities")
          )
+diff --git a/connector/connector/runtimes/dsh/runtime.py b/connector/connector/runtimes/dsh/runtime.py
+index 36d6b3a9..c6721672 100644
+--- a/connector/connector/runtimes/dsh/runtime.py
++++ b/connector/connector/runtimes/dsh/runtime.py
+@@ -34,6 +34,9 @@ from connector.runtimes.dsh.bridge.client import BridgeClient, BridgeRpcError
+ from connector.runtimes.dsh.bridge.sync import SyncRelay
+ 
+ BRIDGE_POLL_INTERVAL_SECONDS = 5.0
++# Native DSH commands AA can expose without a client UI. /btw requires the
++# dsh-btw plugin and returns before its side answer is projected.
++_AA_COMMANDS = frozenset({"compact", "btw"})
+ 
+ 
+ class DshRuntime(AgentRuntime):
+@@ -147,14 +150,14 @@ class DshRuntime(AgentRuntime):
+         commands = models.commands(await self._request("session.listCommands", {
+             **_session_params(session_id, external_session_id), "query": query, "limit": limit,
+         }))
+-        return tuple(command for command in commands if command.id == "compact")
++        return tuple(command for command in commands if command.id in _AA_COMMANDS)
+ 
+     async def execute_command(
+         self, session_id: str, command: str, external_session_id: str | None = None,
+         raw: str | None = None, args: tuple[str, ...] = (),
+     ) -> RuntimeCommandResult:
+-        if command != "compact":
+-            return RuntimeCommandResult(command=command, ok=False, code="unknown_command", message="AA supports only /compact for DSH.")
++        if command not in _AA_COMMANDS:
++            return RuntimeCommandResult(command=command, ok=False, code="unknown_command", message="AA supports only /compact and /btw for DSH.")
+         unavailable = await self._commands_unavailable(session_id, external_session_id)
+         if unavailable:
+             return RuntimeCommandResult(command=command, ok=False, code=unavailable[0], message=unavailable[1])
 diff --git a/connector/connector/runtimes/providers.py b/connector/connector/runtimes/providers.py
 index 53ad8b05..41c2d556 100644
 --- a/connector/connector/runtimes/providers.py
@@ -868,17 +922,40 @@ index 31599929..5cade5a3 100644
                  logger.exception("runtime event recovery deferred runtime={}", runtime_id)
  
 diff --git a/connector/pyproject.toml b/connector/pyproject.toml
-index adb7900c..38902d7e 100644
+index adb7900c..266bb151 100644
 --- a/connector/pyproject.toml
 +++ b/connector/pyproject.toml
 @@ -1,6 +1,6 @@
  [project]
  name = "anywhere-cli"
 -version = "2.0.3"
-+version = "2.0.3+shared.1"
++version = "2.0.3+shared.2"
  description = "Local runtime connector for Agents Anywhere"
  readme = "README.md"
  requires-python = ">=3.12"
+diff --git a/connector/tests/dsh_commands_probe.py b/connector/tests/dsh_commands_probe.py
+index 55ac6511..a17eb4c9 100644
+--- a/connector/tests/dsh_commands_probe.py
++++ b/connector/tests/dsh_commands_probe.py
+@@ -28,10 +28,17 @@ async def main(home: Path) -> None:
+     runtime._client = client
+     session = stable_runtime_session_id("wire", "dsh", "commands-wire")
+     try:
+-        assert [c.id for c in await runtime.list_commands(session, "commands-wire")] == ["compact"]
++        assert [c.id for c in await runtime.list_commands(session, "commands-wire")] == ["btw", "compact"]
+         catalog = await runtime.list_commands(session, "commands-wire", query="compact", limit=1)
+         assert len(catalog) == 1 and catalog[0].id == "compact"
+         assert catalog[0].metadata["ui"]["acceptsMultiline"] is True
++        btw_catalog = await runtime.list_commands(session, "commands-wire", query="btw", limit=1)
++        assert len(btw_catalog) == 1 and btw_catalog[0].id == "btw"
++        assert btw_catalog[0].accepts_args
++        assert btw_catalog[0].metadata["input"] == {"hint": "问题（留空则重开上次问答）"}
++        btw = await runtime.execute_command(session, "btw", "commands-wire", raw="/btw 暗号是什么？")
++        assert btw.ok and btw.result["executionState"] == "accepted"
++        assert btw.result["commandId"]
+         result = await runtime.execute_command(session, "compact", "commands-wire", raw="/compact  first\nsecond  ")
+         assert result.ok and result.message == "  first\nsecond  "
+         assert result.result["executionState"] == "accepted"
 diff --git a/connector/tests/test_connector_cli.py b/connector/tests/test_connector_cli.py
 index 7bac4cee..5c21bdb8 100644
 --- a/connector/tests/test_connector_cli.py
@@ -1256,6 +1333,100 @@ index 00000000..4e213f92
 +        with pytest.raises(RuntimeError, match="owns"):
 +            asyncio.run(cli._pair(args))
 +    assert service.controller.config_path.read_bytes() == before
+diff --git a/connector/tests/test_dsh_checkpoints.py b/connector/tests/test_dsh_checkpoints.py
+index 05b61b42..7f713f1f 100644
+--- a/connector/tests/test_dsh_checkpoints.py
++++ b/connector/tests/test_dsh_checkpoints.py
+@@ -32,7 +32,7 @@ def timeline_notice():
+ 
+ 
+ @pytest.mark.parametrize("fail", [False, True])
+-@pytest.mark.parametrize("projection_version", [2, 3])
++@pytest.mark.parametrize("projection_version", [2, 3, 4])
+ def test_ingestion_precedes_checkpoint_and_ack_and_json_survives_restart(tmp_path, fail, projection_version):
+     checkpoint = {**CHECKPOINT, "projectionVersion": projection_version}
+     async def run():
+@@ -103,7 +103,7 @@ def test_load_ack_returns_checkpoint_and_invalid_version_falls_back(tmp_path):
+ 
+         async def request(method, params=None):
+             if method == "runtime.sync.subscribe":
+-                return {"streamId": "s", "projectionVersion": 3, "checkpointVersion": 1}
++                return {"streamId": "s", "projectionVersion": 4, "checkpointVersion": 1}
+             await acknowledged.put(params)
+ 
+         relay = SyncRelay(SimpleNamespace(request=request), host)
+@@ -112,7 +112,7 @@ def test_load_ack_returns_checkpoint_and_invalid_version_falls_back(tmp_path):
+             for seq, expected in [(1, CHECKPOINT), (2, None)]:
+                 if seq == 2:
+                     await host.sync_state_write(KEY, {**CHECKPOINT, "projectionVersion": 99})
+-                relay.accept({"streamId": "s", "batchSeq": seq, "projectionVersion": 3,
++                relay.accept({"streamId": "s", "batchSeq": seq, "projectionVersion": 4,
+                     "operations": [{"kind": "checkpoint.load", "externalSessionId": "native"}]})
+                 ack = await asyncio.wait_for(acknowledged.get(), 1)
+                 assert ack["checkpoint"] == expected
+diff --git a/connector/tests/test_dsh_commands.py b/connector/tests/test_dsh_commands.py
+index 85a7f5c0..8322790e 100644
+--- a/connector/tests/test_dsh_commands.py
++++ b/connector/tests/test_dsh_commands.py
+@@ -88,12 +88,19 @@ async def bridge(tmp_path: Path, *, supported: bool = True, mode: str = "success
+                     elif mode == "unavailable":
+                         result["capabilities"][0].update({"available": False, "allowed": False, "unavailableReason": "DSH session is archived."})
+                 elif method == "session.listCommands":
+-                    assert params == {"sessionId": "session", "externalSessionId": "native", "query": "compact", "limit": 1}
+-                    result = {"commands": [{"id": "compact", "title": "compact", "description": "native compact", "acceptsArgs": True,
++                    assert params["sessionId"] == "session" and params["externalSessionId"] == "native" and params["limit"] == 1
++                    commands = [{"id": "compact", "title": "compact", "description": "native compact", "acceptsArgs": True,
+                         "metadata": {"definitionId": "compact-plugin", "input": {"hint": "text", "attachments": True}, "attachmentsAvailable": False,
+-                            "ui": {"kind": "execute", "acceptsMultiline": True, "allowedStatuses": ["idle", "running"]}}}]}
++                            "ui": {"kind": "execute", "acceptsMultiline": True, "allowedStatuses": ["idle", "running"]}}}]
+                     if mode == "wide-catalog":
+-                        result["commands"].extend({"id": name, "title": name} for name in ["export", "goal", "permission"])
++                        commands.extend({"id": name, "title": name} for name in ["export", "goal", "permission"])
++                    if mode == "btw-catalog":
++                        commands.append({"id": "btw", "title": "btw", "description": "旁支问答", "acceptsArgs": True,
++                            "metadata": {"input": {"hint": "问题（留空则重开上次问答）"}, "attachmentsAvailable": False,
++                                "ui": {"kind": "execute", "acceptsMultiline": True, "allowedStatuses": ["idle", "running"]}}})
++                    query = (params.get("query") or "").lower()
++                    result = {"commands": [command for command in commands
++                        if query in f'{command["id"]} {command.get("description", "")}'.lower()]}
+                 elif method == "session.executeCommand":
+                     entered.set()
+                     if mode == "timeout":
+@@ -167,6 +174,21 @@ def test_public_catalog_execution_preserves_native_descriptor_and_raw_correlatio
+     asyncio.run(run())
+ 
+ 
++def test_btw_is_exposed_and_dispatched_without_a_ui(tmp_path: Path) -> None:
++    async def run() -> None:
++        async with bridge(tmp_path, mode="btw-catalog") as (runtime, requests, _):
++            catalog = await runtime.list_commands("session", "native", query="btw", limit=1)
++            assert [command.id for command in catalog] == ["btw"]
++            assert catalog[0].accepts_args
++            assert catalog[0].metadata["input"] == {"hint": "问题（留空则重开上次问答）"}
++            result = await runtime.execute_command("session", "btw", "native", raw="/btw 暗号是什么？")
++            assert result.ok and result.message == "native acknowledgement"
++            execution = [request for request in requests if request["method"] == "session.executeCommand"]
++            assert execution[0]["params"]["command"] == "btw"
++            assert execution[0]["params"]["raw"] == "/btw 暗号是什么？"
++    asyncio.run(run())
++
++
+ @pytest.mark.parametrize("command", ["goal", "plan", "export", "feedback", "permission", "model", "file", "compact-thread"])
+ def test_non_compact_commands_never_reach_the_bridge(tmp_path: Path, command: str) -> None:
+     async def run() -> None:
+diff --git a/connector/tests/test_dsh_event_sync.py b/connector/tests/test_dsh_event_sync.py
+index 22c05dec..ae3a94eb 100644
+--- a/connector/tests/test_dsh_event_sync.py
++++ b/connector/tests/test_dsh_event_sync.py
+@@ -79,7 +79,7 @@ def test_snapshot_abort_foreign_items_and_duplicate_pages_do_not_publish_partial
+ 
+ 
+ @pytest.mark.parametrize("reject", [False, True])
+-@pytest.mark.parametrize("projection_version", [2, 3])
++@pytest.mark.parametrize("projection_version", [2, 3, 4])
+ def test_relay_failure_resubscribes_without_closing_concurrent_rpc(reject, projection_version):
+     async def exercise():
+         entered, release, acknowledged = asyncio.Event(), asyncio.Event(), asyncio.Event()
 diff --git a/connector/tests/test_dsh_provider.py b/connector/tests/test_dsh_provider.py
 index ed423917..cfa015ee 100644
 --- a/connector/tests/test_dsh_provider.py
@@ -1439,6 +1610,53 @@ index 00000000..9a6a655e
 +DSH 外部模式通过此协议连接，保留自己的账号登录及 Bridge。它不写共享配置或私有 Connector 配置，不在插件退出、重新加载、退出账号或重置插件时停止公共服务。显式停止和重启按钮会影响共享服务中的所有 Agent。
 +
 +内置托管模式在绑定账号、恢复或撤销设备凭据之前，必须通过原官方 stdio RPC 的 `connector.acquireOwnership` 取得全局租约，并在同一控制进程中完成配置和启动。公共服务已持有租约时，内置模式必须在任何设备凭据操作之前失败。
+diff --git a/contracts/dsh-bridge/1.0/README.md b/contracts/dsh-bridge/1.0/README.md
+index 9b30ead8..3138f003 100644
+--- a/contracts/dsh-bridge/1.0/README.md
++++ b/contracts/dsh-bridge/1.0/README.md
+@@ -99,9 +99,9 @@ composition test also reads persisted sessions through the real Python adapter.
+ 
+ ## Event subscription (additive 1.x)
+ 
+-The handshake advertises `features.syncMode = events` and `projectionVersion = 3`.
++The handshake advertises `features.syncMode = events` and `projectionVersion = 4`.
+ `runtime.sync.subscribe` replaces this connection's previous subscription and returns
+-`streamId` plus the projection version. Connector accepts v2 and v3, and each batch must match the subscribed version. v3 reads rc.7 tool-role results and PTC sub-dispatches; a v2 checkpoint triggers a complete recalibration so previously omitted results are restored. Update Connector together with the v3 Host. `runtime.sync.batch` notifications follow
++`streamId` plus the projection version. Connector accepts v2, v3 and v4, and each batch must match the subscribed version. v3 reads rc.7 tool-role results and PTC sub-dispatches. v4 projects log-only `dsh-btw` side questions independently of the main turn. Earlier projection checkpoints trigger a complete recalibration so previously omitted items are restored. Update Connector together with the v4 Host. `runtime.sync.batch` notifications follow
+ `sync-batch.schema.json`, with monotonic `batchSeq`. The Connector acknowledges each
+ batch via `runtime.sync.ack {streamId,batchSeq}` before the next batch is sent.
+ 
+@@ -135,7 +135,7 @@ Connector state, which uses the existing periodic and shutdown flush. A crash
+ before that flush permits retransmission, never skipping uncommitted history.
+ `checkpoint.delete {externalSessionId}` invalidates an unavailable session.
+ 
+-Checkpoint fields are `version:1`, `projectionVersion:3`, `throughSeq`,
++Checkpoint fields are `version:1`, `projectionVersion:4`, `throughSeq`,
+ `historyHash` (SHA-256 of durable native events and attachment receipts, seeded
+ with native/platform identity), and `settled`. The Host locally replays history
+ and compares this fingerprint, independent of live/persisted SDK revision formats.
+diff --git a/contracts/dsh-bridge/1.0/schemas/sync-batch.schema.json b/contracts/dsh-bridge/1.0/schemas/sync-batch.schema.json
+index 5bef2233..5dd7b38c 100644
+--- a/contracts/dsh-bridge/1.0/schemas/sync-batch.schema.json
++++ b/contracts/dsh-bridge/1.0/schemas/sync-batch.schema.json
+@@ -7,7 +7,7 @@
+   "properties": {
+     "streamId": { "type": "string", "minLength": 1 },
+     "batchSeq": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+-    "projectionVersion": { "enum": [2, 3] },
++    "projectionVersion": { "enum": [2, 3, 4] },
+     "operations": {
+       "type": "array",
+       "minItems": 1,
+@@ -22,7 +22,7 @@
+             "required": ["version", "projectionVersion", "throughSeq", "historyHash", "settled"],
+             "properties": {
+               "version": { "const": 1 },
+-              "projectionVersion": { "enum": [2, 3] },
++              "projectionVersion": { "enum": [2, 3, 4] },
+               "throughSeq": { "type": "integer", "minimum": -1, "maximum": 9007199254740991 },
+               "historyHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+               "settled": { "type": "boolean" }
 diff --git a/docs/runtime-protocol/runtime-extensions.md b/docs/runtime-protocol/runtime-extensions.md
 new file mode 100644
 index 00000000..095aec1c
@@ -1469,10 +1687,18 @@ index 00000000..095aec1c
 +
 +只更新DSH Node插件时，重启DSH即可重连Bridge，不需要重启共享Connector。生产安装来自wheel时，修改源码检出不会影响已安装环境。需要按扩展独立升级的部署，应另行设计worker隔离；当前接口不承诺该能力。
 diff --git a/dsh-bridge-next/README.md b/dsh-bridge-next/README.md
-index 3ab34cf8..3cca87af 100644
+index 3ab34cf8..0c321772 100644
 --- a/dsh-bridge-next/README.md
 +++ b/dsh-bridge-next/README.md
-@@ -23,6 +23,8 @@ DSH Desktop 已集成此插件，**不需要另行下载或执行 npm 安装命
+@@ -7,6 +7,7 @@
+ ## 可以做什么
+ 
+ - 在其他设备上查看 DSH 会话与运行进度，发送消息或继续已有会话。
++- 在远程会话里用 `/btw` 追问旁支问题；回答以系统消息进入时间线，不写入模型上下文（需在 DSH 侧安装 dsh-btw 插件）。
+ - 根据 DSH 和当前会话的能力选择模型、权限与 Agent 模式，发送文字、图片或普通文件，回复输入请求与单次操作审批。
+ - 使用 Agents Anywhere Cloud 或自己的服务实例；在插件中查看连接状态、管理本机 Connector 和桥接日志。
+ - 如果 Agents Anywhere Desktop 正在运行，转到该应用完成连接；否则可以直接在插件中登录并连接本机设备。Agents Anywhere Desktop 和 DSH Desktop 是两个不同的应用。
+@@ -23,6 +24,8 @@ DSH Desktop 已集成此插件，**不需要另行下载或执行 npm 安装命
  
  ## 从 npm 安装到独立 DSH
  
@@ -1481,7 +1707,7 @@ index 3ab34cf8..3cca87af 100644
  如果使用独立安装的 DSH，可以通过官方插件命令从 npm 安装。先确认目标 Profile 的名称，以及当前 npm 包声明的 DSH 依赖是否与你的环境相容。下面以 `desktop` Profile 为例：
  
  ```bash
-@@ -51,3 +53,22 @@ dsh plugin --profile desktop add @agents-anywhere/dsh-bridge-next
+@@ -51,3 +54,22 @@ dsh plugin --profile desktop add @agents-anywhere/dsh-bridge-next
  本仓库源码和 npm 已发布包可能处于不同版本。源码构建、链接安装、headless 检查、配置和实现细节见[技术说明](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/dsh-bridge-next/TECHNICAL.md)。
  
  [开发计划](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/dsh-bridge-next/DEVELOPMENT_PLAN.md) · [Onboarding 方案](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/dsh-bridge-next/ONBOARDING_PLAN.md) · [验证记录](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/dsh-bridge-next/VERIFICATION.md) · [Agents Anywhere 使用文档](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/docs/README.md)
@@ -1505,10 +1731,30 @@ index 3ab34cf8..3cca87af 100644
 +
 +更新此DSH插件的代码后，重新安装tgz并重启对应DSH实例即可；Pi与其他Runtime继续运行。更新公共Connector或Pi Python适配层则需要重启共享服务进程。面板“重启Connector”仅重建同一Python进程内的后端连接，虽然会影响全部Runtime，但不保证重载升级的Python模块。设备账号与配对配置不需要因普通升级而重建。
 diff --git a/dsh-bridge-next/TECHNICAL.md b/dsh-bridge-next/TECHNICAL.md
-index 8bfea133..0b1d95a0 100644
+index 8bfea133..ce9bb896 100644
 --- a/dsh-bridge-next/TECHNICAL.md
 +++ b/dsh-bridge-next/TECHNICAL.md
-@@ -245,3 +245,15 @@ tests/                 单元及集成测试
+@@ -184,10 +184,15 @@ Bridge 的独占锁决定端点文件的写入权。获得锁后会重建残留
+ 私有 runtime 端点提供 `session.listCommands` 与 `session.executeCommand`。两者使用现有
+ `sessionId` / `externalSessionId` 身份检查和原生 source 可用性，通过 Session Controller
+ 取得该会话的权威 Agent，再调用真实 `commands.list` / `commands.execute`；命令文本不会
+-作为普通 prompt 发送。AA 仅开放 `/compact`：目录先过滤出当前 Agent 注册的 `compact`，
+-再执行搜索和数量限制；没有注册时返回空列表。Bridge 和 Python Connector 均拒绝其他
+-命令名，Connector 还会过滤旧 Bridge 返回的其他命令，避免暴露依赖 DSH 客户端 UI 的入口。
+-模型和权限选择继续走现有会话控件及其独立接口。
++作为普通 prompt 发送。AA 开放 `/compact` 与 `/btw`：目录先过滤出当前 Agent 注册的这两个
++命令（`/btw` 需要 DSH 侧安装 dsh-btw 插件），再执行搜索和数量限制；没有注册时返回空列表。
++Bridge 和 Python Connector 均拒绝其他命令名，Connector 还会过滤旧 Bridge 返回的其他命令，
++避免暴露依赖 DSH 客户端 UI 的入口。模型和权限选择继续走现有会话控件及其独立接口。
++
++`/btw` 的 handler 只写 log-only 的 `plugin:dsh-btw/start` 并立即返回，后台回答再写
++`plugin:dsh-btw/end`；Bridge 把这类记录折成同一条 system 时间线（正文
++`/btw 问题\n\n回答`，失败为 error），与 Pi 的 `pi.btw` 投影约定一致，且不进入模型上下文。
++它不占用主 turn，`turn/end` 也不会把仍在回答的旁支条目标成 interrupted。
+ 
+ 目录每次从 registry 读取，包含 Agent 的 scoped override，列表
+ 支持 `query` 和 1–1000 的 `limit`（默认 50）。未提供 registry/controller 的 Host 不启用
+@@ -245,3 +250,15 @@ tests/                 单元及集成测试
  ```
  
  Host 输出 `lib/index.js`，Client 输出 DSH 模块加载格式的 `lib/client.js`，不能当独立网页打开。开发依赖统一锁定 Harness `0.2.0-rc.2`；Cordis、Typert 与 Schemastery 使用 Host 提供的 peer 依赖，以免破坏服务类型身份。DSH 只按 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` peer 判断插件兼容性（预发布版本参与范围匹配），因此 Typert peer 的范围就是插件声明支持的 DSH 版本范围：同一 minor 内的新 rc 和正式版无需改声明，升级到新 minor 前需要重新验证并放宽上限。握手上报的 `runtimeVersion` 读取 Host 实际提供的 Typert 包版本，`bridgeVersion` 读取插件自身 `package.json`。依赖、构建产物和锁文件遵循仓库现有忽略规则。
@@ -1525,14 +1771,14 @@ index 8bfea133..0b1d95a0 100644
 +
 +交互流兼容 Gateway 的三参数和五参数入口。五参数入口显式传入 Connection 的 `browserPeer`，使 `$events` 订阅和通过 `createSharedFetchHandler` 发送的回答使用同一个官方 Peer；旧 Host 没有该属性时仍保留旧接口行为。连接重试只在可用性改变时发布能力变化，避免持续不可用的交互服务反复重发所有会话能力而阻塞启动同步。
 diff --git a/dsh-bridge-next/package.json b/dsh-bridge-next/package.json
-index f185c8dc..8fb0d9ac 100644
+index f185c8dc..b7b9275a 100644
 --- a/dsh-bridge-next/package.json
 +++ b/dsh-bridge-next/package.json
 @@ -1,6 +1,6 @@
  {
    "name": "@agents-anywhere/dsh-bridge-next",
 -  "version": "2.0.3",
-+  "version": "2.0.3-shared.2",
++  "version": "2.0.3-shared.3",
    "description": "Agents Anywhere onboarding, Connector management and event-driven session runtime for DeepSeek Harness",
    "type": "module",
    "main": "./lib/index.js",
@@ -2064,8 +2310,102 @@ index eea58365..c70e0f10 100644
      return this.stopping
    }
  
+diff --git a/dsh-bridge-next/src/host/dsh-runtime/commands.ts b/dsh-bridge-next/src/host/dsh-runtime/commands.ts
+index e1b4eb01..5c451353 100644
+--- a/dsh-bridge-next/src/host/dsh-runtime/commands.ts
++++ b/dsh-bridge-next/src/host/dsh-runtime/commands.ts
+@@ -22,7 +22,11 @@ export interface CommandCapability {
+ }
+ const ONLINE_STATUSES = ['idle', 'running', 'waiting', 'pending', 'stopping', 'waiting_approval', 'error', 'blocked']
+ 
+-/** AA exposes only native compact; the registry owns its grammar and side effects. */
++/** Native commands AA can safely expose without a DSH client UI: /compact owns its
++ * grammar and side effects, and /btw (dsh-btw plugin) returns immediately with the
++ * answer delivered later as a log-only timeline item. */
++const AA_NATIVE_COMMANDS = new Set(['compact', 'btw'])
++
+ export class RuntimeCommands {
+   private readonly instance = randomUUID()
+   private revision = 0
+@@ -74,7 +78,7 @@ export class RuntimeCommands {
+     const query = typeof params.query === 'string' ? params.query.toLocaleLowerCase() : ''
+     const agent = await this.agent(id, signal)
+     return { commands: registry.list(agent)
+-      .filter(item => item.name === 'compact')
++      .filter(item => AA_NATIVE_COMMANDS.has(item.name))
+       .filter(item => `${item.name} ${item.description} ${item.input?.hint ?? ''}`.toLocaleLowerCase().includes(query))
+       .slice(0, limit).map(item => ({
+         id: item.name, title: item.name, description: item.description, aliases: [], scope: 'session', enabled: true,
+@@ -94,7 +98,7 @@ export class RuntimeCommands {
+     const command = typeof params.command === 'string' ? params.command : ''
+     const fail = (code: string, message: string): CommandResult => ({ command, ok: false, code, message, result: {} })
+     if (!command || parseCommand(`/${command}`)?.name !== command) return fail('invalid_command', 'Use the native command name from the catalog.')
+-    if (command !== 'compact') return fail('unknown_command', 'AA supports only /compact for DSH.')
++    if (!AA_NATIVE_COMMANDS.has(command)) return fail('unknown_command', 'AA supports only /compact and /btw for DSH.')
+     const args = params.args === undefined ? [] : params.args
+     if (!Array.isArray(args) || args.some(arg => typeof arg !== 'string')) return fail('invalid_command', 'Command arguments must be strings.')
+     if (params.attachments !== undefined && (!Array.isArray(params.attachments) || params.attachments.length)) return fail('command_attachments_unsupported', 'AA command attachments are unavailable. Keep attachments in the draft.')
+diff --git a/dsh-bridge-next/src/host/dsh-runtime/history.ts b/dsh-bridge-next/src/host/dsh-runtime/history.ts
+index 57c5ac7f..55601973 100644
+--- a/dsh-bridge-next/src/host/dsh-runtime/history.ts
++++ b/dsh-bridge-next/src/host/dsh-runtime/history.ts
+@@ -8,7 +8,21 @@ import { enrichToolResult, parentToolItem, resultContent, toolContent } from './
+ import { json, record, type Data, type ItemStatus, type ItemType, type TimelineItem } from './types.js'
+ 
+ // Bump when replay semantics change so old checkpoints rebuild their timeline.
+-export const PROJECTION_VERSION = 3
++export const PROJECTION_VERSION = 4
++
++/** Log-only records written by the dsh-btw plugin (`plugin:dsh-btw/*`).
++ * Keep the type strings and payload keys in sync with the plugin's host half
++ * (the DSH equivalent of pi's `pi.btw` projection contract). */
++const BTW_START = 'plugin:dsh-btw/start'
++const BTW_END = 'plugin:dsh-btw/end'
++const BTW_REOPEN = 'plugin:dsh-btw/reopen'
++
++/** Render one side-question exchange as the system text AA clients already show. */
++function btwText(question: string, answer: string | undefined, error: string | undefined, running: boolean): string {
++  if (error !== undefined) return `/btw ${question}\n\n${error}`
++  if (answer !== undefined) return `/btw ${question}\n\n${answer}`
++  return `/btw ${question}\n\n${running ? '正在从会话记录回答…' : '（没有返回内容）'}`
++}
+ 
+ // Older persisted logs and fixtures can still carry the pre-rc.1 chunk vocabulary.
+ type LegacyChunk = { type: 'assistant/chunk', seq: SessionEvent['seq'], time: number,
+@@ -37,6 +51,7 @@ export function createProjection(externalId: string, platformId: string, fingerp
+   const removed = new Set<string>()
+   const items = new Map<string, TimelineItem>()
+   const steps = new Map<string, number>()
++  const btwQuestions = new Map<string, string>()
+   const drafts = new Map<string, Map<number, { block: ContentBlock, seq: number, event: ProjectionEvent }>>()
+   const pendingDrafts = new Map<string, Map<number, { block: ContentBlock, seq: number, event: ProjectionEvent }>>()
+   function flushDrafts(): void {
+@@ -244,6 +259,23 @@ export function createProjection(externalId: string, platformId: string, fingerp
+     } else if (String(event.type).startsWith('compaction/')) {
+       put('event', String(event.seq), event, 'marker', 'done', 'system',
+         { kind: 'compact', title: '上下文压缩', eventType: event.type, details: json(event.data) })
++    } else if (eventType === BTW_START || eventType === BTW_END || eventType === BTW_REOPEN) {
++      const btwId = typeof data.btwId === 'string' && data.btwId.length > 0 ? data.btwId : undefined
++      if (btwId === undefined) return
++      const recordedQuestion = typeof data.question === 'string' && data.question.trim().length > 0 ? data.question : undefined
++      if (recordedQuestion !== undefined) btwQuestions.set(btwId, recordedQuestion)
++      const question = recordedQuestion ?? btwQuestions.get(btwId) ?? '（问题内容缺失）'
++      const answer = typeof data.answer === 'string' && data.answer.trim().length > 0 ? data.answer : undefined
++      const error = typeof data.error === 'string' && data.error.trim().length > 0 ? data.error : undefined
++      const running = eventType === BTW_START && answer === undefined && error === undefined
++      const failed = !running && (error !== undefined || answer === undefined)
++      const item = put('btw', btwId, event, 'system', running ? 'running' : failed ? 'failed' : 'done', 'system', {
++        kind: failed ? 'error' : 'system',
++        text: btwText(question, answer, error, running),
++      })
++      // A side question is not owned by the active turn: turn/end must not
++      // close a still-running /btw item as interrupted.
++      item.turnId = null
+     }
+     // Internal and unknown informational events deliberately produce no Timeline item.
+   }
 diff --git a/dsh-bridge-next/src/host/dsh-runtime/interaction-stream.ts b/dsh-bridge-next/src/host/dsh-runtime/interaction-stream.ts
-index aaf74180..85184769 100644
+index aaf74180..af3a62ab 100644
 --- a/dsh-bridge-next/src/host/dsh-runtime/interaction-stream.ts
 +++ b/dsh-bridge-next/src/host/dsh-runtime/interaction-stream.ts
 @@ -12,12 +12,12 @@ export type InteractionOutcome = { kind: 'next' } | { kind: 'result', value: unk
@@ -2116,6 +2456,22 @@ index aaf74180..85184769 100644
            try { await delay(500, undefined, { signal: abort.signal }) } catch { break }
          }
        }
+@@ -71,11 +77,12 @@ export class InteractionStream {
+     const ctx = this.activeContext, clientId = this.clientId
+     if (!ctx || !clientId) throw new Error('DSH 交互连接暂不可用，请稍后重试。')
+     const rpcId = randomUUID()
+-    // Public, already-authenticated in-process carrier. No HTTP request leaves the Host.
+-    const response = await ctx.connection.createSharedFetchHandler('/api').fetch(new Request('http://127.0.0.1/api/$events/result', {
++    // Use the same admitted Connection Peer as the Remote event stream.
++    const handler = ctx.connection.createSharedFetchHandler('/api')
++    const response = await Reflect.apply(handler.fetch, handler, [new Request('http://127.0.0.1/api/$events/result', {
+       method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(15_000),
+       body: JSON.stringify({ type: 'client-request', rpcId, method: '$events/result', payload: { args: { clientId, eventId, outcome } } }),
+-    }))
++    }), Reflect.get(ctx.connection, 'browserPeer')])
+     const envelope = record(await response.json())
+     if (!response.ok || envelope.type !== 'server-response' || envelope.rpcId !== rpcId || record(envelope.result).ok !== true) {
+       throw new Error('DSH 未接收回答，请稍后重试。')
 diff --git a/dsh-bridge-next/src/host/onboarding/manager.ts b/dsh-bridge-next/src/host/onboarding/manager.ts
 index 58933b51..a97faf70 100644
 --- a/dsh-bridge-next/src/host/onboarding/manager.ts
@@ -2513,12 +2869,73 @@ index 00000000..5ba7e28b
 +  assert.equal(h.service.child.exitCode, null)
 +  assert.equal(await readFile(h.configPath, 'utf8'), h.before)
 +})
+diff --git a/dsh-bridge-next/tests/integration/runtime-commands.test.ts b/dsh-bridge-next/tests/integration/runtime-commands.test.ts
+index 729aa10f..383ebf73 100644
+--- a/dsh-bridge-next/tests/integration/runtime-commands.test.ts
++++ b/dsh-bridge-next/tests/integration/runtime-commands.test.ts
+@@ -24,16 +24,24 @@ async function fixture(run: (f: Awaited<ReturnType<typeof commandRuntime>>) => P
+   try { await run(f) } finally { await f.close(); await rm(home, { recursive: true, force: true }) }
+ }
+ 
+-test('AA exposes and executes only compact even when UI-dependent commands are registered', async () => fixture(async f => {
+-  const { agent, params } = await f.create('compact-only')
++test('AA exposes and executes only the native allowlist even when UI-dependent commands are registered', async () => fixture(async f => {
++  const { agent, params } = await f.create('commands-allowlist')
+   const calls: string[] = []
+   for (const name of ['about', 'compact', 'export', 'goal', 'plan', 'model', 'file', 'feedback']) {
+     f.ctx.commands.register({ name, description: name, handler: () => { calls.push(name); return { kind: 'success' } } })
+   }
++  // dsh-btw registers a leading-input command; AA must expose it with its hint.
++  f.ctx.commands.register({ name: 'btw', description: '旁支问答', input: { hint: '问题（留空则重开上次问答）' },
++    handler: () => { calls.push('btw'); return { kind: 'success' } } })
+   const list = async (values = {}) => (await f.router.request('session.listCommands', { ...params, ...values }, signal()) as { commands: Descriptor[] }).commands
+-  assert.deepEqual((await list()).map(c => c.id), ['compact'])
+-  assert.deepEqual((await list({ limit: 1 })).map(c => c.id), ['compact'])
++  assert.deepEqual((await list()).map(c => c.id), ['btw', 'compact'])
++  assert.deepEqual((await list({ limit: 1 })).map(c => c.id), ['btw'])
+   assert.deepEqual(await list({ query: 'export' }), [])
++  const btw = (await list({ query: 'btw' }))[0]!
++  assert.equal(btw.id, 'btw')
++  assert.equal(btw.acceptsArgs, true)
++  assert.equal(btw.metadata.ui.kind, 'execute')
++  assert.equal(btw.metadata.ui.argumentHint, '问题（留空则重开上次问答）')
+   for (const command of ['about', 'export', 'goal', 'plan', 'model', 'file', 'feedback', 'permission', 'compact-thread']) {
+     const result = await f.router.request('session.executeCommand', { ...params, command, raw: `/${command}` }, signal()) as Result
+     assert.equal(result.ok, false)
+@@ -44,6 +52,10 @@ test('AA exposes and executes only compact even when UI-dependent commands are r
+   const result = await f.router.request('session.executeCommand', { ...params, command: 'compact', raw: '/compact' }, signal()) as Result
+   assert.equal(result.ok, true)
+   assert.deepEqual(calls, ['compact'])
++  const side = await f.router.request('session.executeCommand', { ...params, command: 'btw', raw: '/btw 暗号是什么？' }, signal()) as Result
++  assert.equal(side.ok, true)
++  assert.deepEqual(calls, ['compact', 'btw'])
++  assert.equal(agent.session.snapshotEvents().filter(e => e.type === 'turn/start').length, 0)
+ }))
+ 
+ test('AA does not invent compact when the native Agent has no compact command', async () => fixture(async f => {
+@@ -217,6 +229,8 @@ test('compiled native Host and actual Python public adapters execute commands ov
+       const event = inv.agent.session.append('session/title', { title: 'echo', source: { kind: 'user' }, messageSeqs: [] })
+       return { kind: 'success', text: inv.rawInput, sourceEventSeq: event.seq }
+     } })
++    f.ctx.commands.register({ name: 'btw', description: '旁支问答', input: { hint: '问题（留空则重开上次问答）' },
++      handler: () => ({ kind: 'success' }) })
+     const { stdout } = await promisify(execFile)('uv', ['run', '--frozen', 'python', 'tests/dsh_commands_probe.py', home], {
+       cwd: new URL('../../../connector/', import.meta.url), timeout: 20_000,
+     })
+@@ -224,6 +238,7 @@ test('compiled native Host and actual Python public adapters execute commands ov
+     assert.equal(f.ctx.permissionPresets.current(agent.session), 'workspace-write')
+     const events = agent.session.snapshotEvents()
+     assert.equal(events.filter(e => e.type === 'command/run' && e.data.name === 'compact' && e.data.args?.trim() === 'wait').length, 1)
++    assert.equal(events.filter(e => e.type === 'command/run' && e.data.name === 'btw').length, 1)
+     assert.equal(events.filter(e => e.type === 'turn/start').length, 0)
+     assert.equal(events.filter(e => e.type === 'user/message').length, 1)
+   } finally { await f.ctx.fiber.dispose(); await rm(home, { recursive: true, force: true }) }
 diff --git a/dsh-bridge-next/tests/unit/interaction-stream.test.ts b/dsh-bridge-next/tests/unit/interaction-stream.test.ts
 new file mode 100644
-index 00000000..9761fe08
+index 00000000..603cdd62
 --- /dev/null
 +++ b/dsh-bridge-next/tests/unit/interaction-stream.test.ts
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,109 @@
 +import assert from 'node:assert/strict'
 +import test from 'node:test'
 +import { setTimeout as delay } from 'node:timers/promises'
@@ -2591,3 +3008,94 @@ index 00000000..9761fe08
 +  } finally { await stream.close() }
 +  assert.deepEqual(availability, [true, false])
 +})
++
++for (const outcome of [{ kind: 'next' } as const, { kind: 'result', value: 'allowed-once' } as const]) {
++  test(`interaction ${outcome.kind} replies carry the event stream's admitted Peer`, async () => {
++    const peer = { principal: { kind: 'owner' }, interactions: 'answer', signal: new AbortController().signal }
++    let dispose = async () => {}, replies = 0
++    const handler = { fetch: async (request: Request, identity?: unknown) => {
++      assert.equal(identity, peer, 'Gateway rejects an event reply with an absent or different Peer')
++      const body = await request.json() as { rpcId: string, payload: { args: unknown } }
++      assert.deepEqual(body.payload.args, { clientId: 'approval-client', eventId: 'approval-event', outcome })
++      replies++
++      return Response.json({ type: 'server-response', rpcId: body.rpcId, result: { ok: true } })
++    } }
++    const ready = {
++      typertGateway: { wireStream: { open: async function (_endpoint: unknown, _payload: unknown, _uplink: unknown, identity: unknown, signal: AbortSignal) {
++        assert.equal(identity, peer)
++        return (async function* () {
++          yield { type: 'ready', clientId: 'approval-client' }
++          await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
++        })()
++      } } },
++      connection: { browserPeer: peer, createSharedFetchHandler: () => handler },
++      effect: (start: () => () => Promise<void>) => { dispose = start() },
++    }
++    const ctx = { inject: (_keys: unknown, callback: (value: typeof ready) => void) => {
++      callback(ready)
++      return { dispose: () => dispose() }
++    } }
++    const stream = new InteractionStream(ctx as never, async () => {}, () => {})
++    try {
++      for (let n = 0; n < 50 && !stream.available; n++) await delay(5)
++      assert.equal(stream.available, true)
++      await stream.reply('approval-event', outcome)
++      assert.equal(replies, 1, 'the event result reaches the admitted caller')
++      assert.equal(stream.available, true, 'acknowledging an event preserves the stream')
++    } finally { await stream.close() }
++  })
++}
+diff --git a/dsh-bridge-next/tests/unit/runtime-history.test.ts b/dsh-bridge-next/tests/unit/runtime-history.test.ts
+index 0cdffde8..de5af49a 100644
+--- a/dsh-bridge-next/tests/unit/runtime-history.test.ts
++++ b/dsh-bridge-next/tests/unit/runtime-history.test.ts
+@@ -192,6 +192,49 @@ test('compaction keeps original messages and ignores internal informational even
+   assert.ok(!items.some(item => item.content.eventType === 'extension/notice'))
+ })
+ 
++test('dsh-btw log-only records fold into one system item and survive turn closure', () => {
++  const btwStart = { type: 'plugin:dsh-btw/start', data: {
++    btwId: 'btw-1', question: '暗号是什么？', provider: 'test', model: 'test',
++  } }
++  const btwEnd = { type: 'plugin:dsh-btw/end', data: {
++    btwId: 'btw-1', answer: '42', provider: 'test', model: 'test',
++  } }
++
++  const pendingSnapshot = log([...start, btwStart, { type: 'turn/end', data: { turn: 1, reason: { kind: 'stop' } } }])
++  const pending = projectHistory(pendingSnapshot, 'platform').find(item => item.source.itemType === 'plugin:dsh-btw/start')!
++  assert.equal(pending.type, 'system')
++  assert.equal(pending.role, 'system')
++  assert.equal(pending.status, 'running')
++  assert.equal(pending.turnId, null, 'turn/end must not close an independent side question')
++  assert.equal(pending.content.kind, 'system')
++  assert.match(String(pending.content.text), /\/btw 暗号是什么？\n\n正在从会话记录回答…/)
++
++  const projection = createProjection('native', 'platform')
++  for (const event of log([...start, btwStart]).events) projection.apply(event)
++  const running = projection.drain().items.find(item => item.source.itemType === 'plugin:dsh-btw/start')!
++  const completedSnapshot = log([...start, btwStart, btwEnd])
++  for (const event of completedSnapshot.events.slice(-1)) projection.apply(event)
++  const completed = projection.drain().items.find(item => item.source.itemType === 'plugin:dsh-btw/end')!
++  assert.equal(completed.id, running.id, 'the end record updates the same timeline item')
++  assert.equal(completed.orderSeq, running.orderSeq)
++  assert.equal(completed.status, 'done')
++  assert.equal(completed.content.kind, 'system')
++  assert.equal(completed.content.text, '/btw 暗号是什么？\n\n42')
++
++  const failed = projectHistory(log([...start, btwStart, { type: 'plugin:dsh-btw/end', data: {
++    btwId: 'btw-1', error: 'provider failed',
++  } }]), 'platform').find(item => item.source.itemType === 'plugin:dsh-btw/end')!
++  assert.equal(failed.status, 'failed')
++  assert.equal(failed.content.kind, 'error')
++  assert.match(String(failed.content.text), /provider failed/)
++
++  const reopened = projectHistory(log([...start, { type: 'plugin:dsh-btw/reopen', data: {
++    btwId: 'btw-2', question: '再问一次', answer: '42',
++  } }]), 'platform').find(item => item.source.itemType === 'plugin:dsh-btw/reopen')!
++  assert.equal(reopened.status, 'done')
++  assert.equal(reopened.content.text, '/btw 再问一次\n\n42')
++})
++
+ test('canonical identities and hashes match the shared cross-language fixtures', async () => {
+   const fixture = JSON.parse(await readFile(new URL('../../../contracts/dsh-bridge/1.0/fixtures/identity.json', import.meta.url), 'utf8'))
+   for (const entry of fixture.sessionIds) assert.equal(sessionId(entry.connectorId, entry.externalSessionId), entry.sessionId)
