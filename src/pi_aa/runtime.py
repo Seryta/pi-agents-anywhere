@@ -116,6 +116,19 @@ MODEL_GROUP_ID_PREFIX = "pi-aa-group:"
 # How often the idle reclaim loop inspects live sessions.
 RECLAIM_INTERVAL_SECONDS = 15.0
 
+# Memory safety valve: reclaim a live session process whose RSS passes
+# ``maxLiveSessionBytes`` even before it goes idle. One runaway session can
+# exhaust host memory and trigger a global OOM that takes down unrelated
+# processes (the connector itself included). A running turn gets this long to
+# settle first; a reclaim that interrupts a turn is followed by an automatic
+# continue prompt so the agent resumes from the persisted session file.
+MEMORY_RECLAIM_GRACE_SECONDS = 180.0
+AUTO_CONTINUE_MAX_ATTEMPTS = 3
+AUTO_CONTINUE_PROMPT = (
+    "（系统通知）本会话因内存占用过高被自动重启，上下文已从会话文件恢复。"
+    "请从中断处继续完成未完成的工作，完成后简要说明结果。"
+)
+
 # How often the attachment cleanup loop expires inactive session attachment
 # directories (files older than the retention window, then empty directories).
 ATTACHMENT_CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
@@ -642,6 +655,22 @@ class PiLiveSession:
     @property
     def alive(self) -> bool:
         return self.process is not None and self.process.alive
+
+    def rss_bytes(self) -> int | None:
+        """Resident set size of the pi process, or None when unavailable."""
+
+        process = self.process
+        pid = process.pid if process is not None else None
+        if pid is None:
+            return None
+        try:
+            with open(f"/proc/{pid}/status", "rb") as status_file:
+                for line in status_file:
+                    if line.startswith(b"VmRSS:"):
+                        return int(line.split()[1]) * 1024
+        except (OSError, ValueError):
+            return None
+        return None
 
     def active_pending_ui(self) -> list[PendingInteraction]:
         """Open dialogs pi has not auto-resolved yet.
@@ -1223,6 +1252,28 @@ class PiRuntime(AgentRuntime):
         self.executable = str(values["executablePath"])
         self.request_timeout = int(values["requestTimeoutMs"]) / 1000
         self._idle_timeout = float(values["idleTimeoutSeconds"])
+        self._warn_live_bytes = int(values["warnLiveSessionBytes"])
+        self._max_live_bytes = int(values["maxLiveSessionBytes"])
+        self._auto_continue_after_memory_reclaim = bool(
+            values["autoContinueAfterMemoryReclaim"]
+        )
+        # Test seams for the memory valve; production uses the defaults.
+        self._memory_reclaim_grace = MEMORY_RECLAIM_GRACE_SECONDS
+        self._auto_continue_max_attempts = AUTO_CONTINUE_MAX_ATTEMPTS
+        # Platform session ids whose current memory excursion was already
+        # logged; dropped once the process falls back under the warn line.
+        self._memory_warned: set[str] = set()
+        # Sessions with an open reclaim or gave-up notice. Runtime-level for
+        # the same reason as the context warning: the reclaim swaps the
+        # PiLiveSession object, so the flags cannot live on it.
+        self._memory_reclaim_notices: set[str] = set()
+        self._memory_gaveup_notices: set[str] = set()
+        # Platform session ids seen over the memory limit, mapped to when the
+        # pressure was first observed (the grace window starts there).
+        self._memory_pressure_since: dict[str, float] = {}
+        # Consecutive auto-continue revivals per session; reset by a user turn
+        # or by the process coming back under the limit.
+        self._auto_continue_streaks: dict[str, int] = {}
         self._attachment_retention_days = int(values["attachmentRetentionDays"])
         self.default_cwd = str(values["defaultCwd"])
         self.sessions_dir = Path(str(values["sessionsDir"]))
@@ -1279,7 +1330,7 @@ class PiRuntime(AgentRuntime):
         logger.info("pi runtime started version=%s", version)
         await self._publish_runtime_capabilities()
         self._stale_reset_task = asyncio.create_task(self._reset_stale_running_states())
-        if self._idle_timeout > 0:
+        if self._idle_timeout > 0 or self._max_live_bytes > 0 or self._warn_live_bytes > 0:
             self._reclaim_task = asyncio.create_task(self._reclaim_loop())
         self._cleanup_task = asyncio.create_task(self._attachment_cleanup_loop())
 
@@ -1418,6 +1469,7 @@ class PiRuntime(AgentRuntime):
             try:
                 await asyncio.sleep(RECLAIM_INTERVAL_SECONDS)
                 await self._reclaim_idle_sessions()
+                await self._reclaim_oversized_sessions()
             except asyncio.CancelledError:
                 raise
             except Exception:  # a failed pass must not kill the loop
@@ -1455,6 +1507,224 @@ class PiRuntime(AgentRuntime):
                 now - live.last_activity,
             )
             await live.stop()
+
+    async def _reclaim_oversized_sessions(self) -> None:
+        """Reclaim live pi processes whose memory stays above the hard limit.
+
+        The idle pass above only fires once a session went quiet; this pass is
+        the safety valve for a session that keeps growing while it runs and
+        would otherwise drag the whole host into a global OOM (which kills
+        peer processes instead of just this session).
+
+        A running turn is given ``_memory_reclaim_grace`` seconds to settle so
+        the reclaim does not cut an in-flight answer short; past the grace the
+        reclaim is forced and a continue prompt is queued afterwards when
+        ``autoContinueAfterMemoryReclaim`` is enabled.
+        """
+
+        if self._max_live_bytes <= 0 and self._warn_live_bytes <= 0:
+            return
+        now = time.monotonic()
+        for session_id in list(self._live):
+            live = self._live.get(session_id)
+            if live is None:
+                continue
+            rss = live.rss_bytes()
+            if rss is None:
+                continue
+            self._update_memory_warning(session_id, rss)
+            if self._max_live_bytes <= 0 or rss < self._max_live_bytes:
+                # Back under the limit: clear the pressure window and give the
+                # session a fresh auto-continue budget.
+                self._memory_pressure_since.pop(session_id, None)
+                self._auto_continue_streaks.pop(session_id, None)
+                if session_id in self._memory_reclaim_notices:
+                    await self._resolve_memory_reclaim_notice(session_id)
+                continue
+            if live.active_pending_ui():
+                # A dialog means the turn is blocked on the user; killing the
+                # process would drop the question instead of reclaiming memory.
+                continue
+            interrupted = live.is_streaming or live.is_compacting
+            if interrupted:
+                since = self._memory_pressure_since.setdefault(session_id, now)
+                if now - since < self._memory_reclaim_grace:
+                    continue
+            logger.warning(
+                "reclaiming oversized pi session session_id=%s rss_mb=%.0f limit_mb=%.0f interrupted=%s",
+                session_id,
+                rss / 1048576,
+                self._max_live_bytes / 1048576,
+                interrupted,
+            )
+            async with self._live_lock(session_id):
+                if self._live.get(session_id) is not live:
+                    continue
+                self._live.pop(session_id, None)
+            self._memory_pressure_since.pop(session_id, None)
+            await self._publish_memory_reclaim_notice(live, rss, interrupted)
+            await live.stop()
+            if interrupted and self._auto_continue_after_memory_reclaim:
+                await self._revive_after_memory_reclaim(session_id, live)
+
+    async def _publish_memory_reclaim_notice(
+        self, live: PiLiveSession, rss: int, interrupted: bool
+    ) -> None:
+        """Tell the platform why the session restarted under it."""
+
+        message = f"会话进程内存占用 {rss / 1048576:.0f}MB，超过上限，已回收。"
+        if interrupted and self._auto_continue_after_memory_reclaim:
+            message += "正在执行的任务已被中断，会话已重启并自动发送「继续」。"
+        else:
+            message += "会话文件已保留，下一条消息会自动恢复。"
+        try:
+            await self.host.notice_upsert(
+                SessionNotice(
+                    notice_id=f"pi-memory-reclaim-{live.platform_id}",
+                    session_id=live.platform_id,
+                    runtime=RUNTIME,
+                    type="notification",
+                    title="会话内存超限，已自动回收",
+                    message=message,
+                    severity="warning",
+                    status="open",
+                    source={"runtime": RUNTIME, "component": "pi.memory"},
+                )
+            )
+        except Exception:  # a failed notice must not block the reclaim
+            logger.exception(
+                "failed to publish memory reclaim notice for %s", live.platform_id
+            )
+            return
+        self._memory_reclaim_notices.add(live.platform_id)
+
+    async def _resolve_memory_reclaim_notice(self, session_id: str) -> None:
+        """Close the reclaim notice once the session is back under the limit."""
+
+        try:
+            await self.host.notice_upsert(
+                SessionNotice(
+                    notice_id=f"pi-memory-reclaim-{session_id}",
+                    session_id=session_id,
+                    runtime=RUNTIME,
+                    type="notification",
+                    title="会话内存超限，已自动回收",
+                    message="会话内存已回落到上限以下。",
+                    severity="warning",
+                    status="resolved",
+                    source={"runtime": RUNTIME, "component": "pi.memory"},
+                )
+            )
+        except Exception:
+            logger.exception("failed to resolve memory reclaim notice for %s", session_id)
+            return
+        self._memory_reclaim_notices.discard(session_id)
+
+    async def _publish_memory_gaveup_notice(
+        self, session_id: str, attempts: int
+    ) -> None:
+        """Tell the platform that auto-continue stopped to avoid a loop."""
+
+        try:
+            await self.host.notice_upsert(
+                SessionNotice(
+                    notice_id=f"pi-memory-gaveup-{session_id}",
+                    session_id=session_id,
+                    runtime=RUNTIME,
+                    type="notification",
+                    title="自动恢复已停止",
+                    message=(
+                        f"会话已连续 {attempts} 次因内存超限被中断，"
+                        "自动「继续」已停止，避免循环消耗。"
+                        "请压缩会话或拆分任务后手动发送消息恢复。"
+                    ),
+                    severity="warning",
+                    status="open",
+                    source={"runtime": RUNTIME, "component": "pi.memory"},
+                )
+            )
+        except Exception:
+            logger.exception(
+                "failed to publish memory gave-up notice for %s", session_id
+            )
+            return
+        self._memory_gaveup_notices.add(session_id)
+
+    async def _resolve_memory_gaveup_notice(self, session_id: str) -> None:
+        """A returned user closes the gave-up notice with a fresh budget."""
+
+        if session_id not in self._memory_gaveup_notices:
+            return
+        try:
+            await self.host.notice_upsert(
+                SessionNotice(
+                    notice_id=f"pi-memory-gaveup-{session_id}",
+                    session_id=session_id,
+                    runtime=RUNTIME,
+                    type="notification",
+                    title="自动恢复已停止",
+                    message="用户已恢复交互，内存回收计数重置。",
+                    severity="warning",
+                    status="resolved",
+                    source={"runtime": RUNTIME, "component": "pi.memory"},
+                )
+            )
+        except Exception:
+            logger.exception(
+                "failed to resolve memory gave-up notice for %s", session_id
+            )
+            return
+        self._memory_gaveup_notices.discard(session_id)
+
+    async def _reset_auto_continue_budget(self, session_id: str) -> None:
+        """A user turn starts a fresh auto-continue budget for the session."""
+
+        self._auto_continue_streaks.pop(session_id, None)
+        await self._resolve_memory_gaveup_notice(session_id)
+
+    def _update_memory_warning(self, session_id: str, rss: int) -> None:
+        """Log one warning per excursion above the soft memory line."""
+
+        if self._warn_live_bytes <= 0 or rss < self._warn_live_bytes:
+            self._memory_warned.discard(session_id)
+            return
+        if session_id not in self._memory_warned:
+            self._memory_warned.add(session_id)
+            logger.warning(
+                "pi session memory above warning line session_id=%s rss_mb=%.0f warn_mb=%.0f",
+                session_id,
+                rss / 1048576,
+                self._warn_live_bytes / 1048576,
+            )
+
+    async def _revive_after_memory_reclaim(
+        self, session_id: str, stopped: PiLiveSession
+    ) -> None:
+        """Restart a reclaimed session and nudge the agent to resume its turn."""
+
+        attempts = self._auto_continue_streaks.get(session_id, 0)
+        if attempts >= self._auto_continue_max_attempts:
+            logger.warning(
+                "memory reclaim auto-continue budget exhausted session_id=%s attempts=%d",
+                session_id,
+                attempts,
+            )
+            await self._publish_memory_gaveup_notice(session_id, attempts)
+            return
+        self._auto_continue_streaks[session_id] = attempts + 1
+        try:
+            live = await self._ensure_live(session_id, stopped.external_id, None)
+            live.touch()
+            await live.send_prompt(AUTO_CONTINUE_PROMPT)
+            logger.info(
+                "memory reclaim auto-continue sent session_id=%s attempt=%d",
+                session_id,
+                attempts + 1,
+            )
+        except Exception:
+            logger.exception(
+                "memory reclaim auto-continue failed session_id=%s", session_id
+            )
 
     async def _attachment_cleanup_loop(self) -> None:
         """Run the attachment cleanup pass immediately, then on an interval.
@@ -2717,6 +2987,7 @@ class PiRuntime(AgentRuntime):
     ) -> RuntimeOperationResult:
         _ = runtime_options
         images, notes = await self._prepare_attachments(session_id, attachments)
+        await self._reset_auto_continue_budget(session_id)
         workdir = self._resolve_cwd(cwd)
         live = PiLiveSession(self, session_id, cwd=workdir)
         prompt = _prompt_with_attachment_notes(content, notes)
@@ -2744,6 +3015,9 @@ class PiRuntime(AgentRuntime):
         cwd: str | None = None,
     ) -> RuntimeOperationResult:
         images, notes = await self._prepare_attachments(session_id, attachments)
+        # A user turn is a fresh start: give the session a new auto-continue
+        # budget after a previous memory reclaim interrupted its work.
+        await self._reset_auto_continue_budget(session_id)
         live = await self._ensure_live(session_id, external_session_id, cwd)
         prompt = _prompt_with_attachment_notes(content, notes)
         logger.info(
@@ -2773,6 +3047,7 @@ class PiRuntime(AgentRuntime):
         client_message_id: str | None = None,
     ) -> RuntimeOperationResult:
         images, notes = await self._prepare_attachments(session_id, attachments)
+        await self._reset_auto_continue_budget(session_id)
         live = await self._ensure_live(session_id, external_session_id, None)
         prompt = _prompt_with_attachment_notes(content, notes)
         if live.is_streaming:

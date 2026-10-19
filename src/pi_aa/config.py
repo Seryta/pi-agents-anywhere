@@ -20,6 +20,13 @@ DEFAULT_SESSIONS_DIR = "~/.pi/agent/sessions"
 DEFAULT_CWD = "~"
 DEFAULT_REQUEST_TIMEOUT_MS = 60_000
 DEFAULT_IDLE_TIMEOUT_SECONDS = 600
+# A healthy session process sits at 30-400 MiB; 500 MiB is the early-warning
+# line and 1 GiB is the hard reclaim line. A session that big is abnormal:
+# reclaiming it protects the host from a global OOM instead of trimming a
+# normal workload.
+DEFAULT_WARN_LIVE_SESSION_BYTES = 524_288_000
+DEFAULT_MAX_LIVE_SESSION_BYTES = 1_073_741_824
+DEFAULT_AUTO_CONTINUE_AFTER_MEMORY_RECLAIM = True
 DEFAULT_ATTACHMENT_RETENTION_DAYS = 30
 PROBE_TIMEOUT_SECONDS = 20.0
 
@@ -109,6 +116,37 @@ def pi_config_schema() -> dict[str, Any]:
                 ),
                 "default": DEFAULT_IDLE_TIMEOUT_SECONDS,
             },
+            "warnLiveSessionBytes": {
+                "type": "integer",
+                "minimum": 0,
+                "title": "单会话内存警告线（字节）",
+                "description": (
+                    "会话进程常驻内存超过该值时记录一次警告日志（回落至线下后可再次触发），"
+                    "不做回收（0 表示不警告）。应低于单会话内存上限。"
+                ),
+                "default": DEFAULT_WARN_LIVE_SESSION_BYTES,
+            },
+            "maxLiveSessionBytes": {
+                "type": "integer",
+                "minimum": 0,
+                "title": "单会话内存上限（字节）",
+                "description": (
+                    "会话进程的常驻内存超过该值时会被回收，避免一个大会话耗尽整机内存"
+                    "触发全局 OOM（0 表示不限制）。正在执行的回合最多再等 3 分钟结算，"
+                    "仍超限则强制回收；被中断的回合会在回收后自动发送「继续」消息。"
+                ),
+                "default": DEFAULT_MAX_LIVE_SESSION_BYTES,
+            },
+            "autoContinueAfterMemoryReclaim": {
+                "type": "boolean",
+                "title": "内存回收后自动继续",
+                "description": (
+                    "会话因超出内存上限被回收、且中断了执行的回合时，"
+                    "自动重启会话并发送「继续」消息，让模型从中断处恢复。"
+                    "连续自动继续最多 3 次，之后停止并留给用户处理。"
+                ),
+                "default": DEFAULT_AUTO_CONTINUE_AFTER_MEMORY_RECLAIM,
+            },
             "attachmentRetentionDays": {
                 "type": "integer",
                 "minimum": 0,
@@ -128,6 +166,9 @@ def default_config_values() -> dict[str, Any]:
         "defaultCwd": DEFAULT_CWD,
         "requestTimeoutMs": DEFAULT_REQUEST_TIMEOUT_MS,
         "idleTimeoutSeconds": DEFAULT_IDLE_TIMEOUT_SECONDS,
+        "warnLiveSessionBytes": DEFAULT_WARN_LIVE_SESSION_BYTES,
+        "maxLiveSessionBytes": DEFAULT_MAX_LIVE_SESSION_BYTES,
+        "autoContinueAfterMemoryReclaim": DEFAULT_AUTO_CONTINUE_AFTER_MEMORY_RECLAIM,
         "attachmentRetentionDays": DEFAULT_ATTACHMENT_RETENTION_DAYS,
     }
 
@@ -164,6 +205,31 @@ def normalized_config_values(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise RuntimeInvalidRequestError(
             "idleTimeoutSeconds must be an integer between 0 and 86400"
         )
+
+    warn_live_bytes = values.get("warnLiveSessionBytes")
+    if (
+        not isinstance(warn_live_bytes, int)
+        or isinstance(warn_live_bytes, bool)
+        or warn_live_bytes < 0
+    ):
+        raise RuntimeInvalidRequestError("warnLiveSessionBytes must be an integer >= 0")
+
+    max_live_bytes = values.get("maxLiveSessionBytes")
+    if (
+        not isinstance(max_live_bytes, int)
+        or isinstance(max_live_bytes, bool)
+        or max_live_bytes < 0
+    ):
+        raise RuntimeInvalidRequestError("maxLiveSessionBytes must be an integer >= 0")
+
+    if max_live_bytes > 0 and warn_live_bytes > max_live_bytes:
+        raise RuntimeInvalidRequestError(
+            "warnLiveSessionBytes must not exceed maxLiveSessionBytes"
+        )
+
+    auto_continue = values.get("autoContinueAfterMemoryReclaim")
+    if not isinstance(auto_continue, bool):
+        raise RuntimeInvalidRequestError("autoContinueAfterMemoryReclaim must be a boolean")
 
     retention_days = values.get("attachmentRetentionDays")
     if (

@@ -7,6 +7,8 @@ from connector.runtime_protocol import RuntimeInvalidRequestError
 
 from pi_aa.config import (
     DEFAULT_ATTACHMENT_RETENTION_DAYS,
+    DEFAULT_MAX_LIVE_SESSION_BYTES,
+    DEFAULT_WARN_LIVE_SESSION_BYTES,
     default_config_values,
     normalized_config_values,
     pi_config_schema,
@@ -23,12 +25,22 @@ def test_schema_shape() -> None:
         "defaultCwd",
         "requestTimeoutMs",
         "idleTimeoutSeconds",
+        "warnLiveSessionBytes",
+        "maxLiveSessionBytes",
+        "autoContinueAfterMemoryReclaim",
         "attachmentRetentionDays",
     }
     retention = schema["properties"]["attachmentRetentionDays"]
     assert retention["type"] == "integer"
     assert retention["minimum"] == 0
     assert retention["default"] == DEFAULT_ATTACHMENT_RETENTION_DAYS
+    memory_limit = schema["properties"]["maxLiveSessionBytes"]
+    assert memory_limit["type"] == "integer"
+    assert memory_limit["minimum"] == 0
+    assert (memory_limit["default"]) == DEFAULT_MAX_LIVE_SESSION_BYTES
+    warn_limit = schema["properties"]["warnLiveSessionBytes"]
+    assert warn_limit["default"] == DEFAULT_WARN_LIVE_SESSION_BYTES
+    assert schema["properties"]["autoContinueAfterMemoryReclaim"]["type"] == "boolean"
     assert schema["additionalProperties"] is False
 
 

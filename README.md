@@ -152,6 +152,9 @@ loginctl enable-linger "$USER"   # 无登录会话时也保持运行
 | `defaultCwd` | `~` | 未指定工作目录时使用的目录 |
 | `requestTimeoutMs` | `60000` | 单条 RPC 命令超时 |
 | `idleTimeoutSeconds` | `600` | 空闲回收：会话进程空闲超过该时长后被关闭（0 禁用），会话文件保留，下一条消息自动恢复 |
+| `warnLiveSessionBytes` | `524288000` | 单会话内存警告线：进程常驻内存超过 500MB 时记录一次警告日志，回落至线下后可再次触发（0 禁用） |
+| `maxLiveSessionBytes` | `1073741824` | 单会话内存上限：超过 1GB 时回收会话进程，避免拖垮整机触发全局 OOM（正在执行的回合最多再等 3 分钟结算，0 禁用） |
+| `autoContinueAfterMemoryReclaim` | `true` | 回收中断了执行的回合时，自动重启会话并发送「继续」让模型从中断处恢复；连续最多 3 次后停止并留给用户处理 |
 | `attachmentRetentionDays` | `30` | 保留 N 天后清理连接器附件目录中非活跃会话的文件（0 禁用） |
 
 ### 在 AA 里执行 pi 的内置命令
