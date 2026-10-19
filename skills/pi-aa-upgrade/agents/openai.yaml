@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pi / AA / DSH 升级"
+  short_description: "按仓库维护手册升级共享 Connector、Pi 扩展与 DSH 插件"
+  default_prompt: "使用 $pi-aa-upgrade 按仓库维护手册检查并升级 Pi / AA / DSH 共享 Connector 集成。"

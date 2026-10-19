@@ -91,6 +91,8 @@ dsh plugin --profile "$PROFILE" add --ignore-scripts --save-exact \
 
 ## 后续更新与回退
 
+跨仓库源码升级、上游补丁同步和 agent 调用方式见[维护手册](MAINTENANCE.md)。
+
 Pi Python 代码更新时，在新版本目录构建并安装经过验证的 wheel，记录原入口以便回退。等待全部受影响的会话空闲，停止公共服务，切换稳定 venv 入口，再启动服务。不要在运行中的环境覆盖 Python 包。
 
 完成安装后的进程重启与诊断入口：

@@ -270,6 +270,10 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 - 本轮未执行包含实际客户端、Server 数据库和 Redis 的完整端到端流程。
 - Windows 平台；多会话并发压力。
 
+## 后续升级与维护
+
+跨仓库关系、同步上游、补丁刷新、验证和发布步骤见[维护手册](docs/MAINTENANCE.md)。下次可直接让 agent 使用 `$pi-aa-upgrade`，或先阅读本仓库 [AGENTS.md](AGENTS.md)；技能源文件随仓库保存，安装方法见手册。
+
 ## 发布状态
 
 [0.3.0](https://github.com/Seryta/pi-agents-anywhere/releases/tag/v0.3.0) 是共享 Connector 架构版本，不能按 0.2.x 的独立 Connector 方式安装。GitHub Release 提供完整匹配产物，PyPI 提供 Pi 扩展包；单独升级 PyPI 包不能完成安装。具体组件版本、迁移与发布范围见[运维与发布说明](docs/OPERATIONS.md#版本与发布)。
