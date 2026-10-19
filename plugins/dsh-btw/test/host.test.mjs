@@ -242,3 +242,19 @@ test('巨型注入上下文不会把真正的用户提问挤出预算', () => {
   assert.ok(transcript.length < 2_000, 'injected context must be summarized, not carried whole')
   assert.doesNotMatch(transcript, /Time sampled while preparing/, 'time snapshots are skipped')
 })
+
+
+test('transcript 裁剪 Unicode 字符后仍可发送给模型接口', () => {
+  // Emoji occupies two UTF-16 code units. Each budget cuts between them.
+  const cases = [
+    ['injected context', { role: 'user', source: { kind: 'agent-instructions' }, content: [{ type: 'text', text: 'x'.repeat(239) + '😀tail' }] }, {}],
+    ['tool arguments', { role: 'assistant', content: [{ type: 'tool-call', id: 'call-unicode', name: 'bash', arguments: 'x'.repeat(299) + '😀tail' }] }, {}],
+    ['tool result', { role: 'tool', content: [{ type: 'text', text: 'x'.repeat(799) + '😀tail' }] }, {}],
+    ['transcript tail', { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '😀tail' }] }, { maxTranscriptChars: 5 }],
+  ]
+  for (const [label, message, config] of cases) {
+    const transcript = buildTranscript([message], normalizeSettings(config))
+    assert.ok(transcript.isWellFormed(), `${label}: no lone surrogate may reach the provider`)
+    assert.ok(transcript.includes('…[truncated]') || transcript.includes('[earlier session context omitted]'), `${label}: the budget must still apply`)
+  }
+})

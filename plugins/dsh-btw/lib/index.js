@@ -179,8 +179,9 @@ function buildTranscript(messages, settings) {
   }
 
   const transcript = sections.join('\n\n')
-  if (transcript.length <= settings.maxTranscriptChars) return transcript
-  return `...[earlier session context omitted]\n\n${transcript.slice(-settings.maxTranscriptChars)}`
+  // UTF-16 裁剪可能切开 emoji；孤立代理项会让模型接口拒绝 JSON（HTTP 400）。
+  if (transcript.length <= settings.maxTranscriptChars) return transcript.toWellFormed()
+  return `...[earlier session context omitted]\n\n${transcript.slice(-settings.maxTranscriptChars)}`.toWellFormed()
 }
 
 /**

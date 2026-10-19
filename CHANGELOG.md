@@ -2,6 +2,8 @@
 
 ## 未发布（Connector shared.2 / DSH shared.3）
 
+- 修复 DSH `/btw` 裁剪含 emoji 的上下文时产生不完整 Unicode 字符、导致 DeepSeek 接口返回 HTTP 400 的问题。
+
 - 将 DSH `/btw` 核心插件纳入 `plugins/dsh-btw`，提供容器中的源码/打包回归及 tgz 构建入口，CI 保存可下载产物。
 
 - DSH 审批及用户回答使用与交互流相同的显式 Peer，修复审批重连风暴导致 AA 会话同步卡在启动中的问题。
