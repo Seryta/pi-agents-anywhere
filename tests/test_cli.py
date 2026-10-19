@@ -1,279 +1,72 @@
-"""CLI behaviour tests: implicit start, error mapping, lease bookkeeping."""
+"""The Pi alias uses the official lifecycle and packaged provider registry."""
 
 from __future__ import annotations
 
-import logging
-import types
-from pathlib import Path
-from typing import Any
+from importlib.metadata import EntryPoint
+from unittest.mock import AsyncMock
 
-import httpx
 import pytest
+from connector import cli as official_cli
+from connector.runtimes import providers
 
 from pi_aa import cli
-
-
-class FakeLease:
-    def __init__(self, **_: Any) -> None:
-        self.claims: list[Any] = []
-        self.released = 0
-
-    def claim(self, config: Any = None) -> None:
-        self.claims.append(config)
-
-    def release(self) -> None:
-        self.released += 1
-
-
-class FakeConfig:
-    def __init__(self, **values: Any) -> None:
-        self.values = values
-        self.saved_to: Path | None = None
-
-    @staticmethod
-    def default_path() -> Path:
-        return Path("/tmp/pi-aa-test/connector.json")
-
-    @staticmethod
-    def load(path: str | Path) -> FakeConfig:
-        raise FileNotFoundError(path)
-
-    @staticmethod
-    def from_mapping(payload: dict[str, Any]) -> FakeConfig:
-        return FakeConfig(**payload)
-
-    def save(self, path: str | Path) -> Path:
-        self.saved_to = Path(path)
-        return self.saved_to
-
-
-class FakeClient:
-    def __init__(self) -> None:
-        self.ran = False
-
-    async def run_forever(self) -> None:
-        self.ran = True
-
-
-def install_fakes(
-    monkeypatch: pytest.MonkeyPatch,
-    lease: FakeLease,
-    client: FakeClient,
-) -> None:
-    """Replace the connector import surface with test doubles."""
-
-    def require() -> tuple[Any, ...]:
-        return (
-            FakeConfig,
-            lambda **_: lease,
-            lambda: (),
-            lambda config, agent_runtime_providers=None: client,
-        )
-
-    monkeypatch.setattr(cli, "_require_connector", require)
-
-
-def fail_with(exc: Exception) -> Any:
-    async def _pair(args: Any, connector_config: Any, runtime_lease: Any) -> None:
-        raise exc
-
-    return _pair
-
-
-def test_bare_invocation_starts_connector(monkeypatch: pytest.MonkeyPatch) -> None:
-    lease, client = FakeLease(), FakeClient()
-    install_fakes(monkeypatch, lease, client)
-    monkeypatch.setenv("AGENT_SERVER_URL", "https://example.test")
-    monkeypatch.setenv("AGENT_CONNECTOR_ID", "conn_test")
-    monkeypatch.setenv("AGENT_CONNECTOR_TOKEN", "tok_test")
-
-    cli.main([])
-
-    assert client.ran is True
-    assert lease.released == 1
-    # The lease keeps the resolved config so the runtime state records the
-    # connector identity, exactly like upstream does.
-    assert len(lease.claims) == 1
-    assert lease.claims[0].values["connector_id"] == "conn_test"
-
-
-def test_pair_network_error_is_reported(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    install_fakes(monkeypatch, FakeLease(), FakeClient())
-    monkeypatch.setattr(
-        cli,
-        "_pair",
-        fail_with(
-            httpx.ConnectError(
-                "All connection attempts failed",
-                request=httpx.Request("POST", "https://example.test/api/v2/pairing"),
-            )
-        ),
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["pair", "https://example.test"])
-
-    assert excinfo.value.code == 2
-    assert "cannot reach server" in capsys.readouterr().err
-
-
-def test_pair_timeout_is_reported(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    install_fakes(monkeypatch, FakeLease(), FakeClient())
-    monkeypatch.setattr(
-        cli,
-        "_pair",
-        fail_with(
-            httpx.ConnectTimeout(
-                "timed out",
-                request=httpx.Request("POST", "https://example.test/api/v2/pairing"),
-            )
-        ),
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["pair", "https://example.test"])
-
-    assert excinfo.value.code == 2
-    assert "request timed out" in capsys.readouterr().err
-
-
-def test_pair_http_error_uses_server_detail(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    install_fakes(monkeypatch, FakeLease(), FakeClient())
-    response = httpx.Response(400, json={"detail": "pairing code expired"})
-    monkeypatch.setattr(
-        cli,
-        "_pair",
-        fail_with(
-            httpx.HTTPStatusError(
-                "bad request",
-                request=httpx.Request("POST", "https://example.test/api/v2/pairing"),
-                response=response,
-            )
-        ),
-    )
-
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["pair", "https://example.test"])
-
-    assert excinfo.value.code == 2
-    err = capsys.readouterr().err
-    assert "HTTP 400" in err
-    assert "pairing code expired" in err
-
-
-def test_configure_saves_config(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    install_fakes(monkeypatch, FakeLease(), FakeClient())
-
-    cli.main(
-        [
-            "configure",
-            "--server-url",
-            "https://example.test/",
-            "--connector-id",
-            "conn_test",
-            "--connector-token",
-            "tok_test",
-        ]
-    )
-
-    assert "Saved connector config" in capsys.readouterr().out
+from pi_aa.runtime import PiRuntime
 
 
 @pytest.mark.parametrize(
-    "args",
+    "args, expected",
     [
-        ["--poll-interval", "0"],
-        ["--poll-interval", "-1"],
-        ["--timeout", "0"],
+        ([], ["start"]),
+        (["start"], ["start"]),
+        (["serve", "--socket", "/tmp/control.sock"], ["serve", "--socket", "/tmp/control.sock"]),
+        (["rpc"], ["rpc"]),
+        (
+            ["pair", "https://aa.example.test", "--no-start"],
+            ["pair", "https://aa.example.test", "--no-start"],
+        ),
     ],
 )
-def test_pair_rejects_non_positive_seconds(
-    args: list[str], capsys: pytest.CaptureFixture[str]
-) -> None:
-    # Zero or negative seconds would turn the pairing poll into a busy loop.
-    with pytest.raises(SystemExit) as excinfo:
-        cli.main(["pair", "https://example.test", *args])
-    assert excinfo.value.code == 2
+def test_alias_delegates_to_official_cli(monkeypatch, args, expected):
+    calls = []
+    monkeypatch.setattr(official_cli, "main", lambda argv: calls.append(argv))
+    cli.main(args)
+    assert calls == [expected]
+
+
+def test_pi_is_loaded_as_an_extension_alongside_official_providers(monkeypatch):
+    point = EntryPoint(
+        name="pi", value="pi_aa.provider:PiProvider", group="agents_anywhere.runtime_providers.v1"
+    )
+    monkeypatch.setattr(providers, "entry_points", lambda **kwargs: [point])
+    loaded = providers.default_runtime_providers()
+    assert [provider.runtime_type for provider in loaded] == ["codex", "claude", "dsh", "pi"]
+    assert type(loaded[2]) is providers.DshProvider
+
+
+@pytest.mark.asyncio
+async def test_reconnect_uses_the_public_runtime_callback():
+    runtime = object.__new__(PiRuntime)
+    runtime.reannounce_session_states = AsyncMock()
+    runtime._publish_runtime_capabilities = AsyncMock()
+    await runtime.on_backend_reconnect()
+    runtime._publish_runtime_capabilities.assert_awaited_once_with()
+    runtime.reannounce_session_states.assert_awaited_once_with(reason="backend-reconnect")
+
+
+def test_alias_reports_incompatible_upstream(monkeypatch, capsys):
+    monkeypatch.delattr(providers, "RUNTIME_PROVIDER_ENTRY_POINT_GROUP")
+    with pytest.raises(SystemExit) as error:
+        cli.main(["start"])
+    assert error.value.code == 2
+    assert "tested shared-connector integration" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [("--poll-interval", "0"), ("--poll-interval", "-1"), ("--timeout", "0"), ("--timeout", "nan")],
+)
+def test_delegated_pairing_preserves_duration_validation(option, value, capsys):
+    with pytest.raises(SystemExit) as error:
+        cli.main(["pair", "https://example.test", option, value])
+    assert error.value.code == 2
     assert "must be greater than zero" in capsys.readouterr().err
-
-
-async def test_install_reconnect_reannounce_calls_pi_runtime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The reconnect hook must reach the Pi runtime, not just the original hook."""
-
-    import pi_aa.runtime as runtime_module
-
-    announced: list[str] = []
-
-    class FakePiRuntime:
-        async def reannounce_session_states(self, *, reason: str) -> None:
-            announced.append(reason)
-
-    monkeypatch.setattr(runtime_module, "PiRuntime", FakePiRuntime)
-    pi_runtime = FakePiRuntime()
-
-    class FakeRuntimeSync:
-        def __init__(self) -> None:
-            self.supervisor = types.SimpleNamespace(
-                runtimes={"rti_pi": None},
-                resolve_runtime=lambda runtime_id: pi_runtime,
-            )
-
-        async def reconnect_event_runtimes(self) -> None:
-            return None
-
-    client = types.SimpleNamespace(_runtime_sync=FakeRuntimeSync())
-    cli.install_reconnect_reannounce(client)
-    await client._runtime_sync.reconnect_event_runtimes()
-
-    assert announced == ["backend-reconnect"]
-
-
-async def test_reannounce_skips_runtimes_that_fail_to_resolve() -> None:
-    """One broken runtime must not stop the others from re-announcing."""
-
-    resolved: list[str] = []
-
-    def resolve_runtime(runtime_id: str) -> Any:
-        if runtime_id == "rti_bad":
-            raise RuntimeError("boom")
-        resolved.append(runtime_id)
-        return types.SimpleNamespace()
-
-    class FakeRuntimeSync:
-        def __init__(self) -> None:
-            self.supervisor = types.SimpleNamespace(
-                runtimes={"rti_bad": None, "rti_ok": None},
-                resolve_runtime=resolve_runtime,
-            )
-
-        async def reconnect_event_runtimes(self) -> None:
-            return None
-
-    client = types.SimpleNamespace(_runtime_sync=FakeRuntimeSync())
-    cli.install_reconnect_reannounce(client)
-    await client._runtime_sync.reconnect_event_runtimes()
-
-    assert resolved == ["rti_ok"]
-
-
-def test_install_reconnect_reannounce_warns_without_hook(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A changed official client surface degrades to a warning, not a crash."""
-
-    client = types.SimpleNamespace()
-
-    with caplog.at_level(logging.WARNING, logger="pi_aa.cli"):
-        cli.install_reconnect_reannounce(client)
-
-    assert any("reconnect_event_runtimes" in record.getMessage() for record in caplog.records)

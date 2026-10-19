@@ -1,6 +1,6 @@
 [project]
 name = "pi-agents-anywhere"
-version = "0.2.2"
+version = "0.3.0"
 description = "Pi coding agent as an Agents Anywhere runtime (connector adapter)"
 readme = "README.md"
 license = "MIT"
@@ -18,12 +18,15 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "anywhere-cli>=2.0.0",
+    "anywhere-cli==2.0.3",
 ]
 
 [project.urls]
 Repository = "https://github.com/Seryta/pi-agents-anywhere"
 Issues = "https://github.com/Seryta/pi-agents-anywhere/issues"
+
+[project.entry-points."agents_anywhere.runtime_providers.v1"]
+pi = "pi_aa.provider:PiProvider"
 
 [project.scripts]
 pi-aa-connector = "pi_aa.cli:main"

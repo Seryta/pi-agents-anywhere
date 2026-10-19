@@ -1373,6 +1373,10 @@ class PiRuntime(AgentRuntime):
             if process is not None:
                 await process.close()
 
+    async def on_backend_reconnect(self) -> None:
+        await self._publish_runtime_capabilities()
+        await self.reannounce_session_states(reason="backend-reconnect")
+
     async def reannounce_session_states(self, *, reason: str = "reconnect") -> None:
         """Publish the authoritative state of every known session.
 
