@@ -138,9 +138,7 @@ async def test_memory_gaveup_notice_is_resolved_by_a_user_turn(
     await runtime.start()
     try:
         await runtime.create_and_start_session("sess-mem-gaveup", "hello", cwd=str(tmp_path))
-        gaveup = [
-            n for n in fake_host.notices if n.notice_id == "pi-memory-gaveup-sess-mem-gaveup"
-        ]
+        gaveup = [n for n in fake_host.notices if n.notice_id == "pi-memory-gaveup-sess-mem-gaveup"]
         assert [n.status for n in gaveup] == ["open", "resolved"]
     finally:
         await runtime.stop()

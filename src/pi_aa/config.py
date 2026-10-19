@@ -223,9 +223,7 @@ def normalized_config_values(raw: Mapping[str, Any]) -> dict[str, Any]:
         raise RuntimeInvalidRequestError("maxLiveSessionBytes must be an integer >= 0")
 
     if max_live_bytes > 0 and warn_live_bytes > max_live_bytes:
-        raise RuntimeInvalidRequestError(
-            "warnLiveSessionBytes must not exceed maxLiveSessionBytes"
-        )
+        raise RuntimeInvalidRequestError("warnLiveSessionBytes must not exceed maxLiveSessionBytes")
 
     auto_continue = values.get("autoContinueAfterMemoryReclaim")
     if not isinstance(auto_continue, bool):

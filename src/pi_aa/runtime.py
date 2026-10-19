@@ -1254,9 +1254,7 @@ class PiRuntime(AgentRuntime):
         self._idle_timeout = float(values["idleTimeoutSeconds"])
         self._warn_live_bytes = int(values["warnLiveSessionBytes"])
         self._max_live_bytes = int(values["maxLiveSessionBytes"])
-        self._auto_continue_after_memory_reclaim = bool(
-            values["autoContinueAfterMemoryReclaim"]
-        )
+        self._auto_continue_after_memory_reclaim = bool(values["autoContinueAfterMemoryReclaim"])
         # Test seams for the memory valve; production uses the defaults.
         self._memory_reclaim_grace = MEMORY_RECLAIM_GRACE_SECONDS
         self._auto_continue_max_attempts = AUTO_CONTINUE_MAX_ATTEMPTS
@@ -1596,9 +1594,7 @@ class PiRuntime(AgentRuntime):
                 )
             )
         except Exception:  # a failed notice must not block the reclaim
-            logger.exception(
-                "failed to publish memory reclaim notice for %s", live.platform_id
-            )
+            logger.exception("failed to publish memory reclaim notice for %s", live.platform_id)
             return
         self._memory_reclaim_notices.add(live.platform_id)
 
@@ -1624,9 +1620,7 @@ class PiRuntime(AgentRuntime):
             return
         self._memory_reclaim_notices.discard(session_id)
 
-    async def _publish_memory_gaveup_notice(
-        self, session_id: str, attempts: int
-    ) -> None:
+    async def _publish_memory_gaveup_notice(self, session_id: str, attempts: int) -> None:
         """Tell the platform that auto-continue stopped to avoid a loop."""
 
         try:
@@ -1648,9 +1642,7 @@ class PiRuntime(AgentRuntime):
                 )
             )
         except Exception:
-            logger.exception(
-                "failed to publish memory gave-up notice for %s", session_id
-            )
+            logger.exception("failed to publish memory gave-up notice for %s", session_id)
             return
         self._memory_gaveup_notices.add(session_id)
 
@@ -1674,9 +1666,7 @@ class PiRuntime(AgentRuntime):
                 )
             )
         except Exception:
-            logger.exception(
-                "failed to resolve memory gave-up notice for %s", session_id
-            )
+            logger.exception("failed to resolve memory gave-up notice for %s", session_id)
             return
         self._memory_gaveup_notices.discard(session_id)
 
@@ -1701,9 +1691,7 @@ class PiRuntime(AgentRuntime):
                 self._warn_live_bytes / 1048576,
             )
 
-    async def _revive_after_memory_reclaim(
-        self, session_id: str, stopped: PiLiveSession
-    ) -> None:
+    async def _revive_after_memory_reclaim(self, session_id: str, stopped: PiLiveSession) -> None:
         """Restart a reclaimed session and nudge the agent to resume its turn."""
 
         attempts = self._auto_continue_streaks.get(session_id, 0)
@@ -1726,9 +1714,7 @@ class PiRuntime(AgentRuntime):
                 attempts + 1,
             )
         except Exception:
-            logger.exception(
-                "memory reclaim auto-continue failed session_id=%s", session_id
-            )
+            logger.exception("memory reclaim auto-continue failed session_id=%s", session_id)
 
     async def _attachment_cleanup_loop(self) -> None:
         """Run the attachment cleanup pass immediately, then on an interval.
