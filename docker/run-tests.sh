@@ -26,6 +26,9 @@ ARGS=(--rm
     -v "${REPO}:/work"
     -v "${AA_CONNECTOR}:/aa/connector:ro"
     -w /work)
+if [[ -d "${AA_CONNECTOR}/../contracts" ]]; then
+    ARGS+=(-v "${AA_CONNECTOR}/../contracts:/aa/contracts:ro")
+fi
 
 # A real model turn needs pi's account/config state, and pi must be able to
 # write locks and session files, so use a throwaway writable copy.

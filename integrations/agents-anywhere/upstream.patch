@@ -1,0 +1,2593 @@
+diff --git a/connector/README.md b/connector/README.md
+index f87574d2..8629a4d6 100644
+--- a/connector/README.md
++++ b/connector/README.md
+@@ -197,3 +197,36 @@ uv run pytest -q
+ ```
+ 
+ DSH 插件默认将私有数据存放在 `~/.agents-anywhere/dsh-bridge-next/`，其托管 Connector 通过 `AGENT_CONNECTOR_DATA_DIR` 使用其中的 `connector/` 子目录。插件首次启动负责迁移旧 `.agentsanywhere/dsh-bridge-next/` 数据；通用 Connector 的默认路径和自定义环境变量行为不变。
++
++
++## Shared service and installed Runtime extensions
++
++`anywhere-cli serve` runs the per-user Connector independently of any UI process.
++It owns one device identity, config and RuntimeLease. Local management clients use
++`~/.agents-anywhere/connector.sock` (0600 in a private directory); disconnecting a
++client does not stop Agent runtimes. Only explicit stop/restart operations do so.
++`anywhere-cli doctor --expect-runtime pi --expect-runtime dsh` emits JSON and exits
++nonzero when the installation or local service is unhealthy. It does not verify
++backend presence or a model turn.
++
++Installed Python providers are discovered through the versioned entry point group
++`agents_anywhere.runtime_providers.v1`. Built-in providers remain unchanged and
++cannot be replaced by extensions. See [the extension contract](../docs/runtime-protocol/runtime-extensions.md)
++and [the local control protocol](../contracts/connector-local-control/v1/README.md).
++The current shared-service transport targets Unix systems; the existing stdio RPC
++and CLI remain available.
++
++
++### Updating runtime extension code
++
++Runtime entry points load Python code into the shared Connector process; they do
++not provide hot reload or a separate worker. After installing a new extension or
++Connector wheel, restart the host process (`systemctl --user restart
++agents-anywhere-connector.service` in the shared-service deployment). All runtimes
++on that device may be interrupted, so wait for active work to settle first.
++
++The control RPC `connector.restart` only rebuilds the backend task inside the same
++Python process. It does not reliably load changed modules. Neither restarting a
++single Runtime nor Pi's native `/reload` substitutes for a process restart. Editing
++a source checkout also has no effect on an installed wheel. See the
++[runtime extension lifecycle](../docs/runtime-protocol/runtime-extensions.md).
+diff --git a/connector/connector/cli.py b/connector/connector/cli.py
+index 67064595..1e5497a0 100644
+--- a/connector/connector/cli.py
++++ b/connector/connector/cli.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import argparse
+ import asyncio
++import math
+ import os
+ import sys
+ import time
+@@ -41,6 +42,20 @@ def main(argv: list[str] | None = None) -> None:
+             _configure(args)
+         elif args.command == "start":
+             asyncio.run(_start(args))
++        elif args.command == "doctor":
++            import json
++
++            from connector.management.doctor import diagnose
++            from connector.management.service import default_socket_path
++
++            result = asyncio.run(diagnose(Path(args.socket) if args.socket else default_socket_path(), args.expect_runtime))
++            print(json.dumps(result, ensure_ascii=False))
++            if not result["ok"]:
++                raise SystemExit(1)
++        elif args.command == "serve":
++            from connector.management.service import default_socket_path, run_service
++
++            asyncio.run(run_service(args.config, args.socket or default_socket_path()))
+         elif args.command == "rpc":
+             asyncio.run(_rpc(args))
+         else:
+@@ -80,7 +95,7 @@ def _build_parser() -> argparse.ArgumentParser:
+         prog="anywhere-cli", description="Agent Server Codex connector CLI"
+     )
+     subparsers = parser.add_subparsers(
+-        dest="command", metavar="{start,pair,configure,rpc}"
++        dest="command", metavar="{start,pair,configure,rpc,serve,doctor}"
+     )
+ 
+     start = subparsers.add_parser("start", help="start the connector")
+@@ -109,6 +124,13 @@ def _build_parser() -> argparse.ArgumentParser:
+     )
+     _add_config_args(rpc)
+     _add_debug_arg(rpc)
++    serve = subparsers.add_parser("serve", help="run the per-user shared Connector service")
++    _add_config_args(serve)
++    _add_debug_arg(serve)
++    serve.add_argument("--socket", help="absolute Unix socket path for local control")
++    doctor = subparsers.add_parser("doctor", help="check the installed shared service; emit JSON")
++    doctor.add_argument("--socket", help="absolute shared service Unix socket path")
++    doctor.add_argument("--expect-runtime", action="append", default=[], help="required installed runtime type (repeatable)")
+     return parser
+ 
+ 
+@@ -128,6 +150,16 @@ def _add_debug_arg(parser: argparse.ArgumentParser) -> None:
+     )
+ 
+ 
++def _positive_seconds(value: str) -> float:
++    try:
++        seconds = float(value)
++    except ValueError:
++        raise argparse.ArgumentTypeError("invalid duration") from None
++    if not math.isfinite(seconds) or seconds <= 0:
++        raise argparse.ArgumentTypeError("must be greater than zero and finite")
++    return seconds
++
++
+ def _add_pair_args(parser: argparse.ArgumentParser) -> None:
+     _add_config_args(parser)
+     _add_debug_arg(parser)
+@@ -137,10 +169,10 @@ def _add_pair_args(parser: argparse.ArgumentParser) -> None:
+         help="backend server URL, for example anywhere.com or https://api.anywhere.com",
+     )
+     parser.add_argument(
+-        "--poll-interval", type=float, default=2, help="seconds between pairing polls"
++        "--poll-interval", type=_positive_seconds, default=2, help="seconds between pairing polls"
+     )
+     parser.add_argument(
+-        "--timeout", type=float, default=600, help="pairing timeout in seconds"
++        "--timeout", type=_positive_seconds, default=600, help="pairing timeout in seconds"
+     )
+     parser.add_argument(
+         "--no-start",
+@@ -190,13 +222,11 @@ async def _rpc(args: argparse.Namespace) -> None:
+ 
+ async def _pair(args: argparse.Namespace) -> None:
+     lease = RuntimeLease(legacy_paths=[Path(args.config).with_name("connector-runtime.json")])
+-    if not args.no_start:
+-        lease.claim()
++    lease.claim()
+     try:
+         await _pair_with_lease(args, lease)
+     finally:
+-        if not args.no_start:
+-            lease.release()
++        lease.release()
+ 
+ 
+ async def _pair_with_lease(args: argparse.Namespace, lease: RuntimeLease) -> None:
+@@ -266,8 +296,13 @@ def _configure(args: argparse.Namespace) -> None:
+         connector_id=args.connector_id,
+         connector_token=args.connector_token,
+     )
+-    path = config.save(args.config)
+-    print(f"Saved connector config: {path}")
++    lease = RuntimeLease(legacy_paths=[Path(args.config).with_name("connector-runtime.json")])
++    lease.claim(config)
++    try:
++        path = config.save(args.config)
++        print(f"Saved connector config: {path}")
++    finally:
++        lease.release()
+ 
+ 
+ def _resolve_config(args: argparse.Namespace) -> ConnectorConfig:
+diff --git a/connector/connector/core/runtime_owner.py b/connector/connector/core/runtime_owner.py
+index ef9f47f4..2c40aaaa 100644
+--- a/connector/connector/core/runtime_owner.py
++++ b/connector/connector/core/runtime_owner.py
+@@ -195,7 +195,8 @@ def _legacy_process_identity(pid: int) -> str | None:
+ def _connector_command(executable: str, arguments: list[str]) -> bool:
+     """Recognize the running Connector entry point, not an app or uv parent."""
+     name = Path(executable.replace("\\", "/")).name.lower()
+-    entry_points = {"anywhere-cli", "agent-connector", "anywhere-cli.exe", "agent-connector.exe"}
++    entry_points = {"anywhere-cli", "agent-connector", "pi-aa-connector",
++                    "anywhere-cli.exe", "agent-connector.exe", "pi-aa-connector.exe"}
+     if name in entry_points:
+         return True
+     if not name.startswith(("python", "pypy")):
+diff --git a/connector/connector/logging.py b/connector/connector/logging.py
+index 68371565..62ef7360 100644
+--- a/connector/connector/logging.py
++++ b/connector/connector/logging.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import logging
+ import sys
+ from collections.abc import Awaitable, Callable
+ from typing import Any
+@@ -21,6 +22,17 @@ def configure_connector_logging(*, debug: bool = False) -> None:
+     level = "DEBUG" if debug else "INFO"
+     logger.remove()
+     logger.add(sys.stderr, level=level, format=DEFAULT_LOG_FORMAT)
++    # Runtime extensions can use Python's standard logging API.
++    logging.basicConfig(handlers=[_StdlibLogHandler()], level=level, force=True)
++
++
++class _StdlibLogHandler(logging.Handler):
++    def emit(self, record: logging.LogRecord) -> None:
++        try:
++            level: str | int = logger.level(record.levelname).name
++        except ValueError:
++            level = record.levelno
++        logger.opt(exception=record.exc_info).log(level, record.getMessage())
+ 
+ 
+ class RpcLogSink:
+diff --git a/connector/connector/management/__init__.py b/connector/connector/management/__init__.py
+new file mode 100644
+index 00000000..e2263cab
+--- /dev/null
++++ b/connector/connector/management/__init__.py
+@@ -0,0 +1 @@
++"""Shared local Connector management and diagnostics."""
+diff --git a/connector/connector/management/doctor.py b/connector/connector/management/doctor.py
+new file mode 100644
+index 00000000..f24c2a38
+--- /dev/null
++++ b/connector/connector/management/doctor.py
+@@ -0,0 +1,75 @@
++"""Machine-readable checks for the installed shared Connector integration."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++from importlib.metadata import PackageNotFoundError, version
++from pathlib import Path
++from typing import Any
++
++from connector.runtimes.providers import default_runtime_providers
++
++
++async def diagnose(socket_path: Path, expected_runtimes: list[str]) -> dict[str, Any]:
++    result: dict[str, Any] = {"ok": False, "checks": {}, "errors": []}
++    checks = result["checks"]
++    try:
++        checks["runtimeTypes"] = [
++            provider.runtime_type for provider in default_runtime_providers()
++        ]
++        missing = sorted(set(expected_runtimes) - set(checks["runtimeTypes"]))
++        if missing:
++            result["errors"].append("Missing runtime extensions: " + ", ".join(missing))
++        checks["versions"] = {}
++        for package in ("anywhere-cli", "pi-agents-anywhere"):
++            try:
++                checks["versions"][package] = version(package)
++            except PackageNotFoundError:
++                pass
++        info = socket_path.lstat()
++        checks["privateSocket"] = (
++            info.st_mode & 0o077 == 0 and info.st_uid == os.getuid()
++        )
++        if not checks["privateSocket"]:
++            result["errors"].append(
++                "Local socket must be private and owned by the current user"
++            )
++            return result
++        async with asyncio.timeout(5):
++            reader, writer = await asyncio.open_unix_connection(socket_path)
++            try:
++                for index, (method, key) in enumerate(
++                    (
++                        ("connector.getState", "state"),
++                        ("connector.getIdentity", "identity"),
++                    )
++                ):
++                    writer.write(
++                        json.dumps(
++                            {"jsonrpc": "2.0", "id": index, "method": method}
++                        ).encode()
++                        + b"\n"
++                    )
++                    await writer.drain()
++                    while True:
++                        frame = json.loads(await reader.readline())
++                        if frame.get("id") == index:
++                            if "error" in frame:
++                                raise RuntimeError("Local control request was rejected")
++                            checks[key] = frame["result"]
++                            break
++            finally:
++                writer.close()
++                await writer.wait_closed()
++        if checks["state"].get("protocolVersion") != 1:
++            result["errors"].append("Unsupported local control protocol")
++        if not checks["state"].get("running") or checks["state"].get("authFailed"):
++            result["errors"].append(
++                "Connector is stopped or requires credential recovery"
++            )
++    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
++        result["errors"].append(str(exc))
++    result["ok"] = not result["errors"]
++    return result
+diff --git a/connector/connector/management/service.py b/connector/connector/management/service.py
+new file mode 100644
+index 00000000..bd85a853
+--- /dev/null
++++ b/connector/connector/management/service.py
+@@ -0,0 +1,457 @@
++"""Per-user Connector service; local clients never own the backend connection."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import signal
++import socket
++import time
++from collections import deque
++from dataclasses import replace
++from pathlib import Path
++from typing import Any
++from urllib.parse import quote, urlsplit
++from uuid import uuid4
++
++import httpx
++
++from connector.control import ConnectorController
++from connector.core.config import ConnectorConfig
++from connector.core.json_rpc import JsonRpcError, JsonRpcStdioServer
++from connector.logging import logger
++from connector.paths import connector_data_dir
++from connector.server.urls import api_v2_url
++
++MAX_FRAME_BYTES = 1024 * 1024
++
++
++def default_socket_path() -> Path:
++    return connector_data_dir() / "connector.sock"
++
++
++class ConnectorService:
++    def __init__(
++        self, controller: ConnectorController, socket_path: str | Path
++    ) -> None:
++        self.controller = controller
++        self.socket_path = Path(socket_path)
++        if not self.socket_path.is_absolute():
++            raise ValueError("Connector socket path must be absolute")
++        self._clients: set[JsonRpcStdioServer] = set()
++        self._tasks: set[asyncio.Task[Any]] = set()
++        self._logs: deque[dict[str, Any]] = deque(maxlen=10000)
++        self._log_sequence = time.time_ns() // 1000
++        self._redactions: set[str] = set()
++        self._log_sink: int | None = None
++        self._operations = asyncio.Lock()
++        self._server: asyncio.Server | None = None
++        self._socket_inode: int | None = None
++        self.controller.notifier = self.notify
++
++    def get_state(self, _params: Any = None) -> dict[str, Any]:
++        return {**self.controller.get_state(), "protocolVersion": 1}
++
++    def get_identity(self, _params: Any = None) -> dict[str, str] | None:
++        if not self.controller.config_path.exists():
++            return None
++        config = ConnectorConfig.load(self.controller.config_path)
++        return {"serverUrl": config.server_url, "connectorId": config.connector_id}
++
++    async def notify(self, method: str, params: Any) -> None:
++        # Pairing notifications from the stdio Controller may contain credentials.
++        if method != "connector/state":
++            return
++        for client in tuple(self._clients):
++            try:
++                async with asyncio.timeout(1):
++                    await client.notify(method, self.get_state())
++            except (OSError, TimeoutError):
++                client.writer.close()
++                self._clients.discard(client)
++
++    def capture_log(self, message: Any) -> None:
++        text = message.record["message"]
++        for secret in self._redactions:
++            text = text.replace(secret, "[REDACTED]")
++        text = text.encode("utf-8")[:2048].decode("utf-8", errors="ignore")
++        self._log_sequence += 1
++        self._logs.append(
++            {
++                "id": self._log_sequence,
++                "time": message.record["time"].isoformat(),
++                "text": text,
++            }
++        )
++
++    def read_logs(self, params: Any = None) -> dict[str, Any]:
++        params = {} if params is None else params
++        if (
++            not isinstance(params, dict)
++            or set(params) - {"before", "after"}
++            or any(
++                not isinstance(value, int) or isinstance(value, bool) or value < 0
++                for value in params.values()
++            )
++        ):
++            raise JsonRpcError(-32602, "Invalid log pagination parameters")
++        rows = [
++            row
++            for row in self._logs
++            if row["id"] < params.get("before", float("inf"))
++            and row["id"] > params.get("after", -1)
++        ]
++        return {
++            "entries": rows[:200] if "after" in params else rows[-200:],
++            "hasMore": len(rows) > 200,
++            "oldestId": self._logs[0]["id"] if self._logs else None,
++            "newestId": self._logs[-1]["id"] if self._logs else None,
++        }
++
++    async def attach_account(self, params: Any) -> dict[str, str]:
++        if not isinstance(params, dict):
++            raise JsonRpcError(-32602, "Account parameters are required")
++        server = params.get("serverUrl")
++        token = params.get("accessToken")
++        user_id = params.get("userId")
++        recovery = params.get("recovery")
++        if not all(
++            isinstance(value, str) and value for value in (server, token, user_id)
++        ) or recovery not in (None, "reconnect", "recreate"):
++            raise JsonRpcError(-32602, "Invalid account parameters")
++        self._redactions.add(token)
++        server = server.rstrip("/")
++        parsed = urlsplit(server)
++        if (
++            parsed.scheme not in {"http", "https"}
++            or not parsed.hostname
++            or parsed.username
++            or parsed.query
++            or parsed.fragment
++        ):
++            raise JsonRpcError(-32602, "Invalid server URL")
++        config = (
++            ConnectorConfig.load(self.controller.config_path)
++            if self.controller.config_path.exists()
++            else None
++        )
++        if config is not None and config.server_url.rstrip("/") != server:
++            raise JsonRpcError(
++                -32000, "公共 Connector 已连接其他服务器，请先在公共服务中切换。"
++            )
++        owner_path = self.controller.config_path.with_name("connector-owner.json")
++        owner = json.loads(owner_path.read_text()) if owner_path.exists() else None
++        if (
++            config is not None
++            and isinstance(owner, dict)
++            and owner.get("connectorId") == config.connector_id
++            and owner.get("serverUrl") == server
++            and owner.get("userId") != user_id
++        ):
++            raise JsonRpcError(
++                -32000, "公共 Connector 已属于其他账号，请先在公共服务中切换。"
++            )
++        headers = {"Authorization": f"Bearer {token}"}
++        async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
++
++            async def request(method: str, path: str, **kwargs: Any) -> httpx.Response:
++                response = await client.request(
++                    method, api_v2_url(server, path), **kwargs
++                )
++                return response
++
++            me = await request("GET", "/auth/me", headers=headers)
++            self._check_response(me)
++            if me.json().get("userId") != user_id:
++                raise JsonRpcError(-32000, "账号归属与授权不一致。")
++            device = None
++            if config is not None:
++                response = await request(
++                    "GET",
++                    f"/connectors/{quote(config.connector_id, safe='')}",
++                    headers=headers,
++                )
++                if (
++                    response.status_code == 404
++                    and recovery == "recreate"
++                    and not (
++                        isinstance(owner, dict)
++                        and owner.get("connectorId") == config.connector_id
++                        and owner.get("serverUrl") == server
++                        and owner.get("userId") == user_id
++                    )
++                ):
++                    raise JsonRpcError(
++                        -32000, "无法确认旧设备归属，请先在公共服务中重新配对。"
++                    )
++                if response.status_code == 404 and recovery != "recreate":
++                    raise JsonRpcError(
++                        -32012,
++                        "本机设备已删除，请明确重新创建设备。",
++                        {"connectorId": config.connector_id},
++                    )
++                if response.status_code != 404 or recovery != "recreate":
++                    self._check_response(response)
++                    device = response.json().get("connector")
++                    if (
++                        not isinstance(device, dict)
++                        or device.get("id") != config.connector_id
++                        or device.get("userId") != user_id
++                    ):
++                        raise JsonRpcError(
++                            -32000, "公共 Connector 的设备归属与当前账号不一致。"
++                        )
++                    auth = await request(
++                        "POST",
++                        "/connector/auth",
++                        headers={
++                            "Authorization": f"Connector {config.connector_id}:{config.connector_token}"
++                        },
++                    )
++                    if auth.status_code == 401:
++                        if recovery != "reconnect":
++                            raise JsonRpcError(
++                                -32011,
++                                "本机设备凭据已失效，请明确恢复连接。",
++                                {"connectorId": config.connector_id},
++                            )
++                        renewed = await request(
++                            "POST",
++                            f"/connectors/{quote(config.connector_id, safe='')}/revoke",
++                            headers=headers,
++                        )
++                        self._check_response(renewed)
++                        body = renewed.json()
++                        if body.get("connector", {}).get(
++                            "id"
++                        ) != config.connector_id or not body.get("connectorToken"):
++                            raise JsonRpcError(-32000, "设备恢复响应无效。")
++                        config = replace(config, connector_token=body["connectorToken"])
++                        await self.controller.stop()
++                        self._save_config(config)
++                    else:
++                        self._check_response(auth)
++            if device is None:
++                # Persist before registering: lost responses can retry the same installation.
++                installation = self.controller.config_path.with_name(
++                    "connector-installation.json"
++                )
++                saved = (
++                    json.loads(installation.read_text())
++                    if installation.exists()
++                    else None
++                )
++                replaced = config.connector_id if config is not None else None
++                if isinstance(saved, dict) and (
++                    saved.get("serverUrl") != server or saved.get("userId") != user_id
++                ):
++                    raise JsonRpcError(
++                        -32000, "公共 Connector 的设备注册属于其他账号或服务器。"
++                    )
++                if (
++                    not isinstance(saved, dict)
++                    or saved.get("replacesConnectorId") != replaced
++                ):
++                    saved = {
++                        "installationId": str(uuid4()),
++                        "name": socket.gethostname(),
++                        "replacesConnectorId": replaced,
++                        "serverUrl": server,
++                        "userId": user_id,
++                    }
++                    self._write_private_json(installation, saved)
++                registered = await request(
++                    "POST",
++                    "/connectors",
++                    headers=headers,
++                    json={
++                        "name": saved["name"],
++                        "connectorKind": "cli",
++                        "installationId": saved["installationId"],
++                    },
++                )
++                self._check_response(registered)
++                body = registered.json()
++                device = body.get("connector")
++                if (
++                    not isinstance(device, dict)
++                    or device.get("userId") != user_id
++                    or not device.get("id")
++                    or not body.get("connectorToken")
++                ):
++                    raise JsonRpcError(-32000, "设备注册响应无效。")
++                config = (
++                    replace(
++                        config,
++                        connector_id=device["id"],
++                        connector_token=body["connectorToken"],
++                    )
++                    if config is not None
++                    else ConnectorConfig(
++                        server_url=server,
++                        connector_id=device["id"],
++                        connector_token=body["connectorToken"],
++                    )
++                )
++                await self.controller.stop()
++                self._save_config(config)
++            self._write_private_json(
++                owner_path,
++                {"serverUrl": server, "connectorId": device["id"], "userId": user_id},
++            )
++            await self.controller.start()
++            return {
++                "connectorId": device["id"],
++                "name": device.get("name") or device["id"],
++            }
++
++    @staticmethod
++    def _write_private_json(path: Path, value: dict[str, Any]) -> None:
++        temporary = path.with_name(f".{path.name}.{uuid4()}.tmp")
++        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++        try:
++            with os.fdopen(descriptor, "w") as stream:
++                json.dump(value, stream)
++                stream.flush()
++                os.fsync(stream.fileno())
++            temporary.replace(path)
++        finally:
++            temporary.unlink(missing_ok=True)
++
++    @staticmethod
++    def _check_response(response: httpx.Response) -> None:
++        if not response.is_success:
++            raise JsonRpcError(
++                -32000, f"公共 Connector 授权请求失败（HTTP {response.status_code}）。"
++            )
++
++    def _save_config(self, config: ConnectorConfig) -> None:
++        self._redactions.add(config.connector_token)
++        temporary = self.controller.config_path.with_name(
++            f".{self.controller.config_path.name}.{uuid4()}.tmp"
++        )
++        try:
++            config.save(temporary)
++            temporary.replace(self.controller.config_path)
++        finally:
++            temporary.unlink(missing_ok=True)
++
++    def _handlers(self) -> dict[str, Any]:
++        async def operation(method: str, params: Any) -> Any:
++            async with self._operations:
++                if method == "attachAccount":
++                    return await self.attach_account(params)
++                if params not in (None, {}):
++                    raise JsonRpcError(
++                        -32602, "Shared operations use the saved configuration"
++                    )
++                return await getattr(self.controller, method)()
++
++        handlers: dict[str, Any] = {
++            "connector.getState": self.get_state,
++            "connector.getIdentity": self.get_identity,
++            "connector.readLogs": self.read_logs,
++        }
++        for method in ("start", "stop", "restart", "attachAccount"):
++
++            async def handle(params: Any, name: str = method) -> Any:
++                return await operation(name, params)
++
++            handlers[f"connector.{method}"] = handle
++        return handlers
++
++    async def _accept(
++        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
++    ) -> None:
++        task = asyncio.current_task()
++        if task is not None:
++            self._tasks.add(task)
++        rpc = JsonRpcStdioServer(reader, writer, self._handlers())
++        self._clients.add(rpc)
++        try:
++            await rpc.serve_forever()
++        except (OSError, ValueError):
++            pass
++        finally:
++            self._clients.discard(rpc)
++            writer.close()
++            try:
++                await writer.wait_closed()
++            except OSError:
++                pass
++            if task is not None:
++                self._tasks.discard(task)
++
++    async def start(self) -> None:
++        # Take the global process lease before removing a stale socket.
++        self.controller.acquire_ownership()
++        if self.controller.config_path.exists():
++            self._redactions.add(
++                ConnectorConfig.load(self.controller.config_path).connector_token
++            )
++        self._log_sink = logger.add(
++            self.capture_log, format="{message}", backtrace=False, diagnose=False
++        )
++        try:
++            self.socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
++            directory = self.socket_path.parent.stat()
++            if directory.st_uid != os.getuid() or directory.st_mode & 0o077:
++                raise RuntimeError(
++                    "Connector socket requires a private directory owned by the current user"
++                )
++            if self.socket_path.exists() or self.socket_path.is_symlink():
++                if self.socket_path.is_symlink() or not self.socket_path.is_socket():
++                    raise RuntimeError(
++                        "Connector socket path is occupied by a non-socket file"
++                    )
++                self.socket_path.unlink()
++            self._server = await asyncio.start_unix_server(
++                self._accept, path=self.socket_path, limit=MAX_FRAME_BYTES
++            )
++            self._socket_inode = self.socket_path.stat().st_ino
++            self.socket_path.chmod(0o600)
++            if self.controller.config_path.exists():
++                await self.controller.start()
++        except BaseException:
++            await self.close()
++            raise
++
++    async def close(self) -> None:
++        server, self._server = self._server, None
++        if server is not None:
++            server.close()
++        for client in tuple(self._clients):
++            client.writer.close()
++        for task in tuple(self._tasks):
++            task.cancel()
++        await asyncio.gather(*self._tasks, return_exceptions=True)
++        if server is not None:
++            await server.wait_closed()
++        await self.controller.shutdown()
++        if self._log_sink is not None:
++            logger.remove(self._log_sink)
++            self._log_sink = None
++        if self._socket_inode is not None:
++            try:
++                if self.socket_path.lstat().st_ino == self._socket_inode:
++                    self.socket_path.unlink()
++            except FileNotFoundError:
++                pass
++            self._socket_inode = None
++
++
++async def run_service(config_path: str | Path, socket_path: str | Path) -> None:
++    service = ConnectorService(
++        ConnectorController(config_path=config_path), socket_path
++    )
++    stopped = asyncio.Event()
++    loop = asyncio.get_running_loop()
++    loop.add_signal_handler(signal.SIGTERM, stopped.set)
++    try:
++        await service.start()
++        await stopped.wait()
++    finally:
++        loop.remove_signal_handler(signal.SIGTERM)
++        await service.close()
+diff --git a/connector/connector/runtime_protocol/instance_binding.py b/connector/connector/runtime_protocol/instance_binding.py
+index 36dbe949..738edb11 100644
+--- a/connector/connector/runtime_protocol/instance_binding.py
++++ b/connector/connector/runtime_protocol/instance_binding.py
+@@ -440,6 +440,9 @@ class RuntimeInstance(AgentRuntime):
+     async def resynchronize(self, session_id: str | None = None, external_session_id: str | None = None) -> None:
+         await self.native_runtime.resynchronize(session_id, external_session_id)
+ 
++    async def on_backend_reconnect(self) -> None:
++        await self.native_runtime.on_backend_reconnect()
++
+     def __post_init__(self) -> None:
+         if self.native_runtime.identity.runtime != self.instance.runtime_type:
+             raise ValueError(
+diff --git a/connector/connector/runtime_protocol/protocol.py b/connector/connector/runtime_protocol/protocol.py
+index 81c5399f..f95a28fc 100644
+--- a/connector/connector/runtime_protocol/protocol.py
++++ b/connector/connector/runtime_protocol/protocol.py
+@@ -46,6 +46,9 @@ class AgentRuntime(ABC):
+     async def stop(self) -> None:
+         pass
+ 
++    async def on_backend_reconnect(self) -> None:
++        """Republish runtime-owned state after the backend connection recovers."""
++
+     async def get_config(self) -> RuntimeConfig:
+         raise RuntimeUnsupportedError("get_config")
+ 
+diff --git a/connector/connector/runtimes/dsh/provider.py b/connector/connector/runtimes/dsh/provider.py
+index e76f0128..68494d3b 100644
+--- a/connector/connector/runtimes/dsh/provider.py
++++ b/connector/connector/runtimes/dsh/provider.py
+@@ -49,9 +49,13 @@ class DshProvider(RuntimeProvider):
+         self._last_discovery: discovery.DshDiscovery | None = None
+         self._last_values = provider_config.default_config_values()
+         self._preset_catalog: dict[str, Any] = {}
++        self._runtime_capabilities: dict[str, Any] | None = None
+ 
+     def _remember(self, result: discovery.DshDiscovery) -> None:
+         self._last_discovery = result
++        capabilities = (result.metadata or {}).get("runtimeCapabilities")
++        if isinstance(capabilities, dict):
++            self._runtime_capabilities = capabilities
+         catalog = (result.metadata or {}).get("agentPresetCatalog")
+         if isinstance(catalog, dict):
+             self._preset_catalog = catalog
+@@ -83,6 +87,9 @@ class DshProvider(RuntimeProvider):
+         result = await self._discoverer(values)
+         self._remember(result)
+         metadata = dict(result.metadata or {})
++        # Support-only discovery must not erase the bridge's last confirmed controls.
++        if self._runtime_capabilities is not None:
++            metadata["runtimeCapabilities"] = self._runtime_capabilities
+         capabilities = provider_config.dsh_capabilities(
+             metadata.get("runtimeCapabilities")
+         )
+diff --git a/connector/connector/runtimes/providers.py b/connector/connector/runtimes/providers.py
+index 53ad8b05..41c2d556 100644
+--- a/connector/connector/runtimes/providers.py
++++ b/connector/connector/runtimes/providers.py
+@@ -1,10 +1,41 @@
+ from __future__ import annotations
+ 
++from importlib.metadata import entry_points
++
++from connector.logging import logger
+ from connector.runtime_protocol import RuntimeProvider
+ from connector.runtimes.claude.provider import ClaudeProvider
+ from connector.runtimes.codex.provider import CodexProvider
+ from connector.runtimes.dsh.provider import DshProvider
+ 
++RUNTIME_PROVIDER_ENTRY_POINT_GROUP = "agents_anywhere.runtime_providers.v1"
++
+ 
+ def default_runtime_providers() -> tuple[RuntimeProvider, ...]:
+-    return (CodexProvider(), ClaudeProvider(), DshProvider())
++    providers: list[RuntimeProvider] = [
++        CodexProvider(),
++        ClaudeProvider(),
++        DshProvider(),
++    ]
++    registered = {provider.runtime_type for provider in providers}
++    for entry in sorted(
++        entry_points(group=RUNTIME_PROVIDER_ENTRY_POINT_GROUP),
++        key=lambda item: (item.name, item.value),
++    ):
++        try:
++            provider = entry.load()()
++            if not isinstance(provider, RuntimeProvider):
++                raise TypeError("runtime extension must return a RuntimeProvider")
++            runtime_type = provider.runtime_type
++            if not isinstance(runtime_type, str) or not runtime_type.strip():
++                raise ValueError("runtime extension must have a nonempty runtime type")
++            if runtime_type in registered:
++                raise ValueError(f"runtime type already registered: {runtime_type}")
++        except Exception:  # noqa: BLE001 - one extension must not disable built-in runtimes.
++            logger.exception(
++                "runtime extension rejected name={} value={}", entry.name, entry.value
++            )
++            continue
++        registered.add(runtime_type)
++        providers.append(provider)
++    return tuple(providers)
+diff --git a/connector/connector/server/runtime_sync.py b/connector/connector/server/runtime_sync.py
+index 31599929..5cade5a3 100644
+--- a/connector/connector/server/runtime_sync.py
++++ b/connector/connector/server/runtime_sync.py
+@@ -89,6 +89,7 @@ class RuntimeSyncRunner:
+                 runtime = self.supervisor.resolve_runtime(runtime_id)
+                 if runtime.sync_mode == "events":
+                     await runtime.resynchronize()
++                await runtime.on_backend_reconnect()
+             except Exception:
+                 logger.exception("runtime event recovery deferred runtime={}", runtime_id)
+ 
+diff --git a/connector/pyproject.toml b/connector/pyproject.toml
+index adb7900c..38902d7e 100644
+--- a/connector/pyproject.toml
++++ b/connector/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "anywhere-cli"
+-version = "2.0.3"
++version = "2.0.3+shared.1"
+ description = "Local runtime connector for Agents Anywhere"
+ readme = "README.md"
+ requires-python = ">=3.12"
+diff --git a/connector/tests/test_connector_cli.py b/connector/tests/test_connector_cli.py
+index 7bac4cee..5c21bdb8 100644
+--- a/connector/tests/test_connector_cli.py
++++ b/connector/tests/test_connector_cli.py
+@@ -98,7 +98,7 @@ def test_pair_starts_connector_after_saving_credentials(
+             "--config",
+             str(config_path),
+             "--poll-interval",
+-            "0",
++            "0.001",
+         ]
+     )
+     asyncio.run(cli_module._pair(args))
+@@ -131,7 +131,7 @@ def test_pair_no_start_only_saves_credentials(monkeypatch, tmp_path) -> None:
+             "--config",
+             str(config_path),
+             "--poll-interval",
+-            "0",
++            "0.001",
+             "--no-start",
+         ]
+     )
+diff --git a/connector/tests/test_connector_logging.py b/connector/tests/test_connector_logging.py
+index 463a5278..77ea6a82 100644
+--- a/connector/tests/test_connector_logging.py
++++ b/connector/tests/test_connector_logging.py
+@@ -47,3 +47,12 @@ def test_rpc_log_sink_defaults_to_info_level() -> None:
+     events = asyncio.run(exercise())
+ 
+     assert [event[1]["message"] for event in events] == ["visible info"]
++
++
++def test_standard_runtime_extension_logs_reach_official_logging(capsys):
++    import logging
++
++    from connector.logging import configure_connector_logging
++    configure_connector_logging()
++    logging.getLogger("pi_aa.runtime").info("runtime extension connected")
++    assert "runtime extension connected" in capsys.readouterr().err
+diff --git a/connector/tests/test_control_service.py b/connector/tests/test_control_service.py
+new file mode 100644
+index 00000000..4e213f92
+--- /dev/null
++++ b/connector/tests/test_control_service.py
+@@ -0,0 +1,332 @@
++from __future__ import annotations
++
++import asyncio
++import json
++import stat
++
++import httpx
++import pytest
++
++from connector.control import ConnectorController
++from connector.core.config import ConnectorConfig
++from connector.core.json_rpc import JsonRpcError
++from connector.logging import logger
++from connector.management import service as control_service
++from connector.management.doctor import diagnose
++
++
++class Backend:
++    def __init__(self, config):
++        self.config = config
++
++    async def run_forever(self):
++        await asyncio.Event().wait()
++
++
++def service_at(tmp_path, configured=True):
++    path = tmp_path / "connector.json"
++    if configured:
++        ConnectorConfig(
++            server_url="https://aa.example.test",
++            connector_id="existing",
++            connector_token="DEVICE-SECRET",
++        ).save(path)
++    controller = ConnectorController(config_path=path, client_factory=Backend)
++    return control_service.ConnectorService(controller, tmp_path / "control.sock")
++
++
++async def rpc(reader, writer, method, params=None, request_id=1):
++    writer.write(
++        json.dumps(
++            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
++        ).encode()
++        + b"\n"
++    )
++    await writer.drain()
++    while True:
++        frame = json.loads(await asyncio.wait_for(reader.readline(), 3))
++        if frame.get("id") == request_id:
++            return frame
++
++
++def test_clients_share_one_runtime_and_disconnect_does_not_stop_it(tmp_path):
++    async def exercise():
++        service = service_at(tmp_path)
++        await service.start()
++        original_task = service.controller._runtime_task
++        before = service.controller.config_path.read_bytes()
++        try:
++            assert stat.S_IMODE(service.socket_path.stat().st_mode) == 0o600
++            report = await diagnose(service.socket_path, ["dsh", "codex"])
++            assert report["ok"], report
++            logger.info("credential DEVICE-SECRET")
++            logs = service.read_logs()
++            assert logs["entries"] and "SECRET" not in json.dumps(logs)
++            reader, writer = await asyncio.open_unix_connection(service.socket_path)
++            state = await rpc(reader, writer, "connector.getState")
++            assert (
++                state["result"]["running"] and state["result"]["protocolVersion"] == 1
++            )
++            writer.close()
++            await writer.wait_closed()
++            await asyncio.sleep(0)
++            reader, writer = await asyncio.open_unix_connection(service.socket_path)
++            try:
++                identity = await rpc(reader, writer, "connector.getIdentity")
++                assert identity["result"]["connectorId"] == "existing"
++                assert service.controller._runtime_task is original_task
++                assert not original_task.done()
++                assert b"SECRET" not in json.dumps(identity).encode()
++                assert service.controller.config_path.read_bytes() == before
++                # Clients cannot overwrite configuration through start or retrieve tokens.
++                rejected = await rpc(
++                    reader, writer, "connector.start", {"connectorToken": "new"}
++                )
++                assert rejected["error"]["code"] == -32602
++                rejected = await rpc(reader, writer, "connector.getConfig")
++                assert rejected["error"]["code"] == -32601
++                stopped = await rpc(reader, writer, "connector.stop")
++                assert not stopped["result"]["running"]
++                started = await rpc(reader, writer, "connector.start")
++                assert started["result"]["running"]
++            finally:
++                writer.close()
++                await writer.wait_closed()
++        finally:
++            await service.close()
++        assert not service.socket_path.exists()
++        assert original_task.done()
++
++    asyncio.run(exercise())
++
++
++def account_transport(monkeypatch, handler):
++    client_type = httpx.AsyncClient
++    monkeypatch.setattr(
++        control_service.httpx,
++        "AsyncClient",
++        lambda **kwargs: client_type(transport=httpx.MockTransport(handler), **kwargs),
++    )
++
++
++def test_account_attachment_reuses_identity_and_never_rotates_valid_credentials(
++    tmp_path, monkeypatch
++):
++    calls = []
++
++    def handler(request):
++        calls.append((request.method, request.url.path))
++        assert request.method == "GET" or request.url.path.endswith("/connector/auth")
++        if request.url.path.endswith("/auth/me"):
++            return httpx.Response(200, json={"userId": "owner"})
++        if request.url.path.endswith("/connectors/existing"):
++            return httpx.Response(
++                200,
++                json={
++                    "connector": {
++                        "id": "existing",
++                        "userId": "owner",
++                        "name": "Machine",
++                    }
++                },
++            )
++        return httpx.Response(200, json={})
++
++    account_transport(monkeypatch, handler)
++
++    async def exercise():
++        service = service_at(tmp_path)
++        await service.start()
++        before = service.controller.config_path.read_bytes()
++        task = service.controller._runtime_task
++        try:
++            account = {
++                "serverUrl": "https://aa.example.test",
++                "userId": "owner",
++                "accessToken": "OAUTH-SECRET",
++            }
++            for _ in range(2):
++                identity = await service.attach_account(account)
++                assert identity == {"connectorId": "existing", "name": "Machine"}
++                assert "SECRET" not in json.dumps(identity)
++            assert service.controller._runtime_task is task
++            assert service.controller.config_path.read_bytes() == before
++            assert all("revoke" not in path for _, path in calls)
++        finally:
++            await service.close()
++
++    asyncio.run(exercise())
++
++
++def test_foreign_account_cannot_take_over_a_configured_device(tmp_path, monkeypatch):
++    def handler(request):
++        if request.url.path.endswith("/auth/me"):
++            return httpx.Response(200, json={"userId": "stranger"})
++        return httpx.Response(
++            200,
++            json={
++                "connector": {"id": "existing", "userId": "owner", "name": "Machine"}
++            },
++        )
++
++    account_transport(monkeypatch, handler)
++
++    async def exercise():
++        service = service_at(tmp_path)
++        before = service.controller.config_path.read_bytes()
++        with pytest.raises(JsonRpcError, match="归属"):
++            await service.attach_account(
++                {
++                    "serverUrl": "https://aa.example.test",
++                    "userId": "stranger",
++                    "accessToken": "SECRET",
++                }
++            )
++        assert service.controller.config_path.read_bytes() == before
++
++    asyncio.run(exercise())
++
++
++def test_first_registration_is_owned_by_the_service_and_idempotent(
++    tmp_path, monkeypatch
++):
++    registrations = []
++
++    def handler(request):
++        if request.url.path.endswith("/auth/me"):
++            return httpx.Response(200, json={"userId": "owner"})
++        if request.url.path == "/api/v2/connectors":
++            body = json.loads(request.content)
++            registrations.append(body["installationId"])
++            if len(registrations) == 1:
++                raise httpx.ReadTimeout("response lost", request=request)
++            return httpx.Response(
++                200,
++                json={
++                    "connector": {"id": "new", "userId": "owner", "name": "Machine"},
++                    "connectorToken": "NEW-SECRET",
++                },
++            )
++        raise AssertionError(request.url)
++
++    account_transport(monkeypatch, handler)
++
++    async def exercise():
++        service = service_at(tmp_path, configured=False)
++        await service.start()
++        account = {
++            "serverUrl": "https://aa.example.test",
++            "userId": "owner",
++            "accessToken": "OAUTH-SECRET",
++        }
++        try:
++            with pytest.raises(httpx.ReadTimeout):
++                await service.attach_account(account)
++            result = await service.attach_account(account)
++            assert result["connectorId"] == "new"
++            assert registrations[0] == registrations[1]
++            assert (
++                ConnectorConfig.load(service.controller.config_path).connector_token
++                == "NEW-SECRET"
++            )
++            assert stat.S_IMODE(service.controller.config_path.stat().st_mode) == 0o600
++        finally:
++            await service.close()
++
++    asyncio.run(exercise())
++
++
++def test_stale_socket_cleanup_never_deletes_an_unrelated_file(tmp_path):
++    async def exercise():
++        service = service_at(tmp_path, configured=False)
++        service.socket_path.write_text("keep")
++        with pytest.raises(RuntimeError, match="non-socket"):
++            await service.start()
++        assert service.socket_path.read_text() == "keep"
++
++    asyncio.run(exercise())
++
++
++def test_socket_does_not_change_permissions_of_a_shared_parent(tmp_path):
++    async def exercise():
++        service = service_at(tmp_path)
++        tmp_path.chmod(0o755)
++        with pytest.raises(RuntimeError, match="private directory"):
++            await service.start()
++        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o755
++        assert not service.socket_path.exists()
++
++    asyncio.run(exercise())
++
++
++def test_cached_owner_blocks_foreign_recreation_even_when_server_hides_device(
++    tmp_path, monkeypatch
++):
++    async def exercise():
++        service = service_at(tmp_path)
++        service._write_private_json(
++            tmp_path / "connector-owner.json",
++            {
++                "serverUrl": "https://aa.example.test",
++                "connectorId": "existing",
++                "userId": "owner",
++            },
++        )
++        before = service.controller.config_path.read_bytes()
++        with pytest.raises(JsonRpcError, match="其他账号"):
++            await service.attach_account(
++                {
++                    "serverUrl": "https://aa.example.test",
++                    "userId": "stranger",
++                    "accessToken": "SECRET",
++                    "recovery": "recreate",
++                }
++            )
++        assert service.controller.config_path.read_bytes() == before
++
++    asyncio.run(exercise())
++
++
++@pytest.mark.parametrize("command", ["configure", "pair"])
++def test_cli_credential_writers_cannot_bypass_the_shared_owner(
++    tmp_path, monkeypatch, command
++):
++    from connector import cli
++    from connector.core.runtime_owner import RuntimeLease
++
++    service = service_at(tmp_path)
++    before = service.controller.config_path.read_bytes()
++
++    def held(*args, **kwargs):
++        raise RuntimeError("shared service owns this machine")
++
++    monkeypatch.setattr(RuntimeLease, "claim", held)
++    if command == "configure":
++        args = cli._build_parser().parse_args(
++            [
++                "configure",
++                "--config",
++                str(service.controller.config_path),
++                "--server-url",
++                "https://other.example.test",
++                "--connector-id",
++                "other",
++                "--connector-token",
++                "other-token",
++            ]
++        )
++        with pytest.raises(RuntimeError, match="owns"):
++            cli._configure(args)
++    else:
++        args = cli._build_parser().parse_args(
++            [
++                "pair",
++                "https://other.example.test",
++                "--no-start",
++                "--config",
++                str(service.controller.config_path),
++            ]
++        )
++        with pytest.raises(RuntimeError, match="owns"):
++            asyncio.run(cli._pair(args))
++    assert service.controller.config_path.read_bytes() == before
+diff --git a/connector/tests/test_dsh_provider.py b/connector/tests/test_dsh_provider.py
+index ed423917..cfa015ee 100644
+--- a/connector/tests/test_dsh_provider.py
++++ b/connector/tests/test_dsh_provider.py
+@@ -531,3 +531,38 @@ def test_initial_catalog_error_does_not_close_other_runtime_requests(monkeypatch
+             await runtime.stop()
+ 
+     asyncio.run(run())
++
++
++def test_discovery_preserves_probed_messaging_capabilities_without_probing_again():
++    async def run():
++        probes = 0
++        writable = True
++
++        async def support(_values):
++            return DshDiscovery(True, True, None, metadata={})
++
++        async def probe_bridge(_values):
++            nonlocal probes
++            probes += 1
++            return DshDiscovery(True, True, None, metadata={
++                "runtimeCapabilities": {"capabilities": [
++                    {"capabilityId": "session.send_message", "supported": writable, "available": writable, "allowed": writable},
++                    {"capabilityId": "catalog.model", "supported": writable, "available": writable, "allowed": writable},
++                ]},
++            })
++
++        provider = DshProvider(discoverer=support, prober=probe_bridge)
++        assert not (await provider.discover()).capabilities["startTurn"]
++        await provider.validate_config({})
++        for _ in range(2):
++            result = await provider.discover()
++            assert result.capabilities["startTurn"]
++            assert result.capabilities["createAndStartSession"]
++            assert result.capabilities["modelCatalog"]
++            assert result.metadata["readOnly"] is False
++        assert probes == 1, "Device discovery must not reconnect to the DSH bridge"
++        writable = False
++        await provider.validate_config({})
++        assert not (await provider.discover()).capabilities["startTurn"]
++
++    asyncio.run(run())
+diff --git a/connector/tests/test_runtime_extensions.py b/connector/tests/test_runtime_extensions.py
+new file mode 100644
+index 00000000..e40683cb
+--- /dev/null
++++ b/connector/tests/test_runtime_extensions.py
+@@ -0,0 +1,77 @@
++from __future__ import annotations
++
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock
++
++from connector.runtime_protocol import RuntimeProvider
++from connector.runtimes import providers
++from connector.server.runtime_sync import RuntimeSyncRunner
++
++
++class ExtraProvider(RuntimeProvider):
++    runtime_type = "extra"
++    display_name = "Extra"
++
++
++def entry(name, factory):
++    return SimpleNamespace(name=name, value=name, load=lambda: factory)
++
++
++def test_installed_extension_is_added_without_replacing_official_providers(monkeypatch):
++    monkeypatch.setattr(
++        providers, "entry_points", lambda **kwargs: [entry("extra", ExtraProvider)]
++    )
++    loaded = providers.default_runtime_providers()
++    assert [item.runtime_type for item in loaded] == ["codex", "claude", "dsh", "extra"]
++    assert type(loaded[0]) is providers.CodexProvider
++    assert type(loaded[1]) is providers.ClaudeProvider
++    assert type(loaded[2]) is providers.DshProvider
++
++
++def test_bad_extensions_cannot_disable_or_override_official_runtimes(monkeypatch):
++    class Duplicate(ExtraProvider):
++        runtime_type = "dsh"
++
++    def broken():
++        raise ImportError("incompatible extension")
++
++    monkeypatch.setattr(
++        providers,
++        "entry_points",
++        lambda **kwargs: [
++            entry("a-broken", broken),
++            entry("b-duplicate", Duplicate),
++            entry("c-invalid", object),
++            entry("d-valid", ExtraProvider),
++            entry("e-repeat", ExtraProvider),
++        ],
++    )
++    loaded = providers.default_runtime_providers()
++    assert [item.runtime_type for item in loaded] == ["codex", "claude", "dsh", "extra"]
++    assert isinstance(loaded[2], providers.DshProvider)
++
++
++def test_reconnect_reaches_polling_extensions_and_continues_after_failure():
++    async def exercise():
++        bad = SimpleNamespace(
++            sync_mode="polling",
++            on_backend_reconnect=AsyncMock(side_effect=RuntimeError("broken")),
++        )
++        pi = SimpleNamespace(sync_mode="polling", on_backend_reconnect=AsyncMock())
++        event = SimpleNamespace(
++            sync_mode="events",
++            on_backend_reconnect=AsyncMock(),
++            resynchronize=AsyncMock(),
++        )
++        runtimes = {"bad": bad, "pi": pi, "dsh": event}
++        supervisor = SimpleNamespace(
++            runtimes=runtimes, resolve_runtime=runtimes.__getitem__
++        )
++        runner = RuntimeSyncRunner(None, supervisor, None, dict, AsyncMock())
++        await runner.reconnect_event_runtimes()
++        pi.on_backend_reconnect.assert_awaited_once_with()
++        event.resynchronize.assert_awaited_once_with()
++        event.on_backend_reconnect.assert_awaited_once_with()
++
++    asyncio.run(exercise())
+diff --git a/connector/tests/test_runtime_owner.py b/connector/tests/test_runtime_owner.py
+index fd93601d..2e192906 100644
+--- a/connector/tests/test_runtime_owner.py
++++ b/connector/tests/test_runtime_owner.py
+@@ -165,3 +165,25 @@ def test_live_unrelated_process_does_not_block_connector_start():
+     finally:
+         unrelated.terminate()
+         unrelated.wait(timeout=5)
++
++
++@pytest.mark.parametrize("entry", ["pi-aa-connector", "pi-aa-connector.exe"])
++def test_live_pi_connector_prevents_a_second_connector_from_taking_ownership(tmp_path, entry):
++    script = tmp_path / entry
++    script.write_text("import time; time.sleep(60)\n")
++    process = subprocess.Popen([sys.executable, str(script), "start"])
++    try:
++        lease = RuntimeLease()
++        with state_transaction(lease.path) as state:
++            state["runtime"] = {
++                "instanceId": "pi-service", "pid": process.pid, "kind": "cli",
++                "startedAt": "old", "processStartedAt": runtime_owner.process_identity(process.pid),
++            }
++        with pytest.raises(ConnectorAlreadyRunningError) as conflict:
++            RuntimeLease(kind="dsh-plugin").claim(config())
++        assert conflict.value.owner.pid == process.pid
++        assert read_state(lease.path)["runtime"]["instanceId"] == "pi-service"
++        assert process.poll() is None
++    finally:
++        process.terminate()
++        process.wait(timeout=5)
+diff --git a/contracts/connector-local-control/v1/README.md b/contracts/connector-local-control/v1/README.md
+new file mode 100644
+index 00000000..9a6a655e
+--- /dev/null
++++ b/contracts/connector-local-control/v1/README.md
+@@ -0,0 +1,21 @@
++# Connector 本机公共服务协议 v1
++
++`anywhere-cli serve` 在当前用户的私有 Unix socket 上提供 UTF-8 JSON-RPC 2.0，每行一帧，最大 1 MiB。默认路径为 `~/.agents-anywhere/connector.sock`，可用 `--socket` 指定绝对路径。目录权限 0700，socket 权限 0600；此版本服务面向支持 Unix socket 的系统，不监听 TCP。
++
++服务是设备身份、Connector 凭据和 RuntimeLease 的唯一管理者。客户端连接或断开不会影响 Connector 生命周期；只有显式 `connector.stop` / `connector.restart` 会停止或重启所有 Runtime。管理操作串行执行。服务退出时关闭 Runtime、释放租约并删除自己的 socket。
++
++## 请求
++
++- `connector.getState`：官方 Controller 状态，加 `protocolVersion: 1`。running 表示 Connector 任务存活，不代表服务端已上线；上线仍以服务端 presence 为准。
++- `connector.getIdentity`：`{serverUrl, connectorId}` 或 null，不包含 Connector token。
++- `connector.attachAccount`：参数 `{serverUrl, userId, accessToken, recovery?}`。服务验证 OAuth 账号及设备归属，复用现有身份和凭据；首次连接才注册新设备。返回 `{connectorId, name}`。accessToken 只在本次请求内使用，不落盘。`recovery` 仅接受 `reconnect` 或 `recreate`，对应用户明确恢复凭据或重新创建设备的操作；普通连接绝不撤销凭据。已配置其他服务器或账号时拒绝替换。
++- `connector.readLogs`：接受 `{before?, after?}`，返回 `{entries, hasMore, oldestId, newestId}`，每页最多 200 条。服务内存保留最近 10,000 条，重启后清空；长期日志交给 systemd journal。日志展示不回退到旧插件的私有 Connector 日志。
++- `connector.start` / `connector.stop` / `connector.restart`：只操作已经保存的共享配置，不接受配置参数。
++
++## 通知与错误
++
++`connector/state` 广播公开状态，断开的客户端不阻塞其他客户端或服务。所有响应和通知不包含 Connector token 或 OAuth token。未知方法和无效参数使用标准 JSON-RPC 错误；凭据失效使用 -32011，客户端应展示显式恢复操作。socket 不可达时报告服务不可用，不启动内置 Connector，不注册备用设备。
++
++DSH 外部模式通过此协议连接，保留自己的账号登录及 Bridge。它不写共享配置或私有 Connector 配置，不在插件退出、重新加载、退出账号或重置插件时停止公共服务。显式停止和重启按钮会影响共享服务中的所有 Agent。
++
++内置托管模式在绑定账号、恢复或撤销设备凭据之前，必须通过原官方 stdio RPC 的 `connector.acquireOwnership` 取得全局租约，并在同一控制进程中完成配置和启动。公共服务已持有租约时，内置模式必须在任何设备凭据操作之前失败。
+diff --git a/docs/runtime-protocol/runtime-extensions.md b/docs/runtime-protocol/runtime-extensions.md
+new file mode 100644
+index 00000000..095aec1c
+--- /dev/null
++++ b/docs/runtime-protocol/runtime-extensions.md
+@@ -0,0 +1,23 @@
++# 已安装的 Runtime 扩展
++
++官方 Connector 保留内置 Codex、Claude、DSH Provider，并从 Python entry point 组 `agents_anywhere.runtime_providers.v1` 加载同一环境中已安装的第三方 Provider。
++
++entry point 必须指向一个无参数工厂（可以是类），返回 `connector.runtime_protocol.RuntimeProvider` 实例。Runtime type 必须非空且唯一，不得覆盖内置 Provider。损坏、重复或不兼容扩展会记录错误并跳过，不阻止其余 Provider 启动。只安装可信扩展：加载工厂会执行扩展代码。
++
++```toml
++[project.entry-points."agents_anywhere.runtime_providers.v1"]
++pi = "pi_aa.provider:PiProvider"
++```
++
++CLI start、stdio RPC 与公共服务 serve 使用同一 Provider 注册机制。扩展需要在 Connector 的 Python 环境中安装；DSH Bridge 所在的 Node 环境无需 Python 扩展。
++
++所有 Runtime 可覆盖默认无操作的 `on_backend_reconnect()` 生命周期回调，在服务端连接恢复时重新发布状态。RuntimeInstance 透明转发此回调；扩展无需修改 Connector 私有对象。
++
++
++## 代码更新与进程边界
++
++Provider工厂和Runtime对象在Connector Python进程内运行，所有内置和第三方Runtime共享该进程。entry point注册不是热重载协议，也不提供扩展进程隔离。升级扩展包或Connector代码后，需重启宿主Python进程；重新创建Runtime仍可能使用缓存的模块与Provider类。
++
++公共服务部署使用 `systemctl --user restart agents-anywhere-connector.service`。这会影响同设备全部Runtime，正在进行的任务可能中断；原生会话文件保留。DSH面板的 `connector.restart` 在同一进程中重建后端任务，不是代码升级入口。Pi原生资源的 `/reload` 同样不重载Python适配层。
++
++只更新DSH Node插件时，重启DSH即可重连Bridge，不需要重启共享Connector。生产安装来自wheel时，修改源码检出不会影响已安装环境。需要按扩展独立升级的部署，应另行设计worker隔离；当前接口不承诺该能力。
+diff --git a/dsh-bridge-next/README.md b/dsh-bridge-next/README.md
+index 3ab34cf8..3cca87af 100644
+--- a/dsh-bridge-next/README.md
++++ b/dsh-bridge-next/README.md
+@@ -23,6 +23,8 @@ DSH Desktop 已集成此插件，**不需要另行下载或执行 npm 安装命
+ 
+ ## 从 npm 安装到独立 DSH
+ 
++使用本集成的单设备公共Connector时，应安装匹配的本地构建tgz并配置下文的外部服务模式。下面的普通npm安装方式用于官方内置托管模式，不能据此覆盖共享服务的集成包。
++
+ 如果使用独立安装的 DSH，可以通过官方插件命令从 npm 安装。先确认目标 Profile 的名称，以及当前 npm 包声明的 DSH 依赖是否与你的环境相容。下面以 `desktop` Profile 为例：
+ 
+ ```bash
+@@ -51,3 +53,22 @@ dsh plugin --profile desktop add @agents-anywhere/dsh-bridge-next
+ 本仓库源码和 npm 已发布包可能处于不同版本。源码构建、链接安装、headless 检查、配置和实现细节见[技术说明](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/dsh-bridge-next/TECHNICAL.md)。
+ 
+ [开发计划](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/dsh-bridge-next/DEVELOPMENT_PLAN.md) · [Onboarding 方案](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/dsh-bridge-next/ONBOARDING_PLAN.md) · [验证记录](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/dsh-bridge-next/VERIFICATION.md) · [Agents Anywhere 使用文档](https://github.com/anywhere-labs/Agents-Anywhere/blob/main/docs/README.md)
++
++
++## 连接已有公共 Connector
++
++此集成版本支持在插件配置中指定绝对路径 `connectorSocketPath`，连接由 systemd
++托管的 `anywhere-cli serve`。启用后，设备身份和 Connector 凭据由公共服务唯一管理；
++插件保留账号授权和官方 DSH Bridge，普通登录不撤销已有凭据、不重复注册设备。
++
++插件重载、退出 DSH、退出账号及重置插件只解除本机管理连接；共享服务和其他 Agent
++继续运行。面板主动停止或重启会影响该设备的全部 Runtime，界面会显示这一范围。
++Python 镜像、uv 路径及同步设置由公共服务管理，外部模式不显示内置 Connector 安装设置。
++日志面板读取公共服务最近 10,000 条有限日志，长期日志交给 systemd journal。
++
++此模式要求同版本的 Connector 本机控制协议 v1，仅支持 Unix socket。服务不可用时
++明确报错，不启动内置 Connector 或注册第二个设备。账号或服务器与已绑定设备不一致
++时拒绝替换，设备删除和凭据失效保留显式恢复流程。使用原版内置托管模式时不配置此字段。
++
++
++更新此DSH插件的代码后，重新安装tgz并重启对应DSH实例即可；Pi与其他Runtime继续运行。更新公共Connector或Pi Python适配层则需要重启共享服务进程。面板“重启Connector”仅重建同一Python进程内的后端连接，虽然会影响全部Runtime，但不保证重载升级的Python模块。设备账号与配对配置不需要因普通升级而重建。
+diff --git a/dsh-bridge-next/TECHNICAL.md b/dsh-bridge-next/TECHNICAL.md
+index 8bfea133..0b1d95a0 100644
+--- a/dsh-bridge-next/TECHNICAL.md
++++ b/dsh-bridge-next/TECHNICAL.md
+@@ -245,3 +245,15 @@ tests/                 单元及集成测试
+ ```
+ 
+ Host 输出 `lib/index.js`，Client 输出 DSH 模块加载格式的 `lib/client.js`，不能当独立网页打开。开发依赖统一锁定 Harness `0.2.0-rc.2`；Cordis、Typert 与 Schemastery 使用 Host 提供的 peer 依赖，以免破坏服务类型身份。DSH 只按 `@deepseek-ai/dsh` 与 `@deepseek-ai/dsh-*` peer 判断插件兼容性（预发布版本参与范围匹配），因此 Typert peer 的范围就是插件声明支持的 DSH 版本范围：同一 minor 内的新 rc 和正式版无需改声明，升级到新 minor 前需要重新验证并放宽上限。握手上报的 `runtimeVersion` 读取 Host 实际提供的 Typert 包版本，`bridgeVersion` 读取插件自身 `package.json`。依赖、构建产物和锁文件遵循仓库现有忽略规则。
++
++
++## 外部公共服务集成
++
++配置 `connectorSocketPath` 后，OnboardingManager 使用 ExternalConnector，通过
++[本机控制协议 v1](../contracts/connector-local-control/v1/README.md) 连接常驻服务。
++它不构建 Python 环境，不写私有 Connector 配置，也不读取旧绑定中的设备 token。
++账号绑定委托 `connector.attachAccount`，服务验证账号与设备归属并唯一持有凭据。
++管理客户端断开不触发 stop；显式 controlConnector 操作才调用共享服务 stop/restart。
++服务连接失效后按固定间隔重新连接，状态与日志均来自真实控制接口。
++
++交互流兼容 Gateway 的三参数和五参数入口。五参数入口显式传入 Connection 的 `browserPeer`，使 `$events` 订阅和通过 `createSharedFetchHandler` 发送的回答使用同一个官方 Peer；旧 Host 没有该属性时仍保留旧接口行为。连接重试只在可用性改变时发布能力变化，避免持续不可用的交互服务反复重发所有会话能力而阻塞启动同步。
+diff --git a/dsh-bridge-next/package.json b/dsh-bridge-next/package.json
+index f185c8dc..8fb0d9ac 100644
+--- a/dsh-bridge-next/package.json
++++ b/dsh-bridge-next/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@agents-anywhere/dsh-bridge-next",
+-  "version": "2.0.3",
++  "version": "2.0.3-shared.2",
+   "description": "Agents Anywhere onboarding, Connector management and event-driven session runtime for DeepSeek Harness",
+   "type": "module",
+   "main": "./lib/index.js",
+@@ -58,6 +58,9 @@
+     "@deepseek-ai/schemastery": "3.18.4",
+     "react": "^18.3.1"
+   },
++  "resolutions": {
++    "@deepseek-ai/schemastery": "3.18.4"
++  },
+   "devDependencies": {
+     "@deepseek-ai/cordis": "4.0.4",
+     "@deepseek-ai/cordis-plugin-group": "1.0.4",
+diff --git a/dsh-bridge-next/src/client/features/onboarding/settings-panel.tsx b/dsh-bridge-next/src/client/features/onboarding/settings-panel.tsx
+index 3e23b6b1..54a853f8 100644
+--- a/dsh-bridge-next/src/client/features/onboarding/settings-panel.tsx
++++ b/dsh-bridge-next/src/client/features/onboarding/settings-panel.tsx
+@@ -32,6 +32,7 @@ export function SettingsPanel({ t, host, state, snapshot, onConnection }: {
+   const signature = JSON.stringify(management?.settings)
+   useEffect(() => { setDraft(management?.settings) }, [signature])
+   if (!management || !draft) return <p className={css.hint} role="status">{t('请重启 DSH Host，以加载 Connector 管理接口。')}</p>
++  const external = management.mode === 'external'
+   const connecting = ['authorizing', 'pairing', 'starting'].includes(snapshot.stage)
+   const busy = state.busy || connecting || Boolean(state.readError)
+   const status = connectorStatus(snapshot, state.readError, t)
+@@ -62,6 +63,7 @@ export function SettingsPanel({ t, host, state, snapshot, onConnection }: {
+         <dt>{t('服务器')}</dt><dd>{snapshot.settings.apiBaseUrl}</dd>
+       </dl>
+       {status.detail ? <p className={css.hint} role="status">{translateMessage(t, status.detail)}</p> : null}
++      {external ? <p className={css.hint}>{t('由共享服务管理，停止或重启将影响此设备上的所有 Agent。')}</p> : null}
+       {!snapshot.account || snapshot.deviceRecovery ? <Button variant="outline" onClick={onConnection}>
+         {snapshot.account ? t('前往恢复连接') : t('前往登录')}
+       </Button> : <div className={css.actions}>
+@@ -72,7 +74,7 @@ export function SettingsPanel({ t, host, state, snapshot, onConnection }: {
+       </div>}
+     </div>
+ 
+-    <form className={css.form} onSubmit={event => {
++    {!external ? <form className={css.form} onSubmit={event => {
+       event.preventDefault()
+       if (!busy && dirty) void state.run(() => host.saveConnectorSettings(draft)).then(success => { if (success) setSaved(true) })
+     }}>
+@@ -110,14 +112,15 @@ export function SettingsPanel({ t, host, state, snapshot, onConnection }: {
+           </Button>
+         </div>
+       </div>
+-    </form>
++    </form> : null}
+ 
+     <div className={css.section}>
+       <h3>{t('维护')}</h3>
++      {external ? <p className={css.hint}>{t('重置只清除本插件的账号数据，共享服务与其他 Agent 继续运行。')}</p> : null}
+       <div className={css.actions}>
+-        <Button variant="outline" icon={<FolderOpen size={14} />} disabled={state.busy || !management.canOpenFolders}
++        <Button variant="outline" icon={<FolderOpen size={14} />} disabled={state.busy || external || !management.canOpenFolders}
+           onClick={() => void state.run(() => host.openConnectorFolder('data'))}>{t('打开数据目录')}</Button>
+-        <Button variant="outline" icon={<FolderOpen size={14} />} disabled={state.busy || !management.canOpenFolders}
++        <Button variant="outline" icon={<FolderOpen size={14} />} disabled={state.busy || external || !management.canOpenFolders}
+           onClick={() => void state.run(() => host.openConnectorFolder('logs'))}>{t('打开日志目录')}</Button>
+         <Button variant="outline" className={css.danger} disabled={busy}
+           onClick={() => { setReset('normal'); setAcknowledged(false); state.clearError() }}>{t('恢复出厂设置')}</Button>
+@@ -125,7 +128,7 @@ export function SettingsPanel({ t, host, state, snapshot, onConnection }: {
+       {!management.canOpenFolders ? <p className={css.hint}>{t('当前环境不支持打开本机目录。')}</p> : null}
+       <RiskConfirmation open={reset !== null} title={reset === 'force' ? t('无法撤销连接') : t('恢复出厂设置')}
+         description={reset === 'force' ? t('服务端撤销失败，本地数据尚未清理。可以取消后重试，或仅清理本地数据；原设备凭据在服务端可能仍有效。')
+-          : t('将撤销当前设备凭据、停止 Connector，并清除本插件的本地连接数据。DSH 会话和共享的设备记录会保留。')}
++          : external ? t('重置只清除本插件的账号数据，共享服务与其他 Agent 继续运行。') : t('将撤销当前设备凭据、停止 Connector，并清除本插件的本地连接数据。DSH 会话和共享的设备记录会保留。')}
+         acknowledgeLabel={t('我了解恢复出厂设置的影响')} acknowledged={acknowledged} onAcknowledgedChange={setAcknowledged}
+         cancelLabel={t('取消')} closeLabel={t('关闭恢复出厂设置确认')} confirmLabel={reset === 'force' ? t('仅清理本地数据') : t('确认恢复出厂设置')}
+         disabled={state.busy} onCancel={() => { if (!state.busy) { setReset(null); state.clearError() } }} onConfirm={() => void confirmReset()} />
+diff --git a/dsh-bridge-next/src/client/locales.ts b/dsh-bridge-next/src/client/locales.ts
+index 97ce89d8..34d7a337 100644
+--- a/dsh-bridge-next/src/client/locales.ts
++++ b/dsh-bridge-next/src/client/locales.ts
+@@ -5,6 +5,8 @@ import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
+ export const LOCALE_NS = 'agents-anywhere.next'
+ 
+ const hostMessages = {
++  "由共享服务管理，停止或重启将影响此设备上的所有 Agent。": "Managed by the shared service. Stopping or restarting affects all Agents on this device.",
++  "重置只清除本插件的账号数据，共享服务与其他 Agent 继续运行。": "Reset clears only this plugin account. The shared service and other Agents keep running.",
+   "本机连接被占用，无法启动。": "The local connection is in use and cannot start.",
+   "请退出其他正在运行的 DSH，再点击“尝试重启”。如果只开了一个 DSH，请检查是否重复启用了插件。": "Quit other running DSH instances, then click Try restarting. If only one DSH is open, check whether the plugin is enabled more than once.",
+   "本机连接启动失败：访问权限不足。": "The local connection could not start: permission denied.",
+diff --git a/dsh-bridge-next/src/contracts/connector.ts b/dsh-bridge-next/src/contracts/connector.ts
+index 6b34d825..f96b9291 100644
+--- a/dsh-bridge-next/src/contracts/connector.ts
++++ b/dsh-bridge-next/src/contracts/connector.ts
+@@ -28,6 +28,7 @@ export const PYPI_MIRRORS = [
+ export type ConnectorAction = 'start' | 'stop' | 'restart'
+ export type ConnectorFolder = 'data' | 'logs'
+ export interface ConnectorManagement {
++  mode?: 'managed' | 'external'
+   settings: ConnectorSettings
+   resolvedUvPath: string | null
+   dataPath: string
+diff --git a/dsh-bridge-next/src/host/account/binding.ts b/dsh-bridge-next/src/host/account/binding.ts
+index 9721fa5e..cc1f9756 100644
+--- a/dsh-bridge-next/src/host/account/binding.ts
++++ b/dsh-bridge-next/src/host/account/binding.ts
+@@ -14,6 +14,7 @@ export interface Binding {
+   name: string
+ }
+ 
++export interface DeviceIdentity { connectorId: string; name: string; connectorToken?: string }
+ export type BoundDevice = Binding & { connectorId: string; connectorToken: string }
+ export class DeviceRecoveryRequired extends Error {
+   constructor(readonly connectorId: string, readonly reason: 'deleted' | 'disconnected') {
+diff --git a/dsh-bridge-next/src/host/config.ts b/dsh-bridge-next/src/host/config.ts
+index db98d2e5..9b2414ab 100644
+--- a/dsh-bridge-next/src/host/config.ts
++++ b/dsh-bridge-next/src/host/config.ts
+@@ -10,6 +10,7 @@ export interface Config {
+   apiBaseUrl?: string
+   stateRoot?: string
+   connectorSourceDir?: string
++  connectorSocketPath?: string
+   uvPath?: string
+ }
+ 
+@@ -18,6 +19,7 @@ export const Config: z<Config> = z.object({
+   apiBaseUrl: z.string().default(CLOUD_API_BASE_URL),
+   stateRoot: z.string(),
+   connectorSourceDir: z.string(),
++  connectorSocketPath: z.string(),
+   uvPath: z.string(),
+ })
+ 
+@@ -26,6 +28,7 @@ export interface ResolvedConfig extends ConnectionSettings {
+   stateRoot: string
+   legacyStateRoot?: string
+   connectorSourceDir: string
++  connectorSocketPath?: string
+   uvPath: string
+ }
+ 
+@@ -40,6 +43,7 @@ export function bridgeDirectory(): string {
+ 
+ export function resolveConfig(config: Config): ResolvedConfig {
+   if (config.dshHome !== undefined && !isAbsolute(config.dshHome)) throw new Error('DSH_HOME 必须是绝对路径。')
++  if (config.connectorSocketPath !== undefined && !isAbsolute(config.connectorSocketPath)) throw new Error('公共 Connector socket 必须是绝对路径。')
+   const root = stateRoot(config)
+   const connectorSourceDir = config.connectorSourceDir ?? fileURLToPath(new URL('./bundled-connector/', import.meta.url))
+   if (!isAbsolute(root) || !isAbsolute(connectorSourceDir)) throw new Error('数据目录和 Connector 源码目录必须是绝对路径。')
+@@ -48,6 +52,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
+     stateRoot: root,
+     ...(config.stateRoot === undefined ? { legacyStateRoot: join(userInfo().homedir, '.agentsanywhere', 'dsh-bridge-next') } : {}),
+     connectorSourceDir,
++    ...(config.connectorSocketPath !== undefined ? { connectorSocketPath: config.connectorSocketPath } : {}),
+     apiBaseUrl: normalizeServerOrigin(config.apiBaseUrl ?? CLOUD_API_BASE_URL),
+     uvPath: config.uvPath ?? process.env['UV_PATH'] ?? 'uv',
+   }
+diff --git a/dsh-bridge-next/src/host/connector/external.ts b/dsh-bridge-next/src/host/connector/external.ts
+new file mode 100644
+index 00000000..588be784
+--- /dev/null
++++ b/dsh-bridge-next/src/host/connector/external.ts
+@@ -0,0 +1,161 @@
++import { lstat } from 'node:fs/promises'
++import { createConnection, type Socket } from 'node:net'
++import type { Account } from '../account/api.js'
++import { DeviceRecoveryRequired, type DeviceIdentity } from '../account/binding.js'
++import type { ConnectorAction } from '../../contracts/connector.js'
++import type { ConnectorLogPage, ConnectorLogQuery } from '../../contracts/logs.js'
++import { ConnectorCredentialError, type ConnectorProcess, type ConnectorState } from './process.js'
++
++const MAX_FRAME = 1024 * 1024
++interface Pending {
++  resolve: (value: unknown) => void
++  reject: (error: Error) => void
++  timer: ReturnType<typeof setTimeout>
++}
++
++/** Attaches to the shared service. Disposing this client never stops that service. */
++export class ExternalConnector implements ConnectorProcess {
++  readonly external = true
++  private socket: Socket | null = null
++  private connecting: Promise<void> | null = null
++  private pending = new Map<number, Pending>()
++  private nextId = 0
++  private buffer = ''
++  private attached = false
++  private timer: ReturnType<typeof setInterval> | null = null
++  private polling = false
++  private failure: string | null = null
++  private state: ConnectorState = { running: false, authFailed: false }
++  private listeners = new Set<(state: ConnectorState) => void>()
++
++  constructor(private readonly path: string, private readonly pollIntervalMs = 2000) {}
++  get running(): boolean { return this.attached && this.state.running && !this.state.authFailed }
++  get lastError(): string | null { return this.failure }
++  onState(listener: (state: ConnectorState) => void): () => void {
++    this.listeners.add(listener)
++    return () => { this.listeners.delete(listener) }
++  }
++  private updateState(value: unknown): void {
++    if (!value || typeof value !== 'object') throw new Error('公共 Connector 状态响应无效。')
++    const state = value as Partial<ConnectorState>
++    if (typeof state.running !== 'boolean' || typeof state.authFailed !== 'boolean') throw new Error('公共 Connector 状态响应无效。')
++    this.failure = null
++    this.state = { running: state.running, authFailed: state.authFailed }
++    for (const listener of this.listeners) listener({ ...this.state })
++  }
++  async prepare(): Promise<void> {
++    this.attached = true
++    const state = await this.call('connector.getState') as { protocolVersion?: number }
++    if (state?.protocolVersion !== 1) { await this.stop(); throw new Error('公共 Connector 本机协议版本不兼容。') }
++    this.updateState(state)
++    this.timer ??= setInterval(() => { void this.poll() }, this.pollIntervalMs)
++    this.timer.unref()
++  }
++  private async poll(): Promise<void> {
++    if (!this.attached || this.polling) return
++    this.polling = true
++    try { this.updateState(await this.call('connector.getState')) }
++    catch (error) { this.failure = error instanceof Error ? error.message : '公共 Connector 服务不可用。' }
++    finally { this.polling = false }
++  }
++  async bindAccount(account: Account, signal: AbortSignal, recovery?: 'reconnect' | 'recreate'): Promise<DeviceIdentity> {
++    signal.throwIfAborted()
++    if (!this.attached) await this.prepare()
++    const result = await this.call('connector.attachAccount', {
++      serverUrl: account.apiBaseUrl, userId: account.userId, accessToken: account.accessToken,
++      ...(recovery ? { recovery } : {}),
++    }, 70_000) as Partial<DeviceIdentity> | null
++    signal.throwIfAborted()
++    if (!result || typeof result.connectorId !== 'string' || !result.connectorId || typeof result.name !== 'string') throw new Error('公共 Connector 设备响应无效。')
++    return { connectorId: result.connectorId, name: result.name }
++  }
++  async start(binding: DeviceIdentity, apiBaseUrl: string, signal: AbortSignal): Promise<void> {
++    signal.throwIfAborted()
++    const identity = await this.call('connector.getIdentity') as { connectorId?: string; serverUrl?: string } | null
++    if (identity?.connectorId !== binding.connectorId || identity.serverUrl !== apiBaseUrl) throw new Error('公共 Connector 的设备身份已变化，请重新连接。')
++    this.updateState(await this.call('connector.start'))
++    signal.throwIfAborted()
++  }
++  async assertHealthy(): Promise<void> {
++    this.updateState(await this.call('connector.getState'))
++    if (this.state.authFailed) throw new ConnectorCredentialError()
++    if (!this.state.running) throw new Error('公共 Connector 尚未运行。')
++  }
++  async readLogs(query?: ConnectorLogQuery): Promise<ConnectorLogPage> {
++    return await this.call('connector.readLogs', query) as ConnectorLogPage
++  }
++  async control(action: ConnectorAction): Promise<void> {
++    this.updateState(await this.call('connector.' + action))
++  }
++  async stop(): Promise<void> {
++    this.attached = false
++    if (this.timer) clearInterval(this.timer)
++    this.timer = null
++    this.socket?.destroy()
++    this.socket = null
++    this.state = { running: false, authFailed: false }
++    this.rejectPending(new Error('本机管理连接已关闭。'))
++  }
++  private async connect(): Promise<void> {
++    if (this.socket && !this.socket.destroyed) return
++    if (this.connecting) return this.connecting
++    this.connecting = (async () => {
++      const info = await lstat(this.path).catch(() => { throw new Error('公共 Connector 服务不可用，请检查常驻服务。') })
++      if (!info.isSocket() || (info.mode & 0o077) !== 0 || (process.getuid && info.uid !== process.getuid())) throw new Error('公共 Connector 本机接口权限无效。')
++      this.buffer = ''
++      const socket = createConnection(this.path)
++      this.socket = socket
++      socket.setEncoding('utf8')
++      socket.on('data', (chunk: string) => { if (this.socket === socket) this.receive(chunk) })
++      socket.on('error', () => { if (this.socket === socket) this.failure = '公共 Connector 服务不可用，请检查常驻服务。' })
++      socket.on('close', () => {
++        if (this.socket !== socket) return
++        this.socket = null
++        this.state = { running: false, authFailed: false }
++        this.rejectPending(new Error('公共 Connector 连接已断开。'))
++        for (const listener of this.listeners) listener({ ...this.state })
++      })
++      await new Promise<void>((resolve, reject) => {
++        const timer = setTimeout(() => { socket.destroy(); reject(new Error('公共 Connector 连接超时。')) }, 5000)
++        socket.once('connect', () => { clearTimeout(timer); resolve() })
++        socket.once('error', () => { clearTimeout(timer); reject(new Error('公共 Connector 服务不可用，请检查常驻服务。')) })
++      })
++    })().finally(() => { this.connecting = null })
++    return this.connecting
++  }
++  private async call(method: string, params?: unknown, timeoutMs = 10_000): Promise<unknown> {
++    await this.connect()
++    return new Promise((resolve, reject) => {
++      const id = ++this.nextId
++      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('公共 Connector 响应超时。')) }, timeoutMs)
++      this.pending.set(id, { resolve, reject, timer })
++      this.socket!.write(JSON.stringify({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) }) + '\n', error => {
++        if (error) { clearTimeout(timer); this.pending.delete(id); reject(new Error('公共 Connector 写入失败。')) }
++      })
++    })
++  }
++  private receive(chunk: string): void {
++    this.buffer += chunk
++    if (Buffer.byteLength(this.buffer) > MAX_FRAME) { this.socket?.destroy(); return }
++    let end: number
++    while ((end = this.buffer.indexOf('\n')) !== -1) {
++      const line = this.buffer.slice(0, end); this.buffer = this.buffer.slice(end + 1)
++      try {
++        const frame = JSON.parse(line)
++        if (frame.method === 'connector/state') { this.updateState(frame.params); continue }
++        const pending = this.pending.get(frame.id)
++        if (!pending) continue
++        clearTimeout(pending.timer); this.pending.delete(frame.id)
++        if (frame.error) {
++          const id = frame.error.data?.connectorId
++          if (typeof id === 'string' && (frame.error.code === -32011 || frame.error.code === -32012)) pending.reject(new DeviceRecoveryRequired(id, frame.error.code === -32012 ? 'deleted' : 'disconnected'))
++          else pending.reject(new Error(typeof frame.error.message === 'string' ? frame.error.message : '公共 Connector 请求失败。'))
++        } else pending.resolve(frame.result)
++      } catch { this.socket?.destroy(); return }
++    }
++  }
++  private rejectPending(error: Error): void {
++    for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error) }
++    this.pending.clear()
++  }
++}
+diff --git a/dsh-bridge-next/src/host/connector/process.ts b/dsh-bridge-next/src/host/connector/process.ts
+index eea58365..c70e0f10 100644
+--- a/dsh-bridge-next/src/host/connector/process.ts
++++ b/dsh-bridge-next/src/host/connector/process.ts
+@@ -4,7 +4,10 @@ import { join } from 'node:path'
+ import { setTimeout as delay } from 'node:timers/promises'
+ import { promisify } from 'node:util'
+ import type { ResolvedConfig } from '../config.js'
+-import type { BoundDevice } from '../account/binding.js'
++import type { DeviceIdentity } from '../account/binding.js'
++import type { Account } from '../account/api.js'
++import type { ConnectorAction } from '../../contracts/connector.js'
++import type { ConnectorLogPage, ConnectorLogQuery } from '../../contracts/logs.js'
+ import { writeJson } from '../storage/files.js'
+ import { DEFAULT_CONNECTOR_SETTINGS, type ConnectorSettings } from '../../contracts/connector.js'
+ import { resolveUv } from './environment.js'
+@@ -44,10 +47,15 @@ interface Pending {
+ 
+ export interface ConnectorProcess {
+   readonly running: boolean
++  readonly external?: boolean
++  reserveOwnership?(signal?: AbortSignal): Promise<void>
++  readLogs?(query?: ConnectorLogQuery): Promise<ConnectorLogPage>
++  bindAccount?(account: Account, signal: AbortSignal, recovery?: 'reconnect' | 'recreate'): Promise<DeviceIdentity>
++  control?(action: ConnectorAction): Promise<void>
+   readonly lastError?: string | null
+   onState(listener: (state: ConnectorState) => void): () => void
+   prepare(settings?: ConnectorSettings): Promise<void>
+-  start(binding: BoundDevice, apiBaseUrl: string, signal: AbortSignal): Promise<void>
++  start(binding: DeviceIdentity, apiBaseUrl: string, signal: AbortSignal): Promise<void>
+   stop(): Promise<void>
+   assertHealthy(): Promise<void>
+ }
+@@ -76,6 +84,7 @@ export class SourceConnector implements ConnectorProcess {
+   private readonly logs: ConnectorLogs
+   /** 可写的项目副本；uv 只在这个目录里写 uv.lock，绝不碰插件包目录。 */
+   private projectDir: string | null = null
++  private reserved = false
+   constructor(private readonly config: ResolvedConfig, private readonly launch: ConnectorLauncher = spawn,
+     private readonly settings: () => ConnectorSettings = () => DEFAULT_CONNECTOR_SETTINGS,
+     private readonly firstRequestTimeoutMs = FIRST_REQUEST_TIMEOUT,
+@@ -114,10 +123,11 @@ export class SourceConnector implements ConnectorProcess {
+     }
+   }
+ 
+-  async start(binding: BoundDevice, apiBaseUrl: string, signal: AbortSignal): Promise<void> {
++  async start(binding: DeviceIdentity, apiBaseUrl: string, signal: AbortSignal): Promise<void> {
++    if (!binding.connectorToken) throw new Error('Connector 凭据缺失。')
+     if (this.stopping) await this.stopping
+     if (this.running) return
+-    if (this.alive) await this.stop()
++    if (this.alive && !this.reserved) await this.stop()
+     signal.throwIfAborted()
+     const dataDir = join(this.config.stateRoot, 'connector')
+     const configPath = join(dataDir, 'connector.json')
+@@ -134,70 +144,96 @@ export class SourceConnector implements ConnectorProcess {
+       syncExistingOnConnect: true,
+     })
+     signal.throwIfAborted()
+-    this.failure = null
+-    this.buffer = ''
+-    this.updateState({ running: false, authFailed: false })
+-    await this.logs.startSession([binding.connectorToken])
+-    this.logs.record('starting')
++    await this.withControl(signal, [binding.connectorToken], async () => {
++      this.updateState(await this.call('connector.start'))
++    })
++  }
++
++  async reserveOwnership(signal = new AbortController().signal): Promise<void> {
++    if (this.stopping) await this.stopping
++    if (this.alive && (this.running || this.reserved)) return
++    signal.throwIfAborted()
++    await this.withControl(signal, [], async () => {
++      this.updateState(await this.call('connector.acquireOwnership'))
++      this.reserved = true
++    }, true)
++  }
++
++  private async withControl(signal: AbortSignal, secrets: string[], operation: () => Promise<void>, preserveCacheOnConflict = false): Promise<void> {
++    const dataDir = join(this.config.stateRoot, 'connector')
++    const configPath = join(dataDir, 'connector.json')
++    const settings = this.settings()
+     const executable = await resolveUv(this.config, settings)
+     const command = executable ?? (settings.uvPath || this.config.uvPath)
+-    const pypiIndexUrl = settings.uvPypiIndexUrl || 'https://pypi.org/simple'
+-    signal.throwIfAborted()
+-    // 不依赖 prepare() 的调用顺序：start() 自己也要保证项目副本就位。
+-    const projectDir = this.projectDir ??= await materializeConnectorProject(this.config)
+-    signal.throwIfAborted()
+-    const child = this.launch(command, [
+-      'run', '--directory', projectDir,
+-      'anywhere-cli', 'rpc', '--config', configPath,
+-    ], {
+-      cwd: projectDir,
+-      windowsHide: true,
+-      detached: process.platform !== 'win32',
+-      env: {
+-        ...process.env,
+-        AA_CONNECTOR_OWNER_KIND: 'dsh-plugin',
+-        ...(this.config.dshHome ? { DSH_HOME: this.config.dshHome } : {}),
+-        AGENT_CONNECTOR_DATA_DIR: dataDir,
+-        UV_PROJECT_ENVIRONMENT: join(this.config.stateRoot, 'connector-venv'),
+-        PYTHONDONTWRITEBYTECODE: '1',
+-        PYTHONUNBUFFERED: '1',
+-        UV_HTTP_TIMEOUT: process.env['UV_HTTP_TIMEOUT'] || UV_READ_TIMEOUT_SECONDS,
+-        UV_PYTHON_INSTALL_MIRROR: settings.uvPythonInstallMirror || 'https://github.com/astral-sh/python-build-standalone/releases/download',
+-        UV_DEFAULT_INDEX: pypiIndexUrl,
+-        UV_INDEX_URL: pypiIndexUrl,
+-        PIP_INDEX_URL: pypiIndexUrl,
+-      },
+-    })
+-    this.child = child
+-    child.stdout.setEncoding('utf8')
+-    child.stdout.on('data', (chunk: string) => { if (this.child === child) this.receive(chunk) })
+-    child.stderr.setEncoding('utf8')
+-    child.stderr.on('data', (chunk: string) => { this.logs.output(chunk) })
+-    child.stdin.on('error', () => { if (this.child === child) this.fail(new Error('Connector 输入连接已关闭。')) })
+-    child.on('error', () => { if (this.child === child) this.fail(new Error('Connector 进程启动失败，请检查 uv 和源码运行环境。')) })
+-    child.on('close', (code) => {
+-      this.closed.add(child)
+-      this.logs.finish()
+-      this.logs.record(`exited (${code ?? 'signal'})`)
+-      void this.logs.flush().catch(() => undefined)
+-      if (this.child === child) {
+-        this.child = null
+-        this.fail(new Error(`Connector 已退出（${code ?? '终止'}）。请在日志页切换到 Connector 查看原因。`), !this.stopping)
+-      }
+-    })
++    const starting = !this.alive
++    if (starting) {
++      this.reserved = false
++      await mkdir(dataDir, { recursive: true, mode: 0o700 })
++      this.failure = null
++      this.buffer = ''
++      this.updateState({ running: false, authFailed: false })
++      await this.logs.startSession(secrets)
++      this.logs.record('starting')
++      const pypiIndexUrl = settings.uvPypiIndexUrl || 'https://pypi.org/simple'
++      signal.throwIfAborted()
++      // 不依赖 prepare() 的调用顺序：start() 自己也要保证项目副本就位。
++      const projectDir = this.projectDir ??= await materializeConnectorProject(this.config)
++      signal.throwIfAborted()
++      const child = this.launch(command, [
++        'run', '--directory', projectDir,
++        'anywhere-cli', 'rpc', '--config', configPath,
++      ], {
++        cwd: projectDir,
++        windowsHide: true,
++        detached: process.platform !== 'win32',
++        env: {
++          ...process.env,
++          AA_CONNECTOR_OWNER_KIND: 'dsh-plugin',
++          ...(this.config.dshHome ? { DSH_HOME: this.config.dshHome } : {}),
++          AGENT_CONNECTOR_DATA_DIR: dataDir,
++          UV_PROJECT_ENVIRONMENT: join(this.config.stateRoot, 'connector-venv'),
++          PYTHONDONTWRITEBYTECODE: '1',
++          PYTHONUNBUFFERED: '1',
++          UV_HTTP_TIMEOUT: process.env['UV_HTTP_TIMEOUT'] || UV_READ_TIMEOUT_SECONDS,
++          UV_PYTHON_INSTALL_MIRROR: settings.uvPythonInstallMirror || 'https://github.com/astral-sh/python-build-standalone/releases/download',
++          UV_DEFAULT_INDEX: pypiIndexUrl,
++          UV_INDEX_URL: pypiIndexUrl,
++          PIP_INDEX_URL: pypiIndexUrl,
++        },
++      })
++      this.child = child
++      child.stdout.setEncoding('utf8')
++      child.stdout.on('data', (chunk: string) => { if (this.child === child) this.receive(chunk) })
++      child.stderr.setEncoding('utf8')
++      child.stderr.on('data', (chunk: string) => { this.logs.output(chunk) })
++      child.stdin.on('error', () => { if (this.child === child) this.fail(new Error('Connector 输入连接已关闭。')) })
++      child.on('error', () => { if (this.child === child) this.fail(new Error('Connector 进程启动失败，请检查 uv 和源码运行环境。')) })
++      child.on('close', (code) => {
++        this.closed.add(child)
++        this.logs.finish()
++        this.logs.record(`exited (${code ?? 'signal'})`)
++        void this.logs.flush().catch(() => undefined)
++        if (this.child === child) {
++          this.child = null
++          this.fail(new Error(`Connector 已退出（${code ?? '终止'}）。请在日志页切换到 Connector 查看原因。`), !this.stopping)
++        }
++      })
++    } else this.logs.setSecrets(secrets)
+     const abort = () => { void this.stop() }
+     signal.addEventListener('abort', abort, { once: true })
+     try {
+       signal.throwIfAborted()
+       // Includes the first uv dependency installation, not just Python startup.
+-      this.updateState(await this.call('connector.getState', this.firstRequestTimeoutMs))
++      this.updateState(await this.call('connector.getState', starting ? this.firstRequestTimeoutMs : 15_000))
+       signal.throwIfAborted()
+-      this.updateState(await this.call('connector.start'))
++      await operation()
+       signal.throwIfAborted()
+     } catch (error) {
+       await this.stop()
+       // Whatever ended this attempt left a partial download behind, and only a prune reclaims it.
+-      try { await this.prune(command) } catch { /* Housekeeping may not replace the real failure. */ }
++      if (!(preserveCacheOnConflict && error instanceof ConnectorOwnershipError)) {
++        try { await this.prune(command) } catch { /* Housekeeping may not replace the real failure. */ }
++      }
+       throw error
+     } finally {
+       signal.removeEventListener('abort', abort)
+@@ -215,7 +251,7 @@ export class SourceConnector implements ConnectorProcess {
+ 
+   stop(): Promise<void> {
+     if (this.stopping) return this.stopping
+-    this.stopping = this.stopChild().finally(async () => { await this.logs.flush(); this.failure = null; this.stopping = null })
++    this.stopping = this.stopChild().finally(async () => { await this.logs.flush(); this.failure = null; this.stopping = null; this.reserved = false })
+     return this.stopping
+   }
+ 
+diff --git a/dsh-bridge-next/src/host/dsh-runtime/interaction-stream.ts b/dsh-bridge-next/src/host/dsh-runtime/interaction-stream.ts
+index aaf74180..85184769 100644
+--- a/dsh-bridge-next/src/host/dsh-runtime/interaction-stream.ts
++++ b/dsh-bridge-next/src/host/dsh-runtime/interaction-stream.ts
+@@ -12,12 +12,12 @@ export type InteractionOutcome = { kind: 'next' } | { kind: 'result', value: unk
+   | { kind: 'rejected', error: { name: string, code: string, message: string } }
+ 
+ /** Published 0.1.5 uses (endpoint, payload, signal); 0.1.7 adds uplink and peer. */
+-export function openInteractionEvents(wireStream: Context['typertGateway']['wireStream'], signal: AbortSignal): Promise<AsyncIterable<unknown>> {
++export function openInteractionEvents(wireStream: Context['typertGateway']['wireStream'], signal: AbortSignal, peer?: unknown): Promise<AsyncIterable<unknown>> {
+   const open = wireStream.open
+   const args: unknown[] = ['$events', { args: {} }]
+   if (open.length === 5) {
+-    // $events is receive-only. An undefined peer selects the official in-process operator.
+-    args.push((async function* () {})(), undefined, signal)
++    // Current Gateway requires the admitted Connection Peer; replies use that same Peer.
++    args.push((async function* () {})(), peer, signal)
+   } else if (open.length === 3) {
+     args.push(signal)
+   } else {
+@@ -40,14 +40,16 @@ export class InteractionStream {
+         let failed = false
+         while (!abort.signal.aborted) {
+           try {
+-            const stream = await openInteractionEvents(ready.typertGateway.wireStream, abort.signal)
++            const stream = await openInteractionEvents(ready.typertGateway.wireStream, abort.signal, Reflect.get(ready.connection, 'browserPeer'))
+             for await (const value of stream) {
+               if (abort.signal.aborted) break
+               const frame = record(value)
+               if (frame.type === 'ready' && typeof frame.clientId === 'string') {
+                 if (failed) diagnostics.log('info', 'interaction.stream_recovered', { service })
+                 failed = false
+-                this.clientId = frame.clientId; this.activeContext = ready; changed()
++                const wasAvailable = this.available
++                this.clientId = frame.clientId; this.activeContext = ready
++                if (!wasAvailable) changed()
+               } else await receive(frame)
+             }
+           } catch (error) {
+@@ -55,7 +57,11 @@ export class InteractionStream {
+             if (!abort.signal.aborted && !failed) diagnostics.log('warn', 'interaction.stream_failed', { service, openArity: ready.typertGateway.wireStream.open.length }, error)
+             failed = true
+           }
+-          finally { this.clientId = undefined; this.activeContext = undefined; changed() }
++          finally {
++            const wasAvailable = this.available
++            this.clientId = undefined; this.activeContext = undefined
++            if (wasAvailable) changed()
++          }
+           try { await delay(500, undefined, { signal: abort.signal }) } catch { break }
+         }
+       }
+diff --git a/dsh-bridge-next/src/host/onboarding/manager.ts b/dsh-bridge-next/src/host/onboarding/manager.ts
+index 58933b51..a97faf70 100644
+--- a/dsh-bridge-next/src/host/onboarding/manager.ts
++++ b/dsh-bridge-next/src/host/onboarding/manager.ts
+@@ -5,10 +5,13 @@ import { setTimeout as delay } from 'node:timers/promises'
+ import { CLOUD_API_BASE_URL, type ConnectionSettings, type DesktopDetection, type DesktopLaunch, type DeviceRecovery, type DeviceRecoveryAction, type DeviceRecoveryResult, type FlowStage, type LoginRequest, type OnboardingSnapshot } from '../../contracts/index.js'
+ import { resolveOnboardingUrl, resolveWebAppUrl } from '../../contracts/web-address.js'
+ import { AccountApi, ApiError, publicProfile, type Account } from '../account/api.js'
+-import { DeviceRecoveryRequired, ensureBinding, readBoundDevice, recoverBinding, verifyBoundDevice, type BoundDevice } from '../account/binding.js'
++import { DeviceRecoveryRequired, ensureBinding, readBoundDevice, recoverBinding, verifyBoundDevice, type DeviceIdentity } from '../account/binding.js'
+ import { checkServer, normalizeServerOrigin, resolveOAuthWebOrigin } from '../account/server.js'
+ import type { ResolvedConfig } from '../config.js'
+ import { ConnectorCredentialError, SourceConnector, type ConnectorProcess } from '../connector/process.js'
++import { readConnectorLogs } from '../connector/logs.js'
++import type { ConnectorLogPage, ConnectorLogQuery } from '../../contracts/logs.js'
++import { ExternalConnector } from '../connector/external.js'
+ import { detectDesktop } from '../desktop/detect.js'
+ import { desktopOnboardingUrl, launchDesktop, newDesktopFlowId, type DesktopLauncher } from '../desktop/launch.js'
+ import type { LocalMachineRegistry } from '../desktop/machine-state.js'
+@@ -38,7 +41,7 @@ interface Dependencies {
+ export class OnboardingManager {
+   private settings: ConnectionSettings
+   private account: Account | null = null
+-  private binding: BoundDevice | null = null
++  private binding: DeviceIdentity | null = null
+   private recovery: DeviceRecovery | null = null
+   private recoveryCheck: Promise<void> | null = null
+   private recoveryController: AbortController | null = null
+@@ -70,7 +73,7 @@ export class OnboardingManager {
+   constructor(private readonly config: ResolvedConfig, private readonly dependencies: Dependencies = {}) {
+     this.settings = { apiBaseUrl: config.apiBaseUrl }
+     this.connectorSettings = new ConnectorSettingsStore(config, dependencies.systemLanguages)
+-    this.connector = dependencies.connector ?? new SourceConnector(config, undefined, () => this.connectorSettings.get())
++    this.connector = dependencies.connector ?? (config.connectorSocketPath ? new ExternalConnector(config.connectorSocketPath) : new SourceConnector(config, undefined, () => this.connectorSettings.get()))
+     this.detect = dependencies.detect ?? detectDesktop
+     this.launchDesktop = dependencies.launchDesktop ?? launchDesktop
+     this.apiFactory = dependencies.api ?? (base => new AccountApi(base))
+@@ -108,7 +111,7 @@ export class OnboardingManager {
+         await writeJson(join(this.config.stateRoot, 'settings.json'), this.settings)
+       }
+       if (this.account?.apiBaseUrl !== this.settings.apiBaseUrl) this.account = null
+-      if (this.account) this.binding = await readBoundDevice(this.config.stateRoot, this.account)
++      if (this.account && !this.connector.external) this.binding = await readBoundDevice(this.config.stateRoot, this.account)
+       this.roleTimer = setInterval(() => {
+         const wasBlocked = this.desktop.status !== 'absent'
+         void this.refreshRole().then(() => {
+@@ -137,6 +140,10 @@ export class OnboardingManager {
+     return { ...this.snapshot(), stage: 'error', message, ownership: { status: 'error', message } }
+   }
+ 
++  readConnectorLogs(query?: ConnectorLogQuery): Promise<ConnectorLogPage> {
++    return this.connector.readLogs ? this.connector.readLogs(query) : readConnectorLogs(join(this.config.stateRoot, 'logs'), query)
++  }
++
+   async inspect(): Promise<OnboardingSnapshot> {
+     await this.initialize()
+     await this.refreshRole()
+@@ -262,8 +269,9 @@ export class OnboardingManager {
+     const account = this.account
+     if (!account) throw new Error('请先完成登录。')
+     signal.throwIfAborted()
++    await this.connector.reserveOwnership?.(signal)
+     this.setProgress('pairing', '登录成功，正在连接本机设备…')
+-    this.binding = await ensureBinding(this.config.stateRoot, account, api, signal, {
++    this.binding = this.connector.bindAccount ? await this.connector.bindAccount(account, signal) : await ensureBinding(this.config.stateRoot, account, api, signal, {
+       ...(this.dependencies.machineState ? { machineState: this.dependencies.machineState } : {}),
+       renew: Boolean(code),
+     })
+@@ -351,10 +359,11 @@ export class OnboardingManager {
+       try {
+         await this.connector.prepare()
+         await this.connector.stop()
++        await this.connector.reserveOwnership?.(controller.signal)
+         controller.signal.throwIfAborted()
+         this.setProgress('pairing', action === 'recreate' ? '正在重新创建设备…' : '正在恢复设备连接…')
+-        this.binding = await recoverBinding(this.config.stateRoot, account, this.apiFactory(account.apiBaseUrl), controller.signal,
+-          recovery.connectorId, action)
++        this.binding = this.connector.bindAccount ? await this.connector.bindAccount(account, controller.signal, action)
++          : await recoverBinding(this.config.stateRoot, account, this.apiFactory(account.apiBaseUrl), controller.signal, recovery.connectorId, action)
+         this.recovery = null
+         this.setProgress('starting', '正在启动本机连接…')
+         await this.connector.start(this.binding, account.apiBaseUrl, controller.signal)
+@@ -401,6 +410,13 @@ export class OnboardingManager {
+       await this.requireStandalone()
+       if (!['start', 'stop', 'restart'].includes(action)) throw new Error('不支持的 Connector 操作。')
+       await this.cancelFlow()
++      if (this.connector.external && this.connector.control) {
++        this.requireAccount()
++        await this.connector.prepare()
++        await this.connector.control(action)
++        this.setProgress(action === 'stop' ? 'idle' : 'ready', action === 'stop' ? '共享 Connector 已停止，所有 Agent 的连接已停止。' : '共享 Connector 已连接。')
++        return null
++      }
+       if (action === 'stop') {
+         await this.connector.stop()
+         this.setProgress('idle', 'Connector 已停止。')
+@@ -423,9 +439,11 @@ export class OnboardingManager {
+     const controller = new AbortController()
+     this.controller = controller
+     try {
++      await this.connector.reserveOwnership?.(controller.signal)
+       const api = this.apiFactory(account.apiBaseUrl)
+       this.setProgress('pairing', '正在检查本机设备…')
+-      this.binding = this.binding ? await verifyBoundDevice(this.binding, account, api, controller.signal)
++      this.binding = this.connector.bindAccount ? await this.connector.bindAccount(account, controller.signal)
++        : this.binding?.connectorToken ? await verifyBoundDevice(this.binding as import('../account/binding.js').BoundDevice, account, api, controller.signal)
+         : await ensureBinding(this.config.stateRoot, account, api, controller.signal, {
+           ...(this.dependencies.machineState ? { machineState: this.dependencies.machineState } : {}),
+         })
+@@ -445,6 +463,7 @@ export class OnboardingManager {
+   saveConnectorSettings(input: ConnectorSettings): Promise<null> {
+     return this.serial(async () => {
+       await this.requireStandalone()
++      if (this.connector.external) throw new Error('共享 Connector 的运行设置由常驻服务统一管理。')
+       if (this.stage === 'authorizing' || this.stage === 'pairing' || this.stage === 'starting') throw new Error('连接正在进行，请完成或取消后再保存设置。')
+       const next = validateConnectorSettings(input)
+       const previous = this.connectorSettings.get()
+@@ -477,7 +496,8 @@ export class OnboardingManager {
+     return this.serial(async () => {
+       await this.requireStandalone()
+       if (typeof forceLocal !== 'boolean') throw new Error('重置参数无效。')
+-      if (this.binding && this.account && !forceLocal) {
++      if (this.binding && this.account && !forceLocal && !this.connector.external) {
++        await this.connector.reserveOwnership?.()
+         try {
+           // Reuse Desktop's revoke-and-discard semantics. A failed revoke leaves
+           // local credentials intact, allowing retry or a separate local-only reset.
+@@ -491,7 +511,7 @@ export class OnboardingManager {
+       await this.connector.stop()
+       this.account = null; this.binding = null; this.recovery = null; this.profileCheckedAt = 0
+       // Never remove stateRoot itself, the shared Connector record, or the DSH runtime.
+-      for (const path of ['account.json', 'settings.json', 'bindings', 'connector', 'logs']) {
++      for (const path of this.connector.external ? ['account.json', 'settings.json', 'bindings', 'logs'] : ['account.json', 'settings.json', 'bindings', 'connector', 'logs']) {
+         await rm(join(this.config.stateRoot, path), { force: true, recursive: true })
+       }
+       this.settings = { apiBaseUrl: this.config.apiBaseUrl }
+@@ -549,7 +569,7 @@ export class OnboardingManager {
+     this.binding = null
+     this.recovery = null
+     await rm(join(this.config.stateRoot, 'account.json'), { force: true })
+-    this.setProgress('idle', '已退出登录，本机连接已停止。')
++    this.setProgress('idle', this.connector.external ? '已退出插件账号，共享 Connector 继续运行。' : '已退出登录，本机连接已停止。')
+   }
+ 
+   async dispose(): Promise<void> {
+@@ -629,9 +649,10 @@ export class OnboardingManager {
+       connectorId: this.binding?.connectorId ?? null, connectorRunning: this.connector.running, flowId: this.flow?.id ?? null,
+       deviceRecovery: this.recovery ? { ...this.recovery } : null,
+       connector: {
++        mode: this.connector.external ? 'external' : 'managed',
+         settings: this.connectorSettings.get(), resolvedUvPath: this.resolvedUvPath,
+         dataPath: join(this.config.stateRoot, 'connector'), logsPath: join(this.config.stateRoot, 'logs'),
+-        canOpenFolders: canOpenFolders(), deviceName: this.binding?.name ?? null,
++        canOpenFolders: !this.connector.external && canOpenFolders(), deviceName: this.binding?.name ?? null,
+         lastError: this.connector.lastError ?? null,
+       },
+     }
+diff --git a/dsh-bridge-next/src/host/rpc/service.ts b/dsh-bridge-next/src/host/rpc/service.ts
+index fc8bdb0e..2db0c82d 100644
+--- a/dsh-bridge-next/src/host/rpc/service.ts
++++ b/dsh-bridge-next/src/host/rpc/service.ts
+@@ -12,7 +12,6 @@ import type { MobileLoginSnapshot } from '../../contracts/mobile.js'
+ import { join } from 'node:path'
+ import { stateRoot } from '../config.js'
+ import { readBridgeLogs } from '../dsh-runtime/log-reader.js'
+-import { readConnectorLogs } from '../connector/logs.js'
+ import type { ConnectorLogPage, ConnectorLogQuery, BridgeLogSnapshot } from '../../contracts/logs.js'
+ 
+ declare module '@deepseek-ai/cordis' {
+@@ -81,7 +80,7 @@ export class OnboardingService extends TypertRemoteService implements Onboarding
+   @Remote('readBridgeLogs')
+   readBridgeLogs(): Promise<BridgeLogSnapshot> { return readBridgeLogs(this.logsDirectory) }
+   @Remote('readConnectorLogs')
+-  readConnectorLogs(query?: ConnectorLogQuery): Promise<ConnectorLogPage> { return readConnectorLogs(this.logsDirectory, query) }
++  readConnectorLogs(query?: ConnectorLogQuery): Promise<ConnectorLogPage> { return this.manager.readConnectorLogs(query) }
+   @Remote('begin')
+   begin(input?: LoginRequest): Promise<{ url: string }> { return this.manager.begin(input) }
+   @Remote('cancel')
+diff --git a/dsh-bridge-next/tests/helpers/python-connector.ts b/dsh-bridge-next/tests/helpers/python-connector.ts
+index 71355aee..ed5e75db 100644
+--- a/dsh-bridge-next/tests/helpers/python-connector.ts
++++ b/dsh-bridge-next/tests/helpers/python-connector.ts
+@@ -14,7 +14,7 @@ export async function recordConnectorId(home: string, id: string): Promise<void>
+ }
+ 
+ /** Real CLI/RPC entry point with only the remote backend replaced by a wait. */
+-export function launchConnector(home: string, kind: string, mode: 'rpc' | 'start' = 'rpc') {
++export function launchConnector(home: string, kind: string, mode: 'rpc' | 'start' | 'serve' = 'rpc') {
+   const hook = join(home, 'test-python')
+   mkdirSync(hook, { recursive: true })
+   const code = `import asyncio, os, sys
+@@ -30,10 +30,11 @@ BackendRpcClient.run_forever=fake_backend
+   try { writeFileSync(join(hook, 'sitecustomize.py'), code, { flag: 'wx' }) }
+   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error }
+   const args = ['-u', '-m', 'connector.cli', mode, '--config', join(home, 'private', kind, 'connector.json')]
++  if (mode === 'serve') args.push('--socket', join(home, 'control.sock'))
+   if (mode === 'start') args.push('--server-url', 'https://example.test', '--connector-id', 'cli-id', '--connector-token', 'fixture')
+   const child = spawn(python, args, {
+     cwd: connectorProject,
+-    env: { ...process.env, AA_CONNECTOR_OWNER_KIND: kind, AA_TEST_CONNECTOR_HOME: home, PYTHONPATH: [hook, connectorProject].join(delimiter) },
++    env: { ...process.env, AA_CONNECTOR_OWNER_KIND: kind, AA_TEST_CONNECTOR_HOME: home, PYTHONPATH: [hook, connectorProject, process.env.PYTHONPATH || ''].join(delimiter) },
+     stdio: 'pipe',
+   })
+   let buffer = '', stderr = '', id = 0
+@@ -72,9 +73,11 @@ BackendRpcClient.run_forever=fake_backend
+     async close(crash = false) {
+       if (child.exitCode !== null || child.signalCode !== null) return
+       const exited = once(child, 'exit')
+-      if (crash || mode === 'start') child.kill(crash ? 'SIGKILL' : 'SIGINT')
++      if (crash || mode === 'start' || mode === 'serve') child.kill(crash ? 'SIGKILL' : 'SIGINT')
+       else child.stdin.end()
+-      await exited
++      const watchdog = setTimeout(() => { child.kill('SIGKILL') }, 6000)
++      try { await exited } finally { clearTimeout(watchdog) }
++      if (!crash && child.signalCode === 'SIGKILL') throw new Error('Connector failed to shut down: ' + stderr)
+     },
+   }
+ }
+diff --git a/dsh-bridge-next/tests/integration/connector-process.test.ts b/dsh-bridge-next/tests/integration/connector-process.test.ts
+index a5ae0d85..a0e0ecd8 100644
+--- a/dsh-bridge-next/tests/integration/connector-process.test.ts
++++ b/dsh-bridge-next/tests/integration/connector-process.test.ts
+@@ -259,3 +259,16 @@ test('startup exit 2 preserves uv diagnostics in the Connector journal', async (
+     assert.match(logs, /exited \(2\)/)
+   } finally { await h.close() }
+ })
++
++test('ownership reservation survives provisioning in the same control process', async () => {
++  const h = await fixture()
++  try {
++    await h.connector.prepare()
++    await h.connector.reserveOwnership()
++    const reservedPid = h.child!.pid
++    assert.equal(h.connector.running, false, 'reservation must not start a backend connection')
++    await h.connector.start(binding, 'https://api.example.test', new AbortController().signal)
++    assert.equal(h.child!.pid, reservedPid, 'provisioning must reuse the process that owns the lease')
++    assert.equal(h.connector.running, true)
++  } finally { await h.close() }
++})
+diff --git a/dsh-bridge-next/tests/integration/external-connector.test.ts b/dsh-bridge-next/tests/integration/external-connector.test.ts
+new file mode 100644
+index 00000000..5ba7e28b
+--- /dev/null
++++ b/dsh-bridge-next/tests/integration/external-connector.test.ts
+@@ -0,0 +1,152 @@
++import assert from 'node:assert/strict'
++import test from 'node:test'
++import { createServer } from 'node:http'
++import { chmod, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
++import { tmpdir } from 'node:os'
++import { join } from 'node:path'
++import { setTimeout as delay } from 'node:timers/promises'
++import { ExternalConnector } from '../../src/host/connector/external.js'
++import { OnboardingManager } from '../../src/host/onboarding/manager.js'
++import { writeJson } from '../../src/host/storage/files.js'
++import { launchConnector, connectorProject } from '../helpers/python-connector.js'
++import { SourceConnector } from '../../src/host/connector/process.js'
++
++async function until(check: () => boolean | Promise<boolean>) {
++  for (let i = 0; i < 1000; i++) { if (await check()) return; await delay(20) }
++  assert.fail('Shared service did not reach the expected state')
++}
++
++async function fixture(t: import('node:test').TestContext) {
++  const root = await mkdtemp(join(tmpdir(), 'aa-shared-'))
++  const calls: string[] = []
++  const server = createServer((request, response) => {
++    const path = new URL(request.url!, 'http://fixture').pathname
++    calls.push(request.method + ' ' + path)
++    response.setHeader('Content-Type', 'application/json')
++    if (path === '/api/v2/auth/me') return response.end(JSON.stringify({ userId: 'owner', displayName: 'Owner' }))
++    if (path === '/api/v2/connectors/existing') return response.end(JSON.stringify({ connector: { id: 'existing', userId: 'owner', name: 'Machine', status: 'online' } }))
++    if (path === '/api/v2/connectors' && request.method === 'GET') return response.end(JSON.stringify({ connectors: [{ id: 'existing', userId: 'owner', name: 'Machine', status: 'online' }] }))
++    if (path === '/api/v2/connector/auth') { assert.equal(request.headers.authorization, 'Connector existing:DEVICE-SECRET'); return response.end('{}') }
++    response.statusCode = 500
++    response.end('{}')
++  })
++  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
++  const apiBaseUrl = 'http://127.0.0.1:' + (server.address() as import('node:net').AddressInfo).port
++  const configPath = join(root, 'private', 'shared', 'connector.json')
++  await writeJson(configPath, { serverUrl: apiBaseUrl, connectorId: 'existing', connectorToken: 'DEVICE-SECRET' })
++  const before = await readFile(configPath, 'utf8')
++  let service = launchConnector(root, 'shared', 'serve')
++  const client = new ExternalConnector(join(root, 'control.sock'), 25)
++  const account = { apiBaseUrl, userId: 'owner', displayName: 'Owner', accessToken: 'OAUTH-SECRET', expiresAt: Date.now() + 3600_000 }
++  const signal = new AbortController().signal
++  t.after(async () => {
++    await client.stop()
++    await service.close()
++    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
++    await rm(root, { recursive: true, force: true })
++  })
++  await until(() => service.stderr.includes('backend-ready') || service.child.exitCode !== null)
++  assert.equal(service.child.exitCode, null, service.stderr)
++  return {
++    root, client, account, calls, signal, configPath, before, apiBaseUrl,
++    get service() { return service },
++    async restart() {
++      await service.close()
++      await until(() => !client.running)
++      service = launchConnector(root, 'shared', 'serve')
++      await until(() => service.stderr.includes('backend-ready') || service.child.exitCode !== null)
++      assert.equal(service.child.exitCode, null, service.stderr)
++    },
++  }
++}
++
++test('external clients attach to the real Python service without provisioning or stopping peers', async t => {
++  const h = await fixture(t)
++  await h.client.prepare()
++  const identity = await h.client.bindAccount(h.account, h.signal)
++  assert.deepEqual(identity, { connectorId: 'existing', name: 'Machine' })
++  const pid = h.service.child.pid
++  await h.client.start(identity, h.apiBaseUrl, h.signal)
++  await h.client.stop()
++  assert.equal(h.service.child.exitCode, null)
++  await h.client.prepare()
++  await h.client.assertHealthy()
++  assert.equal(h.service.child.pid, pid)
++  assert.equal(await readFile(h.configPath, 'utf8'), h.before)
++  assert.equal(h.calls.some(call => /revoke|POST \/api\/v2\/connectors$/.test(call)), false)
++  assert.doesNotMatch(JSON.stringify(identity), /SECRET/)
++  await h.client.control('stop')
++  assert.equal(h.client.running, false)
++  await h.client.control('start')
++  assert.equal(h.client.running, true)
++})
++
++test('external mode reconnects after the system service restarts', async t => {
++  const h = await fixture(t)
++  await h.client.prepare()
++  await h.restart()
++  await until(() => h.client.running)
++  await h.client.assertHealthy()
++  assert.equal(await readFile(h.configPath, 'utf8'), h.before)
++})
++
++test('DSH reload, logout and reset preserve the shared device and runtime', async t => {
++  const h = await fixture(t)
++  const pluginRoot = join(h.root, 'plugin')
++  await mkdir(pluginRoot)
++  await writeJson(join(pluginRoot, 'account.json'), h.account)
++  const makeManager = () => new OnboardingManager({
++    apiBaseUrl: h.apiBaseUrl, stateRoot: pluginRoot, connectorSourceDir: '/missing-source', uvPath: '/missing-uv', connectorSocketPath: join(h.root, 'control.sock'),
++  }, { detect: async () => ({ status: 'absent', message: 'fixture' }), checkServer: async () => undefined, systemLanguages: async () => ['en-US'], pollIntervalMs: 10 })
++  let manager = makeManager()
++  t.after(() => manager.dispose())
++  await manager.resume()
++  await until(async () => (await manager.inspect()).stage === 'ready')
++  assert.equal((await manager.inspect()).connector.mode, 'external')
++  assert.equal((await manager.inspect()).connectorId, 'existing')
++  await manager.dispose()
++  assert.equal(h.service.child.exitCode, null)
++  manager = makeManager()
++  await manager.resume()
++  await until(async () => (await manager.inspect()).stage === 'ready')
++  await manager.logout()
++  assert.equal(h.service.child.exitCode, null)
++  await manager.resetConnector(false)
++  await h.client.prepare()
++  await h.client.assertHealthy()
++  assert.equal(await readFile(h.configPath, 'utf8'), h.before)
++  assert.equal(h.calls.some(call => /revoke|POST \/api\/v2\/connectors$/.test(call)), false)
++  assert.equal((await manager.inspect()).account, null)
++})
++
++test('external mode rejects insecure socket permissions without a fallback connector', async t => {
++  const h = await fixture(t)
++  await chmod(join(h.root, 'control.sock'), 0o666)
++  await assert.rejects(h.client.prepare(), /权限无效/)
++  assert.equal(h.service.child.exitCode, null)
++  assert.equal(h.calls.length, 0)
++})
++
++
++test('managed mode rejects a shared owner before looking up or rotating device credentials', async t => {
++  const h = await fixture(t)
++  const pluginRoot = join(h.root, 'managed-plugin')
++  await writeJson(join(pluginRoot, 'account.json'), h.account)
++  const config = { apiBaseUrl: h.apiBaseUrl, stateRoot: pluginRoot, connectorSourceDir: connectorProject, uvPath: process.execPath }
++  const managed = new SourceConnector(config, () => {
++    const control = launchConnector(h.root, 'managed-reservation')
++    t.after(() => control.close())
++    return control.child
++  })
++  const manager = new OnboardingManager(config, {
++    connector: managed, detect: async () => ({ status: 'absent', message: 'fixture' }),
++    checkServer: async () => undefined, systemLanguages: async () => ['en-US'],
++    machineState: { readConnectorIds: async () => ['existing'] }, pollIntervalMs: 10,
++  })
++  t.after(() => manager.dispose())
++  await manager.resume()
++  await until(async () => (await manager.inspect()).stage === 'error')
++  assert.equal(h.calls.some(call => call.includes('/connectors')), false, 'ownership must be acquired before any device credential operation')
++  assert.equal(h.service.child.exitCode, null)
++  assert.equal(await readFile(h.configPath, 'utf8'), h.before)
++})
+diff --git a/dsh-bridge-next/tests/unit/interaction-stream.test.ts b/dsh-bridge-next/tests/unit/interaction-stream.test.ts
+new file mode 100644
+index 00000000..9761fe08
+--- /dev/null
++++ b/dsh-bridge-next/tests/unit/interaction-stream.test.ts
+@@ -0,0 +1,72 @@
++import assert from 'node:assert/strict'
++import test from 'node:test'
++import { setTimeout as delay } from 'node:timers/promises'
++import { InteractionStream, openInteractionEvents } from '../../src/host/dsh-runtime/interaction-stream.js'
++
++test('current Gateway event streams receive the same admitted Peer used for replies', async () => {
++  const peer = { principal: { kind: 'owner' }, interactions: 'answer', signal: new AbortController().signal }
++  const signal = new AbortController().signal
++  let received: unknown[] = []
++  const wire = { open: async function (endpoint: unknown, payload: unknown, uplink: unknown, identity: unknown, abort: unknown) {
++    received = [endpoint, payload, uplink, identity, abort]
++    return (async function* () {})()
++  } }
++  await openInteractionEvents(wire as never, signal, peer)
++  assert.equal(received[0], '$events')
++  assert.equal(received[3], peer, 'Gateway 0.2.1 rejects an absent Peer before opening the event stream')
++  assert.equal(received[4], signal)
++})
++
++test('failed interaction retries do not announce unchanged unavailable capabilities', async () => {
++  let attempts = 0, changes = 0
++  let dispose = async () => {}
++  const ready = {
++    typertGateway: { wireStream: { open: async function (_endpoint: unknown, _payload: unknown, _signal: unknown) {
++      attempts++
++      throw new Error('interaction source unavailable')
++    } } },
++    connection: {},
++    effect: (start: () => () => Promise<void>) => { dispose = start() },
++  }
++  const ctx = { inject: (_keys: unknown, callback: (value: typeof ready) => void) => {
++    callback(ready)
++    return { dispose: () => dispose() }
++  } }
++  const stream = new InteractionStream(ctx as never, async () => {}, () => { changes++ })
++  try {
++    await delay(560)
++    assert.ok(attempts >= 2, 'the unavailable source must still be retried')
++    assert.equal(stream.available, false)
++    assert.equal(changes, 0, 'retries must not flood every session with unchanged capability updates')
++  } finally { await stream.close() }
++})
++
++test('the local consumer uses Connection browserPeer and announces only actual availability transitions', async () => {
++  const peer = { principal: { kind: 'owner' }, interactions: 'answer', signal: new AbortController().signal }
++  const received: unknown[] = [], availability: boolean[] = []
++  let dispose = async () => {}
++  const ready = {
++    typertGateway: { wireStream: { open: async function (_endpoint: unknown, _payload: unknown, _uplink: unknown, identity: unknown, signal: AbortSignal) {
++      received.push(identity)
++      return (async function* () {
++        yield { type: 'ready', clientId: 'local-consumer' }
++        yield { type: 'ready', clientId: 'local-consumer' }
++        await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true }))
++      })()
++    } } },
++    connection: { browserPeer: peer },
++    effect: (start: () => () => Promise<void>) => { dispose = start() },
++  }
++  const ctx = { inject: (_keys: unknown, callback: (value: typeof ready) => void) => {
++    callback(ready)
++    return { dispose: () => dispose() }
++  } }
++  const stream = new InteractionStream(ctx as never, async () => {}, () => availability.push(stream.available))
++  try {
++    for (let n = 0; n < 50 && !stream.available; n++) await delay(5)
++    assert.equal(stream.available, true)
++    assert.deepEqual(received, [peer])
++    assert.deepEqual(availability, [true], 'duplicate ready frames do not invalidate all session capabilities')
++  } finally { await stream.close() }
++  assert.deepEqual(availability, [true, false])
++})

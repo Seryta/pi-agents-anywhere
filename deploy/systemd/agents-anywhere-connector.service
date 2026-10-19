@@ -1,0 +1,20 @@
+[Unit]
+Description=Agents Anywhere shared Connector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=AGENT_CONNECTOR_CONFIG=%h/.agents-anywhere/connector.json
+Environment=AGENT_CONNECTOR_DATA_DIR=%h/.agents-anywhere
+ExecStart=%h/.local/share/agents-anywhere/venv/bin/python -m connector.cli serve
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=default.target
+Alias=pi-aa-connector.service

@@ -12,8 +12,8 @@ jobs:
         pi-version: ["0.87.1", "1.1.0"]
     env:
       PI_AA_CONNECTOR_SOURCE: /tmp/Agents-Anywhere/connector
-      # Agents Anywhere v2.0.3; repository variables can opt into another ref.
-      PI_AA_CONNECTOR_REF: ${{ vars.PI_AA_CONNECTOR_REF || 'c0c3810d80331a9b8434e25538eeb389f84301ce' }}
+      # Reviewed Agents Anywhere v2.0.3 integration base.
+      PI_AA_CONNECTOR_REF: c0c3810d80331a9b8434e25538eeb389f84301ce
     steps:
       - uses: actions/checkout@v4
 
@@ -24,6 +24,9 @@ jobs:
           git -C /tmp/Agents-Anywhere fetch --depth 1 origin "$PI_AA_CONNECTOR_REF"
           git -C /tmp/Agents-Anywhere checkout --detach FETCH_HEAD
 
+      - name: Apply the reviewed upstream integration
+        run: python3 integrations/agents-anywhere/apply.py /tmp/Agents-Anywhere
+
       - name: Build the test image
         run: docker/build-test-env.sh --build-arg PI_VERSION=${{ matrix.pi-version }}
 
@@ -32,3 +35,14 @@ jobs:
 
       - name: Tests (unit + real pi)
         run: PI_AA_TRUE_PI=1 docker/run-tests.sh
+
+  shared-distribution:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the pinned Connector, Pi extension and DSH plugin
+        run: docker/build-shared-connector.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shared-connector
+          path: dist/shared-connector/

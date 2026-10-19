@@ -12,8 +12,8 @@ jsonschema-specifications==2025.9.1
 loguru==0.7.3
 packaging==26.3
 pluggy==1.6.0
-pydantic==2.14.1
-pydantic_core==2.50.1
+pydantic==2.13.5
+pydantic_core==2.46.5
 Pygments==2.21.0
 pytest==9.1.1
 pytest-asyncio==1.4.0

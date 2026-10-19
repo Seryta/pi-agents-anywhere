@@ -17,7 +17,7 @@ ARG PIP_INDEX_URL=https://pypi.org/simple
 
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && apt-get install -y --no-install-recommends ca-certificates curl git xz-utils \
     && curl -fsSL -o /tmp/node.tar.xz "${NODE_DIST}/${NODE_VERSION}/node-${NODE_VERSION}-linux-x64.tar.xz" \
     && tar -xf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
     && rm /tmp/node.tar.xz \
@@ -27,6 +27,10 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     && rm -rf /var/lib/apt/lists/*
 
 COPY test-requirements.txt /tmp/test-requirements.txt
-RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" -r /tmp/test-requirements.txt
+COPY --from=connector_source /pyproject.toml /connector-source/pyproject.toml
+COPY --from=connector_source /README.md /connector-source/README.md
+COPY --from=connector_source /connector /connector-source/connector
+COPY --from=integration_config /constraints.txt /tmp/constraints.txt
+RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" -c /tmp/constraints.txt -r /tmp/test-requirements.txt /connector-source
 
 WORKDIR /work
