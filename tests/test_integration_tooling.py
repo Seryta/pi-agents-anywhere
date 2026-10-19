@@ -42,8 +42,11 @@ def integration(tmp_path):
 def test_patch_refresh_includes_changes_after_the_reviewed_base(integration, committed, tmp_path):
     checkout, module, package, tool, base = integration
     module.write_text("extension\n")
+    contract = checkout / "contracts/dsh-bridge/1.0/schema.json"
+    contract.parent.mkdir(parents=True)
+    contract.write_text('{"projectionVersion": 4}\n')
     if committed:
-        git(checkout, "add", "connector")
+        git(checkout, "add", "connector", "contracts")
         git(checkout, "commit", "-qm", "feat(test): install extension")
     (module.parent / "new.py").write_text("new extension\n")
     subprocess.run([sys.executable, str(tool), str(checkout)], check=True)
@@ -53,6 +56,9 @@ def test_patch_refresh_includes_changes_after_the_reviewed_base(integration, com
     git(clean, "apply", str(package / "upstream.patch"))
     assert (clean / "connector/runtime.py").read_text() == "extension\n"
     assert (clean / "connector/new.py").read_text() == "new extension\n"
+    assert (
+        clean / "contracts/dsh-bridge/1.0/schema.json"
+    ).read_text() == '{"projectionVersion": 4}\n'
 
 
 def test_patch_refresh_rejects_an_unreviewed_history(integration):

@@ -27,6 +27,7 @@ def main() -> None:
         "connector",
         "dsh-bridge-next",
         "contracts/connector-local-control",
+        "contracts/dsh-bridge",
         "docs/runtime-protocol/runtime-extensions.md",
     ]
     patch = subprocess.check_output(["git", "diff", "--binary", base, "--", *paths], cwd=checkout)
