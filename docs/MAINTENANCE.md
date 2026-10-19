@@ -4,6 +4,16 @@
 
 ## 下次可以这样下达任务
 
+三种 agent 共用 `skills/pi-aa-upgrade/SKILL.md`，入口语法不同：
+
+| Agent | 调用方式 |
+| --- | --- |
+| Codex | `使用 $pi-aa-upgrade ...` |
+| Pi agent | `/skill:pi-aa-upgrade ...` |
+| DSH | `请调用 skill 工具加载 pi-aa-upgrade，再按维护手册 ...` |
+
+以下自然语言示例使用 Codex 语法；Pi / DSH 替换为对应入口即可。
+
 仅检查上游变化：
 
 > 使用 $pi-aa-upgrade 检查 Pi、AA 和 DSH 是否需要升级，先阅读仓库 AGENTS.md 和 docs/MAINTENANCE.md，报告建议版本与影响范围。
@@ -124,4 +134,17 @@ mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
 ln -s "$PI_REPO/skills/pi-aa-upgrade" "${CODEX_HOME:-$HOME/.codex}/skills/pi-aa-upgrade"
 ```
 
-若目标已存在，先查看并确认其来源，不覆盖其他技能。未安装技能时仍可直接使用本仓库的 AGENTS.md 和本文。
+若目标已存在，先查看并确认其来源，不覆盖其他技能。
+
+Pi agent 使用 `~/.pi/agent/settings.json` 的 `skills` 数组：追加 `PI_REPO/skills/pi-aa-upgrade` 的实际绝对路径，保留已有条目和其他设置。JSON 不展开 shell 变量，不能把字面量 `$PI_REPO` 写进去。这个入口避免改动用户可能单独纳入 Git 的 `~/.pi/agent/skills` 仓库。新会话会加载配置；已有 Pi 会话可用 `/reload` 重新加载资源和设置。
+
+DSH 使用用户技能目录入口：
+
+```bash
+mkdir -p "$HOME/.dsh/skills"
+ln -s "$PI_REPO/skills/pi-aa-upgrade" "$HOME/.dsh/skills/pi-aa-upgrade"
+```
+
+配置了自定义 DSH home 或禁用默认技能来源时，以当前技能文件系统 Provider 配置为准。DSH 文件系统 Provider 支持符号链接；调用时按名称 `pi-aa-upgrade` 使用 `skill` 工具。当前安装不要求重启共享 Connector；正在运行的 DSH 会话是否已经刷新目录需要单独核实，新会话可重新读取技能。
+
+本机三个入口都引用同一个仓库目录，避免分别复制后产生版本分歧。未安装技能时仍可直接使用本仓库的 AGENTS.md 和本文。

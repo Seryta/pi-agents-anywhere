@@ -9,4 +9,4 @@
 - 编译、打包、lint、自动化测试全部在容器或虚机内执行；使用现有 `docker/` 入口，检查嵌套命令的实际执行环境。
 - 改仓库前检查 `.agent/claims.md` 并登记自己的范围；`.agent/` 为被忽略的本地协调状态。
 - 本次任务已授权的步骤直接执行。安装重启、公开推送、包发布按当前用户指令的范围处理；技能本身不授予这些权限。
-- 可复用的 Codex 技能源文件为 [skills/pi-aa-upgrade/SKILL.md](skills/pi-aa-upgrade/SKILL.md)。没有技能支持的 agent 直接遵循维护手册。
+- Codex、Pi agent 与 DSH 共用的技能源文件为 [skills/pi-aa-upgrade/SKILL.md](skills/pi-aa-upgrade/SKILL.md)。没有技能支持的 agent 直接遵循维护手册。

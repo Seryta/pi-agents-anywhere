@@ -272,7 +272,7 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 
 ## 后续升级与维护
 
-跨仓库关系、同步上游、补丁刷新、验证和发布步骤见[维护手册](docs/MAINTENANCE.md)。下次可直接让 agent 使用 `$pi-aa-upgrade`，或先阅读本仓库 [AGENTS.md](AGENTS.md)；技能源文件随仓库保存，安装方法见手册。
+跨仓库关系、同步上游、补丁刷新、验证和发布步骤见[维护手册](docs/MAINTENANCE.md)。Codex 使用 `$pi-aa-upgrade`、Pi agent 使用 `/skill:pi-aa-upgrade`，DSH 使用 `skill` 工具加载同名技能；也可先阅读本仓库 [AGENTS.md](AGENTS.md)。三者共用随仓库保存的技能源文件，安装方法见手册。
 
 ## 发布状态
 

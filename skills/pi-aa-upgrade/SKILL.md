@@ -5,6 +5,8 @@ description: 维护和升级 pi-agents-anywhere 的共享 Connector 集成，涵
 
 # Pi / AA / DSH 集成维护
 
+本技能为通用 Agent Skill，Codex 使用 `$pi-aa-upgrade`，Pi agent 使用 `/skill:pi-aa-upgrade`，DSH 按名称 `pi-aa-upgrade` 调用 `skill` 工具加载。完整安装与调用说明见仓库维护手册。
+
 先找到本技能所在的 `pi-agents-anywhere` 仓库。若从本机全局技能目录调用，先用 `realpath` 解析技能目录的符号链接，再向上两层定位仓库根；检验 `pyproject.toml` 的项目名和 `integrations/agents-anywhere/upstream.json`。仓库移动或技能为独立副本时，从当前工作区或用户已有检出定位，不凭旧绝对路径推测。
 
 读取仓库的 `AGENTS.md` 和 [docs/MAINTENANCE.md](../../docs/MAINTENANCE.md)。先按手册判断请求针对 Pi 原生 CLI、Pi Python 扩展、AA Connector、DSH 核心还是 Bridge 插件，再只执行本次所需部分。安装 / 重启时额外读 [docs/OPERATIONS.md](../../docs/OPERATIONS.md)。
