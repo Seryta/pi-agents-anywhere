@@ -37,7 +37,14 @@ PiProvider/PiRuntime 是公共 Connector 进程内的 Python 对象，不是独�
 
 ## 首次安装
 
-所有构建、打包和自动化测试都在 Docker 内执行；宿主只编排构建、安装预构建产物和维护服务配置。
+优先下载 [v0.3.0 Release](https://github.com/Seryta/pi-agents-anywhere/releases/tag/v0.3.0) 的全部附件并验证校验值：
+
+```bash
+gh release download v0.3.0 --repo Seryta/pi-agents-anywhere --dir dist/shared-connector
+(cd dist/shared-connector && sha256sum --check SHA256SUMS)
+```
+
+也可下载整套归档并解压到 `dist/shared-connector/`。需要自行构建时使用以下入口；所有构建、打包和自动化测试都在 Docker 内执行：
 
 ```bash
 docker/build-shared-connector.sh
@@ -101,10 +108,10 @@ journalctl --user -u agents-anywhere-connector.service
 
 ## 版本与发布
 
-本次应作为 Pi **0.3.0** 发布：从独立 Connector 改为共享 Connector 的进程内扩展，旧安装/启动方式不兼容，不能包装成 0.2.x 的普通修补更新。仓库版本已调整为0.3.0，仍标记未发布；本机部署通过不等于已打 tag 或公开发布。
+Pi **0.3.0** 于 2026-10-19 发布：从独立 Connector 改为共享 Connector 的进程内扩展，旧安装/启动方式不兼容。GitHub Release 提供完整产物集合，PyPI 发布 Pi 扩展 wheel 与源码包；Connector 和 DSH 补丁构建仅通过本项目 Release 分发。
 
 本次验证的组件组合是 Pi0.3.0、Connector2.0.3+shared.1、DSH插件2.0.3-shared.2。后续只改Pi代码时只需递增Pi版本；改Connector集成补丁或DSH插件时分别递增对应组件版本，再更新兼容清单和补丁校验值。文档勘误不要求重启或额外递增未发布的组件版本。
 
-发布交付物应包含 Pi 包与完整匹配产物集合：两份wheel、DSH tgz、systemd模板、约束文件、上游/协议清单、SHA256清单及构建门禁结果。修改后的官方Connector与DSH插件作为本项目Release的配套产物分发；不要向不属于本项目的上游发布命名空间上传补丁构建。Pi包即使单独分发，也必须明确依赖这套兼容安装，不能宣称独立升级即可使用。
+发布交付物应包含 Pi 包与完整匹配产物集合：两份wheel、Pi源码包、DSH tgz、systemd模板、约束文件、上游/协议清单、SHA256清单及构建门禁结果；整套归档便于一次下载。修改后的官方Connector与DSH插件作为本项目Release的配套产物分发；不要向不属于本项目的上游发布命名空间上传补丁构建。Pi包即使单独分发，也必须明确依赖这套兼容安装，不能宣称独立升级即可使用。
 
 发布前完成版本一致性、固定补丁重放、相关容器回归与安装迁移验收；公开推送前按项目要求完成元数据、当前文件、历史message和历史blob的四层隐私审计。然后分别执行提交、tag、Release/包发布。新工作区文档或本机安装不会自动完成这些发布动作。

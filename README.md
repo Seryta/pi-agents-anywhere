@@ -32,13 +32,20 @@ DSH 外部服务模式只建立本机管理连接。退出 DSH、重新加载插
 
 ## 构建与安装
 
-要求 Docker、Git 和 Python 3.12+。构建、类型检查与打包均在容器内进行；宿主脚本只准备固定提交的源码归档并编排 Docker：
+运行要求 Python 3.12+ 和 uv；Pi 原生 CLI 保持原有安装。直接下载 [v0.3.0 Release](https://github.com/Seryta/pi-agents-anywhere/releases/tag/v0.3.0) 的完整匹配产物，无需本机构建。例如使用 GitHub CLI：
+
+```bash
+gh release download v0.3.0 --repo Seryta/pi-agents-anywhere --dir dist/shared-connector
+(cd dist/shared-connector && sha256sum --check SHA256SUMS)
+```
+
+也可下载 Release 中的 `pi-agents-anywhere-0.3.0-shared-connector.tar.gz` 整套包。需要从源码构建时，额外要求 Docker 和 Git；构建、类型检查与打包均在容器内进行：
 
 ```bash
 docker/build-shared-connector.sh
 ```
 
-默认使用相邻 `../Agents-Anywhere` 检出；也可设置 `PI_AA_UPSTREAM_SOURCE`。没有检出时自动下载固定提交到任务临时目录。输出到 `dist/shared-connector/`，包括官方 Connector wheel、Pi 扩展 wheel、DSH 插件 tgz、上游清单和 SHA256 清单。构建从干净的固定提交重放补丁，不依赖开发者工作区的未提交文件。
+默认使用相邻 `../Agents-Anywhere` 检出；也可设置 `PI_AA_UPSTREAM_SOURCE`。没有检出时自动下载固定提交到任务临时目录。输出到 `dist/shared-connector/`，包括官方 Connector wheel、Pi 扩展 wheel 与源码包、DSH 插件 tgz、systemd 模板、依赖约束、上游清单、集成验证结果、整套归档及 SHA256 清单。构建从干净的固定提交重放补丁，不依赖开发者工作区的未提交文件。
 
 将两份 wheel 安装到同一个 Python 3.12 环境；使用 `--no-build`，依赖只使用预构建 wheel。新安装示例：
 
@@ -72,7 +79,7 @@ ln -s "$RELEASE/venv" "$HOME/.local/share/agents-anywhere/venv"
 
 ```bash
 mkdir -p ~/.config/systemd/user
-cp deploy/systemd/agents-anywhere-connector.service ~/.config/systemd/user/
+cp "$RELEASE/artifacts/agents-anywhere-connector.service" ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now agents-anywhere-connector.service
 ```
@@ -265,4 +272,4 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 
 ## 发布状态
 
-0.3.0是当前未发布的架构升级，不能按0.2.x的独立Connector方式安装。应同时提供经过验证的Connector wheel与匹配DSH插件产物，具体版本、迁移与发布范围见[运维与发布说明](docs/OPERATIONS.md#版本与发布)。仓库版本号、本机构建与安装不代表已经提交、打tag或公开发布。
+[0.3.0](https://github.com/Seryta/pi-agents-anywhere/releases/tag/v0.3.0) 是共享 Connector 架构版本，不能按 0.2.x 的独立 Connector 方式安装。GitHub Release 提供完整匹配产物，PyPI 提供 Pi 扩展包；单独升级 PyPI 包不能完成安装。具体组件版本、迁移与发布范围见[运维与发布说明](docs/OPERATIONS.md#版本与发布)。
