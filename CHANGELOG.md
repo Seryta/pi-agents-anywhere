@@ -1,5 +1,15 @@
 # 版本记录
 
+## 0.3.0（未发布）
+
+**不兼容变更**：Pi由独立Connector改为共享服务内的Runtime扩展，需按[安装迁移说明](docs/OPERATIONS.md)安装匹配的两份wheel；DSH使用匹配外部服务插件。Pi Python代码更新需重启整个共享服务进程，面板重启连接和Pi `/reload`不加载新Python代码。
+
+- DSH 插件兼容 Gateway 0.2.1 的显式 Peer；交互连接失败重试不重复广播未变化的能力，避免 AA 长期停在启动中。
+- Pi 改为官方 Connector 的 entry point Runtime 扩展，CLI 委托官方生命周期，重连使用公开回调。
+- 提供单设备公共 Connector、DSH 正式外部服务模式和私有本机 JSON-RPC；插件关闭与共享服务生命周期分离。
+- 保存固定上游提交与可重放集成补丁，提供容器构建、SHA256 产物清单、systemd 模板和 JSON doctor。
+- 普通账号连接复用设备身份和凭据；凭据恢复、重新创建设备必须显式发起，管理动作串行执行。
+
 ## 0.2.2（2026-10-16）
 
 ### 修复

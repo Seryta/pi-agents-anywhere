@@ -1,125 +1,94 @@
 # pi-agents-anywhere
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-222222?style=flat)](LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/pi-agents-anywhere?style=flat)](https://pypi.org/project/pi-agents-anywhere/)
+把 [Pi coding agent](https://github.com/earendil-works/pi) 作为 Runtime 扩展安装到 [Agents Anywhere](https://github.com/anywhere-labs/Agents-Anywhere) 官方 Connector。一个工作设备只运行一个 Connector，同时提供官方 Codex / Claude / DSH 和 Pi。
 
-把 [pi coding agent](https://github.com/earendil-works/pi) 接入 [Agents Anywhere](https://github.com/anywhere-labs/Agents-Anywhere) 工作台的连接器适配器。
-
-Agents Anywhere（下称 AA）官方 Connector 只内置 Codex / Claude / DSH 三个 Runtime。本项目提供一个 **pi** Runtime：通过官方注入点把 `PiProvider` / `PiRuntime` 挂进 Connector，用 `pi --mode rpc` 驱动本机 pi，并把 pi 会话投影为平台 Timeline。**不修改官方 Connector 源码。**
-
-## 架构
+## 架构与生命周期
 
 ```
-AA 客户端（Web/桌面/手机）
-        │
-AA Server （云端或自托管）
-        │  Connector RPC
-pi-aa-connector（本进程 = 官方 BackendRpcClient + PiProvider 注入）
-        │  Runtime RPC
-pi-aa 的 PiRuntime
-        │  JSONL over stdin/stdout
-pi --mode rpc （每个活跃会话一个子进程）
+AA Server ←→ 官方 Connector 公共服务（systemd，唯一设备身份与凭据）
+                  ├─ 官方 Codex / Claude Runtime
+                  ├─ PiProvider → pi --mode rpc
+                  └─ 官方 DSH Runtime ←→ 官方 DSH 插件 Bridge ←→ DSH
+
+DSH 管理面板 ←→ 私有 Unix socket ←→ Connector 公共服务
 ```
 
-- **PiProvider**：发现本机 pi（`pi --version`）、配置校验、按配置创建 Runtime 实例。
-- **PiRuntime**：会话清单（扫描 `~/.pi/agent/sessions`）、会话快照、状态、发送/打断/转向、图片附件、模型目录、命令、扩展 UI 交互。
-- **Timeline 投影**：把 pi 会话文件里的消息、工具调用、轮次翻译成 AA 的 `RuntimeTimelineItem`（同样的投影同时用于历史会话与实时推送）。运行时还会把 `message_update` 的文本/思考增量与 `tool_execution_*` 的工具状态按约 300ms 聚合，通过 `timeline_item_upsert` 实时推送到工作台；轮次结束时由全量投影替换为正式时间线项。注意：pi 投影生成的 `turn.start`/`turn.end` 分界项与 `turnId` 会被官方 Connector/Server 2.0.x 的边界主动过滤，工作台时间线不显示轮次分界（属官方 2.0.x 的 session-only boundary 设计，非缺陷）。
+Pi 通过 Python entry point `agents_anywhere.runtime_providers.v1` 加载；Pi CLI 只委托官方 CLI，不再复制配对、凭据和进程管理。重连状态发布使用公开的 `on_backend_reconnect()` 回调。
 
-注入点来自官方代码：`BackendRpcClient(config, agent_runtime_providers=(...))`（`connector/server/client.py`）。
+**Pi Python 适配层在共享 Connector 进程内运行，没有热重载。** 改源码后先构建并安装新 wheel，再通过 `systemctl --user restart agents-anywhere-connector.service` 重启服务进程；同设备其他 Runtime 会短暂断开。DSH 面板的 Connector 重启只重建进程内后端任务，不能用于加载新 Python 模块；Pi 的 `/reload` 只重载其原生资源。完整边界与操作见[安装、更新与发布](docs/OPERATIONS.md)。
 
-## 前置要求
+DSH 外部服务模式只建立本机管理连接。退出 DSH、重新加载插件、退出插件账号或重置插件，不停止公共 Connector；主动点击停止或重启会影响这个设备的所有 Agent。DSH 退出期间，其官方 Bridge 不可用，Pi 和其他独立 Runtime 继续工作。服务不可达会明确报错，不启动备用 Connector。
 
-- **pi（本机）**：用官方脚本安装 `curl -fsSL https://pi.dev/install.sh | sh`，或 npm 安装（Node.js >= 22.19）：
-  `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`。确认 `pi --version` 可用，并启动 `pi` 登录至少一个模型供应商（`/login`）。
-- **Python 3.12+**：运行 Connector。依赖较重（含官方 `anywhere-cli`），建议用独立环境或 `uv tool`。
-- **Agents Anywhere Server 地址**：云端或自托管均可。
+## 兼容版本与上游补丁
 
-## 安装
+此架构需要官方 Connector 的扩展加载入口和 DSH 插件的外部服务模式，当前使用本仓库保存的正式集成补丁，**不能只安装未经补丁的 PyPI anywhere-cli**。
 
-从 PyPI 安装（需要 [uv](https://docs.astral.sh/uv/)）：
+- 上游固定提交、组件版本、协议版本与补丁 SHA256：[upstream.json](integrations/agents-anywhere/upstream.json)。
+- 可审查、可重放补丁：[upstream.patch](integrations/agents-anywhere/upstream.patch)。它保留官方 Runtime 实现，并包含此前的进程识别与 DSH 能力缓存回归修复。
+- 本机公共服务面向 Linux / systemd；原有官方 CLI 和 stdio RPC 继续保留。Unix socket 模式不承诺 Windows 支持。
+- 连接器 Python 包与 DSH Node 插件分别安装；Pi 只需安装在公共 Connector 的 Python 环境中。
+
+更新上游时先更新固定提交、重新审查和生成补丁，再通过 Connector、Pi 与 DSH 跨进程回归并重建产物。不要自动追随浮动 main 或直接覆盖已验证的组件。
+
+## 构建与安装
+
+要求 Docker、Git 和 Python 3.12+。构建、类型检查与打包均在容器内进行；宿主脚本只准备固定提交的源码归档并编排 Docker：
 
 ```bash
-uv tool install --python 3.12 pi-agents-anywhere
+docker/build-shared-connector.sh
 ```
 
-也可以直接从 GitHub 源码安装（等同最新 main）：
+默认使用相邻 `../Agents-Anywhere` 检出；也可设置 `PI_AA_UPSTREAM_SOURCE`。没有检出时自动下载固定提交到任务临时目录。输出到 `dist/shared-connector/`，包括官方 Connector wheel、Pi 扩展 wheel、DSH 插件 tgz、上游清单和 SHA256 清单。构建从干净的固定提交重放补丁，不依赖开发者工作区的未提交文件。
+
+将两份 wheel 安装到同一个 Python 3.12 环境；使用 `--no-build`，依赖只使用预构建 wheel。新安装示例：
 
 ```bash
-uv tool install --python 3.12 "git+https://github.com/Seryta/pi-agents-anywhere"
+RELEASE="$HOME/.local/share/agents-anywhere/releases/0.3.0"
+mkdir -p "$RELEASE/artifacts"
+cp -a dist/shared-connector/. "$RELEASE/artifacts/"
+uv venv --python 3.12 "$RELEASE/venv"
+uv pip install --python "$RELEASE/venv/bin/python" --no-build \
+  -c "$RELEASE/artifacts/constraints.txt" "$RELEASE"/artifacts/*.whl
+ln -s "$RELEASE/venv" "$HOME/.local/share/agents-anywhere/venv"
 ```
 
-装完 `pi-aa-connector` 在 PATH 里可直接调用（`pipx install pi-agents-anywhere` 等价）。
+已有0.2.x安装按[迁移步骤](docs/OPERATIONS.md#从-02x-迁移)切换，不覆盖运行环境；单独升级PyPI的Pi包不能完成这次迁移。
 
-已通过 `uv tool` 从 PyPI 安装的用户，可升级到最新发布版本（本次为 0.2.2），并重启
-Connector 使其生效：
+用 DSH 官方插件管理器安装生成的 `dsh-bridge-next.tgz`，并固定该本地产物来源。它与 npm 原版使用同一包名，应替换当前包，不重复启用两个 Bridge。不要覆盖无关插件或模型设置。
+
+在该插件的配置中设置 `connectorSocketPath` 为当前用户的绝对路径，例如 `/home/<user>/.agents-anywhere/connector.sock`。外部模式不使用 `uvPath` 或 `connectorSourceDir` 启动子进程；留空这些旧的自定义启动配置。
+
+## 配对与常驻运行
+
+已配对设备继续使用 `~/.agents-anywhere/connector.json`，无需创建第二个设备。迁移旧安装时先停旧 Connector，再启动公共服务，保留 connectorId、token、statePath、同步目录和 Agent 原生历史。
+
+首次使用可由 DSH 登录界面授权，公共服务统一注册身份；也可先使用官方配对命令：
 
 ```bash
-uv tool upgrade --reinstall pi-agents-anywhere
-systemctl --user restart pi-aa-connector  # 若采用下方的 systemd user service
+~/.local/share/agents-anywhere/venv/bin/python -m connector.cli pair https://your-server --no-start
 ```
 
-版本变更见 [CHANGELOG.md](https://github.com/Seryta/pi-agents-anywhere/blob/main/CHANGELOG.md)。
-
-开发或需要跟随最新源码时，用可编辑安装：
+安装 [systemd user unit](deploy/systemd/agents-anywhere-connector.service)，然后启用：
 
 ```bash
-git clone https://github.com/Seryta/pi-agents-anywhere
-cd pi-agents-anywhere
-uv venv .venv --python 3.12
-uv pip install -e .               # 依赖会从 PyPI 解析（含官方 anywhere-cli）
-```
-
-如需跟随官方 Connector 仓库的最新源码：
-
-```bash
-uv pip install -e /path/to/Agents-Anywhere/connector
-uv pip install -e . --no-deps     # 依赖已由 connector 提供
-```
-
-## 使用
-
-### 1. 配对（只需一次）
-
-```bash
-pi-aa-connector pair https://your-server --no-start
-```
-
-源码安装时用 `.venv/bin/pi-aa-connector`；`uv tool` / `pipx` 安装则直接在 PATH 里。
-
-命令会打印配对码，在 AA 工作台的「添加设备」里输入该码；凭据保存到
-`~/.agents-anywhere/connector.json`（与官方 CLI 同一配置）。
-
-### 2. 常驻运行
-
-测试/构建在容器里，运行在工作设备上。推荐 systemd user service：
-
-```ini
-# ~/.config/systemd/user/pi-aa-connector.service
-[Unit]
-Description=Agents Anywhere Connector (with Pi runtime)
-After=network-online.target
-
-[Service]
-# 路径按安装方式取其一：
-#   uv tool / pipx → %h/.local/bin/pi-aa-connector
-#   源码 checkout  → %h/pi-agents-anywhere/.venv/bin/pi-aa-connector
-# 裸跑 `pi-aa-connector`（不带子命令）等价于 `start`。
-ExecStart=%h/.local/bin/pi-aa-connector start
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/systemd/agents-anywhere-connector.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now pi-aa-connector
-loginctl enable-linger "$USER"   # 无登录会话时也保持运行
+systemctl --user enable --now agents-anywhere-connector.service
 ```
 
-连接参数、配对方式、状态目录与官方 `anywhere-cli` 完全一致（`~/.agents-anywhere`、`AGENT_*` 环境变量）。
-随后在 AA 工作台里配置 pi Runtime（可执行文件、会话目录等）并创建会话。
+需要退出登录后保持运行时，可配置用户 linger。公共服务是唯一托管者；不要同时启用旧的 Pi 服务或 DSH 内置 Connector。`pi-aa-connector` 兼容命令仍可用，但只转交官方 CLI，裸调用等价于 `start`；常驻服务使用 `serve`。
+
+## 诊断与回归契约
+
+```bash
+~/.local/share/agents-anywhere/venv/bin/python -m connector.cli doctor --expect-runtime pi --expect-runtime dsh
+journalctl --user -u agents-anywhere-connector.service
+```
+
+Doctor 输出 JSON，包含 `ok`、已安装 Runtime、版本、本机协议、服务状态和设备身份；不输出凭据。检查失败返回非零退出码。它验证本机安装及服务任务存活，不能代替 AA 在线状态和真实模型收发验证。插件日志面板读取公共服务的有限日志；长期日志由 systemd journal 保存。
+
+回归必须覆盖：一个设备同时出现 Pi 和官方 Runtime、插件重载/退出不重启公共服务、公共服务重启后插件重连、普通授权不轮换凭据、跨账号拒绝替换、Pi 与 DSH 实际会话收发。确定性单测不使用真实账号；真实模型 smoke 另行显式启用。
 
 ## 能力映射
 
@@ -193,6 +162,7 @@ curl -fsSL -o ~/.pi/agent/extensions/btw.ts \
 
 ## 已知限制
 
+- **Pi适配代码更新影响整个共享进程**：没有按扩展热重载或独立worker。Python包升级需要重启共享服务；native会话文件保留，但执行中的任务可能中断。
 - **附件大小上限**：单个附件（含图片）超过 64 MiB 会被跳过（防磁盘滥用），日志有记录。
 - **无权限目录**：pi 没有运行时工具审批概念（工具权限由启动配置决定），因此没有 permission catalog。
 - **流式为消息级聚合**：文本/思考在生成过程中按约 300ms 聚合推送（非逐 token），工具输出同样节流；轮次结束后临时项由会话文件的全量投影替换。
@@ -218,8 +188,9 @@ PI_AA_TRUE_PI_MODEL=1 docker/run-tests.sh       # 追加一轮真实模型调用
 在 `docker/test-requirements.txt` 固定版本。验证其他 pi 版本可运行
 `docker/build-test-env.sh -t pi-aa-test-env:pi-1.1.0 --build-arg PI_VERSION=1.1.0`，
 然后设置 `PI_AA_TEST_IMAGE=pi-aa-test-env:pi-1.1.0` 运行测试。
-CI 覆盖 pi 0.87.1 / 1.1.0，并固定 Connector v2.0.3 的提交；仓库变量
-`PI_AA_CONNECTOR_REF` 可覆盖该提交以验证其他版本。基础镜像及系统包仍由上游更新。
+CI 覆盖 pi 0.87.1 / 1.1.0，并在固定 Connector v2.0.3 提交上重放集成补丁。
+本地首次准备上游时先运行 `python3 integrations/agents-anywhere/apply.py ../Agents-Anywhere`；
+更新版本需要同时审查清单与补丁。基础镜像及系统包仍由上游更新。
 
 长会话响应性可重复验证：先运行
 `docker/run-tests.sh python scripts/benchmark-session.py --doctor` 检查隔离环境和依赖，再运行
@@ -255,7 +226,17 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 
 ### 验证状态
 
-本轮验收（2026-10-15）：全部在 Docker 内使用 Python 3.12.13、Node 22.19.0 执行。
+0.3.0共享服务集成验收（2026-10-19，均在Docker内）：
+
+- 官方Connector：1085通过、2个Darwin用例跳过；Pi：257通过、1个需显式开启的付费模型单测跳过，各有1条已记录警告。
+- DSH插件2.0.3-shared.2：200通过、0失败、0跳过；typecheck/build/check:build通过。正式产物构建门禁8项通过，包括真实Node→Python管理接口、Peer兼容和重试能力通知回归。
+- 本机实际Gateway0.2.1-rc.2接口探针通过；生产229个Python源文件与最终wheel逐字节一致。
+- 使用现有AA服务，Pi/DSH分别完成真实模型对话；重启DSH后共享Connector和3个既有Pi进程保留，原设备身份与凭据不变。仅本任务测试会话被归档。
+- 本轮未重跑旧版Pi四组兼容矩阵、实体手机客户端GUI或Windows。既有Python lint/format基线问题仍存在，未将其表述为全部lint通过。
+
+以下为0.2.x历史记录，不代表0.3.0支持未经补丁的旧Connector：
+
+历史验收（2026-10-15）：全部在 Docker 内使用 Python 3.12.13、Node 22.19.0 执行。
 开启无模型凭据的真 pi 集成测试后，四组兼容性矩阵均为 `240 passed, 1 skipped`；
 唯一跳过项是需显式开启的真实模型付费调用。未开启真 pi 的默认模式本轮未单独重跑。
 
@@ -264,7 +245,7 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 | 2.0.0 | 240 passed, 1 skipped | 240 passed, 1 skipped |
 | 2.0.3 | 240 passed, 1 skipped | 240 passed, 1 skipped |
 
-`ruff check` 与 `ruff format --check` 均通过，覆盖 `src`、`tests` 和
+该历史版本的 `ruff check` 与 `ruff format --check` 均通过，覆盖 `src`、`tests` 和
 `scripts/benchmark-session.py`（27 个文件）。本轮验证包括：
 
 - 单元：RPC 传输、会话文件解析（含分支树）、Timeline 投影（含 edit diff 的 `changes`）、流式推送（节流聚合、running→终态收敛（done/cancelled/failed）、工具终态与 exitCode、任务不泄漏）、消息队列与 `clear_queue` 中断语义、内置命令代理（compact/name/stats/export）、命令 id 消毒后按 pi 原生名派发、命令 `sourceInfo` 元数据、`/btw` 自定义条目投影与 `entry_appended` 实时推送、会话统计与上下文预警、扩展 `setStatus`/`notify` 生命周期、非图片附件落盘与乐观消息对账、附件目录保留策略、Provider 配置、Runtime 生命周期与交互流程、图片附件转发、CLI 参数解析与错误映射。
@@ -281,3 +262,7 @@ scanner 最大事件循环延迟为 1194.930 ms，总耗时中位数为 1253.065
 - AA 各客户端（Web / Desktop / Android / iOS）上的完整渲染验收。
 - 本轮未执行包含实际客户端、Server 数据库和 Redis 的完整端到端流程。
 - Windows 平台；多会话并发压力。
+
+## 发布状态
+
+0.3.0是当前未发布的架构升级，不能按0.2.x的独立Connector方式安装。应同时提供经过验证的Connector wheel与匹配DSH插件产物，具体版本、迁移与发布范围见[运维与发布说明](docs/OPERATIONS.md#版本与发布)。仓库版本号、本机构建与安装不代表已经提交、打tag或公开发布。
