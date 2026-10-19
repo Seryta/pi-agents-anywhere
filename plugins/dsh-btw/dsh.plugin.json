@@ -1,0 +1,15 @@
+{
+  "name": "dsh-btw",
+  "description": "旁支问答（/btw）：基于当前会话记录单独回答，不打断主任务、不进入模型上下文",
+  "version": "0.2.0",
+  "entry": {
+    "name": "dsh-btw",
+    "inject": [
+      "commands",
+      "llm"
+    ]
+  },
+  "client": {
+    "platform": "web"
+  }
+}

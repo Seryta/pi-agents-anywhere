@@ -2,6 +2,8 @@
 
 把 [Pi coding agent](https://github.com/earendil-works/pi) 作为 Runtime 扩展安装到 [Agents Anywhere](https://github.com/anywhere-labs/Agents-Anywhere) 官方 Connector。一个工作设备只运行一个 Connector，同时提供官方 Codex / Claude / DSH 和 Pi。
 
+DSH 的旁支问答插件源码、容器打包与安装说明见 [plugins/dsh-btw](plugins/dsh-btw/README.md)。
+
 ## 架构与生命周期
 
 ```

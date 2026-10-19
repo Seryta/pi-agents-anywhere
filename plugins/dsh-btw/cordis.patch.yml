@@ -1,0 +1,6 @@
+# dsh-btw bundle patch：把本包装配为一个 host 插件 entry。
+# 手动安装到 profile 时由 dsh 的 bundle patch 机制装配；运行时注入（super-injector）
+# 走 loader.create，不使用本文件。
+- insert:
+    - id: dsh-btw
+      name: 'dsh-btw'

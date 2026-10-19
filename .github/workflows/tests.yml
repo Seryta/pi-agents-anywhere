@@ -46,3 +46,14 @@ jobs:
         with:
           name: shared-connector
           path: dist/shared-connector/
+
+  dsh-btw:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify and package the DSH side-question plugin
+        run: docker/build-dsh-btw.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsh-btw
+          path: dist/dsh-btw/

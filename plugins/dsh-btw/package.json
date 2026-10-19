@@ -1,0 +1,37 @@
+{
+  "name": "dsh-btw",
+  "version": "0.2.0",
+  "description": "旁支问答（/btw）：基于当前会话记录单独回答，不打断主任务、不进入模型上下文",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Seryta/pi-agents-anywhere.git",
+    "directory": "plugins/dsh-btw"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

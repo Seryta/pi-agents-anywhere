@@ -64,6 +64,10 @@ Pi 原生 CLI、Pi Python 扩展、官方 Connector、DSH 核心及 DSH Bridge �
 | 升级 DSH 核心或 Bridge 插件 | 核实实际 Gateway / Peer / Bridge 契约，适配插件并测试 | 仅插件代码变化时重启目标 DSH |
 | 文档勘误 | 更新相应文档 | 无需重启 |
 
+## DSH `/btw` 插件源码
+
+核心插件位于本仓库 `plugins/dsh-btw/`，不另建第三个仓库。AA 的命令转发与时间线投影仍在 AA fork；本仓库保存其固定补丁。构建与安装见[插件说明](../plugins/dsh-btw/README.md)，容器入口为 `docker/build-dsh-btw.sh`。本机旧的本地插件目录是安装副本，后续修改以仓库源码为准，打包安装后重启目标 DSH；提交源码不会自动更新已加载的模块。
+
 ## 同步 AA 上游与集成补丁
 
 1. 检查两个仓库的分支、工作区、认领和远端。保存旧清单、完整补丁和可回退的已发布产物；隔离他人改动，优先创建新的工作分支 / worktree。
