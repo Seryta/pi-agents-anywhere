@@ -1,6 +1,9 @@
 # 版本记录
 
-## 未发布（Connector shared.2 / DSH shared.3）
+## 未发布（Connector shared.3 / DSH shared.4）
+
+- AA 的 Codex 会话新增 `/btw`：主任务继续运行，独立、无工具的模型请求根据近期会话记录生成中文回答；问答仅存 Connector 时间线，不进入原生模型历史。无参数重开上次问答，支持超时、服务关闭和推送失败后的历史恢复。
+- 新增真实 Codex 0.159.1 与容器内确定性 Responses 服务的并发验收，无需真实账号或付费调用。Connector 变化同步更新包含其源码的 DSH Bridge 包版本；不修改 Pi 包版本或 Codex CLI。
 
 - 修复 DSH `/btw` 裁剪含 emoji 的上下文时产生不完整 Unicode 字符、导致 DeepSeek 接口返回 HTTP 400 的问题。
 

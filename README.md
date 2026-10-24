@@ -2,6 +2,8 @@
 
 把 [Pi coding agent](https://github.com/earendil-works/pi) 作为 Runtime 扩展安装到 [Agents Anywhere](https://github.com/anywhere-labs/Agents-Anywhere) 官方 Connector。一个工作设备只运行一个 Connector，同时提供官方 Codex / Claude / DSH 和 Pi。
 
+AA 中的 Codex 会话也支持 `/btw 你的问题`：主任务继续运行，单独从近期记录生成中文答案，无工具调用，不进入主模型历史；发送 `/btw` 可重开上次问答。此功能由配套 Connector 提供，无需另装 Codex 插件；不改变 Codex CLI 终端。凭据与验证边界见[维护手册](docs/MAINTENANCE.md#codex-btw-旁支问答)。
+
 DSH 的旁支问答插件源码、容器打包与安装说明见 [plugins/dsh-btw](plugins/dsh-btw/README.md)。
 
 ## 架构与生命周期

@@ -68,6 +68,19 @@ Pi 原生 CLI、Pi Python 扩展、官方 Connector、DSH 核心及 DSH Bridge �
 
 核心插件位于本仓库 `plugins/dsh-btw/`，不另建第三个仓库。AA 的命令转发与时间线投影仍在 AA fork；本仓库保存其固定补丁。构建与安装见[插件说明](../plugins/dsh-btw/README.md)，容器入口为 `docker/build-dsh-btw.sh`。本机旧的本地插件目录是安装副本，后续修改以仓库源码为准，打包安装后重启目标 DSH；提交源码不会自动更新已加载的模块。
 
+## Codex `/btw` 旁支问答
+
+实现位于 AA fork 的 `connector/connector/runtimes/codex/turns/btw.py` 与 `sdk/side_question.py`，通过本仓库固定补丁分发。无需修改 Codex 原生 CLI 或另装插件；这只为 AA 中的 Codex 会话新增命令入口。
+
+**语言约定：旁支对话一律使用中文回答。即使问题或会话记录使用英文或其他语言，或记录不足、需要说明无法回答，也必须用中文回复。** 此约定已写入旁支模型的独立提示词。
+
+- `/btw 问题` 在主回合运行、等待或审批期间也可执行，立即返回 accepted；独立模型请求固定要求中文回答，并显式不提供工具。不调用原生 turn/start、steer、interrupt、resume 或 fork，不改主任务与原生模型历史。
+- 转录取最近 30 条原生记录，工具结果每条最多 800 字符、总量最多 16,000 字符。问答只存 Connector 自有状态，以稳定 ID 投影为 system 消息；推送失败后历史同步恢复，服务重启后可查看。无参数重开不再调用模型；未完成问答在重启后显示中断。每会话一条并发旁支，120 秒超时。
+- 模型沿用当前选择。使用 AA 配置的模型网关，或由 App Server `config/read` 解析出的 Responses 提供方（API key、环境变量、可导出的 ChatGPT 登录）；登录凭据通过 App Server `getAuthStatus` 在内存中取得，不读取或改写 auth.json。不可导出的托管凭据及非 Responses 提供方明确报错；不静默改用另一账号或端点。云端登录、企业路由与实际客户端显示仍需单独验收。
+- 回归用例为 AA 的 `connector/tests/test_codex_btw.py` 与 `test_codex_btw_live.py`。后者在容器里启动真实固定版 Codex 和本地确定性 Responses 服务：主任务保持运行时旁支答案已到达，主任务正常结束后历史仅含一份旁支，原生历史不含问题或答案。无需真实凭据或付费调用。
+
+更新 Connector wheel 后需安装并重启共享服务进程才能生效；源码与补丁更新不会自动改变已安装环境。Connector 版本递增为 `2.0.3+shared.3`；Bridge 包因内含 Connector 源码同步递增为 `2.0.3-shared.4`。Pi Python 扩展仍为 `0.3.0`。
+
 ## 同步 AA 上游与集成补丁
 
 1. 检查两个仓库的分支、工作区、认领和远端。保存旧清单、完整补丁和可回退的已发布产物；隔离他人改动，优先创建新的工作分支 / worktree。
@@ -112,6 +125,7 @@ PI_AA_UPSTREAM_SOURCE="$AA_WORKTREE" docker/build-shared-connector.sh
 - 普通账号连接保留身份和凭据，跨账号替换被拒绝，所有权先于凭据操作。
 - Gateway 交互流及 `$events/result` 回复使用同一显式 Peer；必须同时验证打开和回复两条路径。只验证订阅成功会漏掉审批回复引发的重连风暴。重试不反复广播未变化的能力，AA 最终离开“启动中”。
 - DSH `/btw` 依赖持久安装的 `dsh-btw` 插件；仅运行时注入不会跨 DSH 重启保留。Bridge 投影版本 4 需要接受该版本的配套 Connector，先准备两侧产物再切换；中文旁支回答在主任务运行时出现在 AA，主回合结束后不重复，也不进入主模型历史。
+- Codex `/btw` 的确定性验证须同时覆盖主回合继续运行、无工具、中文回答、旁支不进入原生历史、重开、关闭/重启与推送失败恢复。真实云端登录和 AA 客户端验收不能由本地假模型代替。
 - 实际安装后，在原设备上完成 Pi / DSH 真实会话收发，检查已有会话可恢复；只测试自己创建的会话。
 
 医生入口见 [运维说明](OPERATIONS.md#后续更新与回退)。doctor 验证本机状态，不能替代真实收发。需要账号、模型调用或运行环境而本次未获授权 / 无法完成的检查，明确写为未验证。

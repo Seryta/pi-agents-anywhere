@@ -33,6 +33,9 @@ jobs:
       - name: Lint
         run: docker/run-tests.sh bash -c "python -m ruff check src tests && python -m ruff format --check src tests"
 
+      - name: Codex runtime and side-question regressions
+        run: docker/run-tests.sh bash -c 'cd /aa/connector && python -m pytest -q -p no:cacheprovider tests/test_codex*.py'
+
       - name: Tests (unit + real pi)
         run: PI_AA_TRUE_PI=1 docker/run-tests.sh
 
