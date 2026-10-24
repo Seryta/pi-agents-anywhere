@@ -325,20 +325,29 @@ def _model_display_title(
     model_id: str,
     directory: Sequence[tuple[str, str | None, str]],
 ) -> str:
-    """Label a model so ids under one name stay distinct.
+    """Label a model so entries under one name stay distinct.
 
-    Providers already act as group headings in the picker, so titles do not
-    repeat them; only the model id is appended when one provider exposes
-    several ids under the same name. Labels are computed over the full
-    directory so search and pagination cannot change them.
+    Providers act as group headings in the picker, but clients that group
+    rows by title instead (the Agents Anywhere app does) collapse entries
+    that share a title, hiding one of them. So a name offered by several
+    providers carries its provider; a name repeated inside one provider
+    carries the model id, and both suffixes are combined when a name is
+    repeated in a provider that also shares it with another provider. Labels
+    are computed over the full directory so search and pagination cannot
+    change them.
     """
 
     same_name = [entry for entry in directory if entry[0] == name]
     duplicate_model = any(entry[1] == provider and entry[2] != model_id for entry in same_name)
-    title = name
+    shared_with_providers = provider is not None and any(
+        entry[1] != provider for entry in same_name
+    )
+    if shared_with_providers:
+        suffix = f"{provider}/{model_id}" if duplicate_model else provider
+        return f"{name} [{suffix}]"
     if duplicate_model:
-        title += f" [{model_id}]"
-    return title
+        return f"{name} [{model_id}]"
+    return name
 
 
 def _model_group_item(provider: str) -> RuntimeModelItem:
@@ -2604,8 +2613,9 @@ class PiRuntime(AgentRuntime):
     ) -> RuntimeModelCatalog:
         data = response_data(await self._utility_command({"type": "get_available_models"}))
         # Pi allows the same model name under several providers; ids stay
-        # provider-qualified and the providers render as group headings, so
-        # titles do not repeat the provider.
+        # provider-qualified and the providers render as group headings. Only
+        # a name shared by several providers repeats the provider in its
+        # title, because clients may group rows by title instead of by heading.
         entries: list[tuple[Mapping[str, Any], str, str, str | None, str]] = []
         for raw in _as_list(data.get("models")):
             if not isinstance(raw, Mapping):

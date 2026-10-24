@@ -686,20 +686,21 @@ async def test_model_catalog_and_selections(
         assert len(ids) == len(set(ids))
         assert catalog.models[0].enabled is False
         assert catalog.models[0].selection_id == "pi-aa-group:alt"
-        # Providers render as group headings; titles stay plain so identical
-        # names under different providers read the same inside their groups.
+        # Providers render as group headings; a name shared by several
+        # providers still carries its provider so title-grouping clients keep
+        # both rows apart.
         titles = [model.title for model in catalog.models]
         assert titles == [
             "alt",
-            "Test Model",
+            "Test Model [alt]",
             "test",
-            "Test Model",
+            "Test Model [test]",
             "Other Model",
         ]
         filtered = await runtime.list_model_catalog(query="alt")
         assert [model.id for model in filtered.models] == ["pi-aa-group:alt", "alt:test-model"]
         # Labels are computed over the full directory, so filtering keeps them.
-        assert filtered.models[-1].title == "Test Model"
+        assert filtered.models[-1].title == "Test Model [alt]"
 
         await runtime.create_and_start_session("sess-model", "hi", cwd=str(tmp_path))
         result = await runtime.update_session_selections(
@@ -1759,12 +1760,21 @@ def test_model_display_title_rules() -> None:
         ("DeepSeek V4 Pro", "deepseek", "deepseek-v4-pro"),
         ("Routed", "test", "a"),
         ("Routed", "test", "b"),
+        ("Twice", "test", "x"),
+        ("Twice", "test", "y"),
+        ("Twice", "other", "z"),
     ]
-    # Several providers: titles stay plain; providers act as group headings.
+    # One name across several providers: append the provider so clients that
+    # group rows by title cannot collapse one of them away.
     assert (
         _model_display_title("DeepSeek V4.1 Flash", "deepseek", "deepseek-flash", directory)
-        == "DeepSeek V4.1 Flash"
+        == "DeepSeek V4.1 Flash [deepseek]"
     )
+    assert (
+        _model_display_title("DeepSeek V4.1 Flash", "opencode-go", "deepseek-v4.1-flash", directory)
+        == "DeepSeek V4.1 Flash [opencode-go]"
+    )
+    # A unique name keeps its plain title.
     assert (
         _model_display_title("DeepSeek V4 Pro", "deepseek", "deepseek-v4-pro", directory)
         == "DeepSeek V4 Pro"
@@ -1772,6 +1782,10 @@ def test_model_display_title_rules() -> None:
     # Same provider, several ids under one name: append the model id.
     assert _model_display_title("Routed", "test", "a", directory) == "Routed [a]"
     assert _model_display_title("Routed", "test", "b", directory) == "Routed [b]"
+    # Both at once: provider disambiguates the shared name, the id the repeats.
+    assert _model_display_title("Twice", "test", "x", directory) == "Twice [test/x]"
+    assert _model_display_title("Twice", "test", "y", directory) == "Twice [test/y]"
+    assert _model_display_title("Twice", "other", "z", directory) == "Twice [other]"
     # A single-provider catalog stays untouched.
     single = [("Solo", "test", "s"), ("Other", "test", "o")]
     assert _model_display_title("Solo", "test", "s", single) == "Solo"
