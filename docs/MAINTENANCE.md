@@ -41,7 +41,9 @@
 - AA 个人 fork：<https://github.com/Seryta/Agents-Anywhere>；上游为 <https://github.com/anywhere-labs/Agents-Anywhere>。
 - AA 仓库中 `origin` 是官方上游，`fork` 是个人仓库；不能凭 remote 名称假定推送目标。
 
-0.3.0 发布时：Pi `main` / `v0.3.0` 对应 `5df74d5ec7c71b38bd304dcccd694bd15f79b0cd`；AA 集成分支为个人 fork 的 `codex/shared-connector-runtime`。这只是初始定位信息，后续先核实当前分支、远端和清单。
+Pi 0.3.0 时：`v0.3.0` 对应 `5df74d5ec7c71b38bd304dcccd694bd15f79b0cd`，AA 集成分支为个人 fork 的 `codex/shared-connector-runtime`（固定上游 v2.0.3）。
+
+Pi 0.4.0 / AA 2.1.0 起：固定上游 `e8f0cb9`（v2.1.0），集成分支改为个人 fork 的 `codex/mesh-2.1`；旧的 `codex/shared-connector-runtime` 保留为 2.0.3 线，不再前进。集成分支的提交会被重建（`git cherry-pick` + 解决冲突），不要直接在上游提交上手工修改。这只是定位信息，后续先核实当前分支、远端和清单。
 
 Pi 原生 CLI、Pi Python 扩展、官方 Connector、DSH 核心及 DSH Bridge 插件是不同组件。用户说“升级 Pi”但对象有实质歧义时，先区分对象，不连带升级整套依赖。当前架构没有修改 Pi 上游、DSH 核心或 AA 各客户端。
 
