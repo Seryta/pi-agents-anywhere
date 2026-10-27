@@ -27,7 +27,8 @@ echo "== venv"
 if [ ! -x "$RELEASE/venv/bin/python" ]; then
     python3 -m venv "$RELEASE/venv"
 fi
-"$RELEASE/venv/bin/pip" install --quiet --no-build --upgrade \
+"$RELEASE/venv/bin/pip" install --quiet --no-build --upgrade --timeout 120 --retries 5 \
+    --index-url "${PI_AA_PIP_INDEX_URL:-https://pypi.org/simple}" \
     -c "$RELEASE/artifacts/constraints.txt" \
     "$RELEASE"/artifacts/anywhere_cli-*.whl "$RELEASE"/artifacts/pi_agents_anywhere-*.whl
 "$RELEASE/venv/bin/python" -c 'from importlib.metadata import version; print("anywhere-cli", version("anywhere-cli")); print("pi-agents-anywhere", version("pi-agents-anywhere"))'
