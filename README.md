@@ -36,14 +36,14 @@ DSH 外部服务模式只建立本机管理连接。退出 DSH、重新加载插
 
 ## 构建与安装
 
-运行要求 Python 3.12+ 和 uv；Pi 原生 CLI 保持原有安装。直接下载 [v0.3.0 Release](https://github.com/Seryta/pi-agents-anywhere/releases/tag/v0.3.0) 的完整匹配产物，无需本机构建。例如使用 GitHub CLI：
+运行要求 Python 3.12+ 和 uv；Pi 原生 CLI 保持原有安装。直接下载 [v0.4.0 Release](https://github.com/Seryta/pi-agents-anywhere/releases/tag/v0.4.0) 的完整匹配产物，无需本机构建。例如使用 GitHub CLI：
 
 ```bash
-gh release download v0.3.0 --repo Seryta/pi-agents-anywhere --dir dist/shared-connector
+gh release download v0.4.0 --repo Seryta/pi-agents-anywhere --dir dist/shared-connector
 (cd dist/shared-connector && sha256sum --check SHA256SUMS)
 ```
 
-也可下载 Release 中的 `pi-agents-anywhere-0.3.0-shared-connector.tar.gz` 整套包。需要从源码构建时，额外要求 Docker 和 Git；构建、类型检查与打包均在容器内进行：
+也可下载 Release 中的 `pi-agents-anywhere-0.4.0-shared-connector.tar.gz` 整套包。需要从源码构建时，额外要求 Docker 和 Git；构建、类型检查与打包均在容器内进行：
 
 ```bash
 docker/build-shared-connector.sh
@@ -54,7 +54,7 @@ docker/build-shared-connector.sh
 将两份 wheel 安装到同一个 Python 3.12 环境；使用 `--no-build`，依赖只使用预构建 wheel。新安装示例：
 
 ```bash
-RELEASE="$HOME/.local/share/agents-anywhere/releases/0.3.0"
+RELEASE="$HOME/.local/share/agents-anywhere/releases/0.4.0"
 mkdir -p "$RELEASE/artifacts"
 cp -a dist/shared-connector/. "$RELEASE/artifacts/"
 uv venv --python 3.12 "$RELEASE/venv"
@@ -67,7 +67,7 @@ ln -s "$RELEASE/venv" "$HOME/.local/share/agents-anywhere/venv"
 
 用 DSH 官方插件管理器安装生成的 `dsh-bridge-next.tgz`，并固定该本地产物来源。它与 npm 原版使用同一包名，应替换当前包，不重复启用两个 Bridge。不要覆盖无关插件或模型设置。
 
-在该插件的配置中设置 `connectorSocketPath` 为当前用户的绝对路径，例如 `/home/<user>/.agents-anywhere/connector.sock`。外部模式不使用 `uvPath` 或 `connectorSourceDir` 启动子进程；留空这些旧的自定义启动配置。
+在该插件的配置中设置 `connectorServicePath` 为共享服务发布的会合文件，例如 `/home/<user>/.agents-anywhere/connector-service`（固定位置，也可留空时由管理端指定）。外部模式不使用 `uvPath` 或 `connectorSourceDir` 启动子进程；留空这些旧的自定义启动配置。
 
 ## 配对与常驻运行
 

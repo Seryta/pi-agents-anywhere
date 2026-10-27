@@ -33,7 +33,7 @@
 | 位置 | 职责 | 应先读取 |
 | --- | --- | --- |
 | `pi-agents-anywhere` | Pi Python 扩展、固定补丁、构建与统一发行 | `pyproject.toml`、`src/pi_aa/__init__.py`、`integrations/agents-anywhere/upstream.json`、`.github/workflows/tests.yml` |
-| `Agents-Anywhere` 的维护者 fork | 官方 Connector 扩展入口与公共服务、DSH 外部管理模式和连接修复 | 该仓库 `AGENTS.md`、`connector/`、`dsh-bridge-next/`、`contracts/connector-local-control/` |
+| `Agents-Anywhere` 的维护者 fork | 官方 Connector 扩展入口与公共服务、DSH 外部管理模式和连接修复 | 该仓库 `AGENTS.md`、`connector/`、`dsh-bridge-next/`、`contracts/connector-service/` |
 
 仓库地址以实际 `git remote -v` 为准。当前公开来源：
 
@@ -79,7 +79,9 @@ Pi 原生 CLI、Pi Python 扩展、官方 Connector、DSH 核心及 DSH Bridge �
 - 模型沿用当前选择。使用 AA 配置的模型网关，或由 App Server `config/read` 解析出的 Responses 提供方（API key、环境变量、可导出的 ChatGPT 登录）；登录凭据通过 App Server `getAuthStatus` 在内存中取得，不读取或改写 auth.json。不可导出的托管凭据及非 Responses 提供方明确报错；不静默改用另一账号或端点。云端登录、企业路由与实际客户端显示仍需单独验收。
 - 回归用例为 AA 的 `connector/tests/test_codex_btw.py` 与 `test_codex_btw_live.py`。后者在容器里启动真实固定版 Codex 和本地确定性 Responses 服务：主任务保持运行时旁支答案已到达，主任务正常结束后历史仅含一份旁支，原生历史不含问题或答案。无需真实凭据或付费调用。
 
-更新 Connector wheel 后需安装并重启共享服务进程才能生效；源码与补丁更新不会自动改变已安装环境。Connector 版本递增为 `2.0.3+shared.3`；Bridge 包因内含 Connector 源码同步递增为 `2.0.3-shared.4`。Pi Python 扩展仍为 `0.3.0`。
+更新 Connector wheel 后需安装并重启共享服务进程才能生效；源码与补丁更新不会自动改变已安装环境。当前版本：Connector `2.1.0+shared.3`；Bridge 包因内含 Connector 源码同步递增为 `2.1.0-shared.2`；Pi Python 扩展为 `0.4.0`（兼容基线变更）。
+
+自 2.1.0 起本机管理通道是上游 MeshCall：共享服务用 `LocalHub` 发布 0600 会合文件 `~/.agents-anywhere/connector-service`（Router 端点 + `service` 角色密钥），管理者只能调用 `aa.local.v2.Shared`、`aa.local.v2.Logs` 与 Registry。控制/日志模型直接复用上游 `connector/mesh/*`，本仓库只增加服务类与角色权限，不再维护自己的 socket 协议与日志缓冲。
 
 ## 同步 AA 上游与集成补丁
 

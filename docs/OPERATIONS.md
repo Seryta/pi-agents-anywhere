@@ -1,6 +1,6 @@
 # 共享 Connector 的安装、更新与发布
 
-适用于 Pi 扩展 0.3.x 的 Linux/systemd 部署。版本组合以 [upstream.json](../integrations/agents-anywhere/upstream.json) 为准；Pi 版本在 [pyproject.toml](../pyproject.toml) 中声明。0.2.x 的独立 Pi Connector 安装方式不能直接沿用。
+适用于 Pi 扩展 0.4.x 的 Linux/systemd 部署。版本组合以 [upstream.json](../integrations/agents-anywhere/upstream.json) 为准；Pi 版本在 [pyproject.toml](../pyproject.toml) 中声明。0.2.x 的独立 Pi Connector 安装方式不能直接沿用。
 
 ## 什么改动需要重启
 
@@ -37,10 +37,10 @@ PiProvider/PiRuntime 是公共 Connector 进程内的 Python 对象，不是独�
 
 ## 首次安装
 
-优先下载 [v0.3.0 Release](https://github.com/Seryta/pi-agents-anywhere/releases/tag/v0.3.0) 的全部附件并验证校验值：
+优先下载 [v0.4.0 Release](https://github.com/Seryta/pi-agents-anywhere/releases/tag/v0.4.0) 的全部附件并验证校验值：
 
 ```bash
-gh release download v0.3.0 --repo Seryta/pi-agents-anywhere --dir dist/shared-connector
+gh release download v0.4.0 --repo Seryta/pi-agents-anywhere --dir dist/shared-connector
 (cd dist/shared-connector && sha256sum --check SHA256SUMS)
 ```
 
@@ -55,7 +55,7 @@ docker/build-shared-connector.sh
 以下是新安装示例；已有安装按下一节迁移，不直接覆盖运行中的环境：
 
 ```bash
-RELEASE="$HOME/.local/share/agents-anywhere/releases/0.3.0"
+RELEASE="$HOME/.local/share/agents-anywhere/releases/0.4.0"
 mkdir -p "$RELEASE/artifacts"
 cp -a dist/shared-connector/. "$RELEASE/artifacts/"
 uv venv --python 3.12 "$RELEASE/venv"
@@ -74,7 +74,7 @@ dsh plugin --profile "$PROFILE" add --ignore-scripts --save-exact \
   "$RELEASE/artifacts/dsh-bridge-next.tgz"
 ```
 
-在该 Profile 现有 `agents-anywhere-bridge-next` 条目的 `config` 中合并绝对路径 `connectorSocketPath`，例如 `/home/<user>/.agents-anywhere/connector.sock`；不要重复添加条目或覆盖其他插件配置。清空旧自定义 `uvPath` 转接配置。外部服务模式由公共服务保存设备凭据，DSH 插件保留账号授权和官方 Bridge。
+在该 Profile 现有 `agents-anywhere-bridge-next` 条目的 `config` 中合并绝对路径 `connectorServicePath`，例如 `/home/<user>/.agents-anywhere/connector-service`；不要重复添加条目或覆盖其他插件配置。清空旧自定义 `uvPath` 转接配置。外部服务模式由公共服务保存设备凭据，DSH 插件保留账号授权和官方 Bridge。
 
 首次设备按 [README 配对与常驻运行](../README.md#配对与常驻运行) 完成配对并安装 unit。已有有效全局配置无需重新配对。
 
@@ -84,7 +84,7 @@ dsh plugin --profile "$PROFILE" add --ignore-scripts --save-exact \
 2. 等待相关任务空闲，停止旧 Pi Connector 与 DSH 插件托管的 Connector。安装新环境前完成依赖准备，避免长时间停机。
 3. 保留原有 `~/.agents-anywhere/connector.json`、statePath 和同步目录。若原凭据失效，使用显式设备恢复流程；不要为迁移自动注册第二个设备。
 4. 将旧 `pi-aa-connector.service` 独立服务停用；若该名字对应普通 unit 文件，先备份并移出该路径，以便新 unit 创建兼容别名。保留已有内存限制等有效 drop-in，并应用到新的正式服务名。
-5. 安装匹配的 wheel/tgz，配置 DSH 的 `connectorSocketPath`，启用共享 unit。旧插件私有 Connector/绑定移出活动目录保存备份；插件账号保留。移除此前自建的启动转接配置，正式运行无需观察脚本。
+5. 安装匹配的 wheel/tgz，配置 DSH 的 `connectorServicePath`，启用共享 unit。旧插件私有 Connector/绑定移出活动目录保存备份；插件账号保留。移除此前自建的启动转接配置，正式运行无需观察脚本。
 6. 验证原设备身份不变、Pi 与官方 Runtime 同时可用，并分别做真实会话收发；重启 DSH 后公共服务和 Pi 继续工作。doctor 通过不能替代这些检查。
 
 本机已完成上述迁移；不要重复执行配对或迁移以更新普通 Pi 代码。
@@ -112,7 +112,16 @@ journalctl --user -u agents-anywhere-connector.service
 
 Pi **0.3.0** 于 2026-10-19 发布：从独立 Connector 改为共享 Connector 的进程内扩展，旧安装/启动方式不兼容。GitHub Release 提供完整产物集合，PyPI 发布 Pi 扩展 wheel 与源码包；Connector 和 DSH 补丁构建仅通过本项目 Release 分发。
 
-本次验证的组件组合是 Pi0.3.0、Connector2.0.3+shared.1、DSH插件2.0.3-shared.2。后续只改Pi代码时只需递增Pi版本；改Connector集成补丁或DSH插件时分别递增对应组件版本，再更新兼容清单和补丁校验值。文档勘误不要求重启或额外递增未发布的组件版本。
+Pi **0.4.0** 跟随 Agents Anywhere 2.1.0（上游 `e8f0cb9`）发布：本机管理通道从自建 JSON-RPC socket 换成 MeshCall 会合文件，Pi wheel、Connector wheel 与 DSH 插件必须同版本配套安装。升级步骤：
+
+1. 下载并核对 0.4.0 Release 的全部附件；在新版本目录创建 venv 并安装两份 wheel（约束文件用 Release 内的 `constraints.txt`）。
+2. 切换 `~/.local/share/agents-anywhere/venv` 符号链接（保留旧的 `venv.bak-*` 以便回退），重启 `agents-anywhere-connector.service`。
+3. 把 DSH Profile 里 `agents-anywhere-bridge-next` 的 `connectorSocketPath` 换成 `connectorServicePath: ~/.agents-anywhere/connector-service`，并安装同版本 tgz；重启 DSH。
+4. `anywhere-cli doctor --expect-runtime pi --expect-runtime dsh` 应返回 `ok=true`，`~/.agents-anywhere/connector-service` 权限为 0600，插件面板显示共享服务模式。
+
+服务端 2.1.0 需要数据库迁移 `v2_42`–`v2_44`，并按上游说明升级各客户端；本机 Connector 与 Server 的协议版本仍是 `1.0`，但看板等新能力要求两端都升级。
+
+本次验证的组件组合是 Pi0.4.0、Connector2.1.0+shared.3、DSH插件2.1.0-shared.2。后续只改Pi代码时只需递增Pi版本；改Connector集成补丁或DSH插件时分别递增对应组件版本，再更新兼容清单和补丁校验值。文档勘误不要求重启或额外递增未发布的组件版本。
 
 发布交付物应包含 Pi 包与完整匹配产物集合：两份wheel、Pi源码包、DSH tgz、systemd模板、约束文件、上游/协议清单、SHA256清单及构建门禁结果；整套归档便于一次下载。修改后的官方Connector与DSH插件作为本项目Release的配套产物分发；不要向不属于本项目的上游发布命名空间上传补丁构建。Pi包即使单独分发，也必须明确依赖这套兼容安装，不能宣称独立升级即可使用。
 

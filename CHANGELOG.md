@@ -1,16 +1,21 @@
 # 版本记录
 
-## 未发布（Connector shared.3 / DSH shared.4）
+## 未发布（Pin 0.4.0 / Connector 2.1.0+shared.3 / DSH 2.1.0-shared.2）
 
+**不兼容变更**：跟随 Agents Anywhere 2.1.0（上游 `e8f0cb9`）重建整条集成。本机管理通道由自建 JSON-RPC socket 改为上游 MeshCall：`anywhere-cli serve` 在 `~/.agents-anywhere/connector-service` 发布 0600 会合文件，DSH 插件以只读 scoped key 接入控制与日志服务，管理器断开不影响常驻服务。Pi wheel、Connector wheel 与 DSH 插件必须同版本配套安装；2.0.x 与 2.1.0 的本机通道互不兼容。服务端数据库迁移（`v2_42`–`v2_44`）与各客户端升级按上游 2.1.0 说明另行执行。
+
+- Pi 扩展入口与 `on_backend_reconnect` 回调保持不变，仍以 `agents_anywhere.runtime_providers.v1` entry point 加载；上游 2.1.0 仍未内置该机制。
+- 共享服务改挂在上游 MeshCall Router 上：身份、账号绑定与运行生命周期拆成 `aa.local.v2.Shared`，日志改用上游 `aa.local.v2.Logs`；`anywhere-cli doctor` 改为读取会合文件并通过 MeshCall 查询状态。
+- DSH 插件外部模式改为 MeshCall 客户端：不再启动第二个 Connector，也不写共享配置；停止/重启共享服务必须在插件里显式操作，影响本机全部 Agent。
+- 上游 2.1.0 已原生实现 DSH 同步检查点、孤立代理项归一化、大历史分页上传与中央日志，本集成只保留 `/btw` 的投影版本 4（旁支问答独立于当前回合）。
+- DSH `/btw` 命令仍经 AA 执行；Codex `/btw` 重铺到支持 Codex App / IDE IPC 的 2.1.0 Codex 运行时，主任务运行中仍可提问。
+- 新增容器内验证入口 `docker/aa-connector-tests.sh`（Connector 自带 ruff / pytest，含契约夹具）与 `docker/aa-plugin-test.Dockerfile`（Node 22 + Python 3.12，跑插件 typecheck / 测试）。
+- 修复 `upstream.json` 的 `dshPluginVersion` 与实际 tgz 版本不一致的问题：本次起清单版本随产物一起生成。
 - AA 的 Codex 会话新增 `/btw`：主任务继续运行，独立、无工具的模型请求根据近期会话记录生成中文回答；问答仅存 Connector 时间线，不进入原生模型历史。无参数重开上次问答，支持超时、服务关闭和推送失败后的历史恢复。
-- 新增真实 Codex 0.159.1 与容器内确定性 Responses 服务的并发验收，无需真实账号或付费调用。Connector 变化同步更新包含其源码的 DSH Bridge 包版本；不修改 Pi 包版本或 Codex CLI。
-
+- DSH 原生 `/btw` 插件命令可经 AA 执行；旁支问答以独立时间线条目实时更新，不中断主回合、不进入主模型消息历史。
 - 修复 DSH `/btw` 裁剪含 emoji 的上下文时产生不完整 Unicode 字符、导致 DeepSeek 接口返回 HTTP 400 的问题。
-
 - 将 DSH `/btw` 核心插件纳入 `plugins/dsh-btw`，提供容器中的源码/打包回归及 tgz 构建入口，CI 保存可下载产物。
-
-- DSH 审批及用户回答使用与交互流相同的显式 Peer，修复审批重连风暴导致 AA 会话同步卡在启动中的问题。
-- DSH 原生 `/btw` 插件命令可经 AA 执行；旁支问答以独立时间线条目实时更新，不中断主回合、不进入主模型消息历史。Connector 与插件需配套更新，以启用新版历史投影。
+- 新增真实 Codex 客户端与容器内确定性 Responses 服务的并发验收，无需真实账号或付费调用。
 - 修复同一模型名由多个 provider 提供时目录标题完全相同的问题：此类条目标题追加 provider，AA App 按标题分组的模型选择器不再折叠掉其中一项（如 `deepseek/deepseek-flash` 与 `opencode-go/deepseek-v4.1-flash`）。
 
 ## 0.3.0（2026-10-19）
