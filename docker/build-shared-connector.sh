@@ -17,4 +17,5 @@ fi
 git -C "$UPSTREAM" archive "$COMMIT" > "${SCRATCH}/upstream.tar"
 docker build --file "${REPO}/docker/shared-connector.Dockerfile" \
     --build-context "upstream_source=${SCRATCH}" \
+    --build-arg "PIP_INDEX_URL=${PI_AA_PIP_INDEX_URL:-https://pypi.org/simple}" \
     --output "type=local,dest=${OUTPUT}" "$REPO"

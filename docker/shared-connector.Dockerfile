@@ -24,9 +24,12 @@ RUN corepack yarn install && corepack yarn typecheck && corepack yarn build && c
     && mv /artifacts/*.tgz /artifacts/dsh-bridge-next.tgz
 
 FROM python-build AS integration-check
+# The runtime dependencies are large wheels; a mirror keeps a slow link from
+# failing the gate. Defaults to the official index, like the other build scripts.
+ARG PIP_INDEX_URL=https://pypi.org/simple
 COPY --from=plugin-build /usr/local/bin/node /usr/local/bin/node
 COPY --from=plugin-build /upstream /upstream
-RUN python -m pip install --no-cache-dir --constraint /integration/constraints.txt /artifacts/*.whl
+RUN python -m pip install --no-cache-dir --timeout 120 --retries 5 --index-url "${PIP_INDEX_URL}" --constraint /integration/constraints.txt /artifacts/*.whl
 WORKDIR /upstream/dsh-bridge-next
 RUN AA_TEST_PYTHON=/usr/local/bin/python3.12 node node_modules/tsx/dist/cli.mjs --test --test-concurrency=1 tests/unit/interaction-stream.test.ts tests/integration/external-connector.test.ts > /artifacts/shared-integration.tap \
     && python -c 'import json,pathlib; pathlib.Path("/artifacts/integration-verified.json").write_text(json.dumps({"ok":True,"scope":"Node client to packaged Python shared service; reload, logout, reset, restart, permissions, pre-auth ownership, Peer compatibility and capability retry transitions"})+"\n")'
