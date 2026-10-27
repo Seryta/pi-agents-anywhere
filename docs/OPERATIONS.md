@@ -15,6 +15,8 @@ PiProvider/PiRuntime 是公共 Connector 进程内的 Python 对象，不是独�
 | 更新 DSH 插件代码 | 构建并安装新 tgz，重启对应 DSH 实例 | DSH 暂时断开；共享 Connector、Pi 与 Codex 继续运行 |
 | 只修改文档 | 无需重启 | 无运行影响 |
 
+重启范围取决于 Runtime 由谁拉起：Connector 自己启动的 Runtime 子进程（例如托管模式下的 DSH Host）会随服务一起重启；以独立 unit 运行的 DSH（如本机 `dsh-web.service`）只会断开桥接，服务恢复后按会合文件自动重连，不需要重启 DSH。
+
 **这里的重启是 systemd 服务进程重启。** DSH 面板的“重启 Connector”当前调用 `connector.restart`，只在现有 Python 进程里停止并重建后端任务；它会影响所有 Runtime，但不能保证加载新 Python 代码。单独重启 Pi 会话、重建 Runtime 或重启 DSH 也不能用于更新 Pi Python 适配层。
 
 当前生产安装使用 wheel。修改源码目录不会直接修改已安装环境。即使开发时使用 editable 安装，已导入的 Python 模块也需要进程重启才能可靠更新。
