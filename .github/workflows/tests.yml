@@ -12,8 +12,8 @@ jobs:
         pi-version: ["0.87.1", "1.1.0"]
     env:
       PI_AA_CONNECTOR_SOURCE: /tmp/Agents-Anywhere/connector
-      # Reviewed Agents Anywhere v2.0.3 integration base.
-      PI_AA_CONNECTOR_REF: c0c3810d80331a9b8434e25538eeb389f84301ce
+      # Reviewed Agents Anywhere v2.1.0 integration base.
+      PI_AA_CONNECTOR_REF: e8f0cb9e1d9aeca45331224653d0b7cacba39a3a
     steps:
       - uses: actions/checkout@v4
 

@@ -1,15 +1,16 @@
 # Direct runtime dependencies verified with this integration. Update with the compatibility suite.
 asyncer==0.0.18
-claude-agent-sdk==0.2.161
+claude-agent-sdk==0.2.174
 httpx==0.28.1
 jsonschema==4.26.0
 loguru==0.7.3
-openai-codex==0.159.1
-openai-codex-cli-bin==0.159.1
+meshcall==0.3.0
+openai-codex==0.163.0
+openai-codex-cli-bin==0.163.0
 pexpect==4.9.0
 psutil==7.2.2
 ptyprocess==0.7.0
-pydantic==2.13.5
+pydantic==2.14.1
 pyte==0.8.2
 python-socks==3.1.1
-websockets==17.1
+websockets==17.3

@@ -1,9 +1,10 @@
 {
   "repository": "https://github.com/anywhere-labs/Agents-Anywhere",
-  "commit": "c0c3810d80331a9b8434e25538eeb389f84301ce",
-  "connectorVersion": "2.0.3+shared.3",
-  "dshPluginVersion": "2.0.3-shared.4",
+  "commit": "e8f0cb9e1d9aeca45331224653d0b7cacba39a3a",
+  "connectorVersion": "2.1.0+shared.3",
+  "dshPluginVersion": "2.1.0-shared.2",
   "runtimeExtensionApi": 1,
-  "localControlProtocol": 1,
-  "patchSha256": "ab21b9ef0371448009e516de819fd20f8ba43f9fc3cdd7bdf8698eb6343fbdc9"
+  "localServiceTransport": "meshcall-0.3.0",
+  "localServiceRendezvousVersion": 1,
+  "patchSha256": "42dc4ac6922e64f4ba2c7238a62443679f3d44e3960797a161a195b7df2beb80"
 }

@@ -26,7 +26,7 @@ def main() -> None:
     paths = [
         "connector",
         "dsh-bridge-next",
-        "contracts/connector-local-control",
+        "contracts/connector-service",
         "contracts/dsh-bridge",
         "docs/runtime-protocol/runtime-extensions.md",
     ]
