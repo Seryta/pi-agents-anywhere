@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        pi-version: ["0.87.1", "1.1.0"]
+        pi-version: ["0.87.1", "1.1.0", "1.4.0"]
     env:
       PI_AA_CONNECTOR_SOURCE: /tmp/Agents-Anywhere/connector
       # Reviewed Agents Anywhere v2.1.0 integration base.
